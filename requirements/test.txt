@@ -1,0 +1,14 @@
+# Test dependencies for the MLPerf Inference Endpoint Benchmarking System
+# Install with: pip install -r requirements/test.txt
+
+# Include base requirements
+-r base.txt
+
+# Testing framework
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+pytest-cov>=4.0.0
+pytest-benchmark>=4.0.0
+
+# Test utilities
+coverage>=7.0.0

@@ -1,0 +1,8 @@
+# Base dependencies for the MLPerf Inference Endpoint Benchmarking System
+# These are the minimal dependencies required for the package to function
+
+# Core Python dependencies
+typing-extensions>=4.0.0
+
+# Note: asyncio is part of Python 3.11+ standard library
+# Additional dependencies will be added as components are implemented
