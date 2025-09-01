@@ -25,9 +25,10 @@ class Query:
     """Represents a single query to be processed."""
 
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
-    prompt: str = ""
     model: str = ""
-    max_tokens: int = 100
+    max_tokens: int = (
+        100  # TODO: This is a token count - should we have text count instead?
+    )
     temperature: float = 0.7
     stream: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -40,14 +41,35 @@ class Query:
 
             self.created_at = time.time()
 
+    def to_json(self) -> dict[str, Any]:
+        raise NotImplementedError("to_json is not implemented for Query")
+
+
+@dataclass
+class ChatCompletionQuery(Query):
+    """Represents a single query to be processed."""
+
+    prompt: str = (
+        ""  # TODO for now a single prompt, but we can replace wiht a list of messages
+    )
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "model": self.model,
+            "messages": [
+                {"role": "developer", "content": "You are a helpful assistant."},
+                {"role": "user", "content": self.prompt},
+            ],
+        }
+
 
 @dataclass
 class QueryResult:
     """Result of a completed query."""
 
     query_id: str
-    content: str = ""
-    tokens: int = 0
+    response_output: str = ""
     latency: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
@@ -65,8 +87,7 @@ class StreamChunk:
     """A chunk of streaming response."""
 
     query_id: str
-    content: str = ""
-    tokens: int = 0
+    response_chunk: str = ""
     is_complete: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
