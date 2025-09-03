@@ -44,6 +44,10 @@ class Query:
     def to_json(self) -> dict[str, Any]:
         raise NotImplementedError("to_json is not implemented for Query")
 
+    @classmethod
+    def from_json(cls, json_str: dict[str, Any]) -> "Query":
+        raise NotImplementedError("from_json is not implemented for Query")
+
 
 @dataclass
 class ChatCompletionQuery(Query):
@@ -63,6 +67,14 @@ class ChatCompletionQuery(Query):
             ],
         }
 
+    @classmethod
+    def from_json(cls, json_value: dict[str, Any]) -> "ChatCompletionQuery":
+        return ChatCompletionQuery(
+            id=json_value["id"],
+            model=json_value["model"],
+            prompt=json_value["messages"][1]["content"],
+        )
+
 
 @dataclass
 class QueryResult:
@@ -80,6 +92,22 @@ class QueryResult:
             import time
 
             self.completed_at = time.time()
+
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "id": self.query_id,
+            "choices": [
+                {"message": {"role": "assistant", "content": self.response_output}}
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10},
+        }
+
+    @classmethod
+    def from_json(cls, json_value: dict[str, Any]) -> "QueryResult":
+        return QueryResult(
+            query_id=json_value["id"],
+            response_output=json_value["choices"][0]["message"]["content"],
+        )
 
 
 @dataclass

@@ -29,6 +29,20 @@ class TestQuery:
         assert query.id is not None
         assert query.created_at is not None
 
+    def test_query_store_load(self) -> None:
+        """Test creating a basic query."""
+        query = ChatCompletionQuery(
+            prompt="Test prompt", model="test-model", max_tokens=100
+        )
+
+        query_loaded = ChatCompletionQuery.from_json(query.to_json())
+        assert query_loaded.prompt == query.prompt
+        assert query_loaded.model == query.model
+        assert query_loaded.max_tokens == query.max_tokens
+        assert query_loaded.temperature == query.temperature
+        assert query_loaded.status == query.status
+        assert query_loaded.id is not None
+
     def test_query_defaults(self) -> None:
         """Test query with minimal parameters."""
         query = ChatCompletionQuery()
