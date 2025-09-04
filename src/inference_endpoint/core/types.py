@@ -57,6 +57,13 @@ class ChatCompletionQuery(Query):
         ""  # TODO for now a single prompt, but we can replace wiht a list of messages
     )
 
+    headers: dict[str, str] = field(
+        default_factory=lambda: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer dummy",  # TODO(vir): expose this config via __post_init__
+        }
+    )
+
     def to_json(self) -> dict[str, Any]:
         return {
             "id": self.id,
