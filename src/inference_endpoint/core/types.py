@@ -72,14 +72,29 @@ class ChatCompletionQuery(Query):
                 {"role": "developer", "content": "You are a helpful assistant."},
                 {"role": "user", "content": self.prompt},
             ],
+            "stream": self.stream,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
         }
 
     @classmethod
     def from_json(cls, json_value: dict[str, Any]) -> "ChatCompletionQuery":
+        # Extract prompt from messages if present
+        prompt = ""
+        if "messages" in json_value and len(json_value["messages"]) > 0:
+            # Find the last user message
+            for msg in reversed(json_value["messages"]):
+                if msg.get("role") == "user":
+                    prompt = msg.get("content", "")
+                    break
+
         return ChatCompletionQuery(
-            id=json_value["id"],
-            model=json_value["model"],
-            prompt=json_value["messages"][1]["content"],
+            id=json_value.get("id", str(uuid.uuid4())),
+            model=json_value.get("model", ""),
+            prompt=prompt,
+            stream=json_value.get("stream", False),
+            max_tokens=json_value.get("max_tokens", 100),
+            temperature=json_value.get("temperature", 0.7),
         )
 
 
@@ -111,10 +126,53 @@ class QueryResult:
 
     @classmethod
     def from_json(cls, json_value: dict[str, Any]) -> "QueryResult":
-        return QueryResult(
-            query_id=json_value["id"],
-            response_output=json_value["choices"][0]["message"]["content"],
-        )
+        """Parse QueryResult from JSON, supporting both internal and OpenAI formats."""
+        # Check if this is an OpenAI response format
+        if "choices" in json_value and json_value["choices"]:
+            choice = json_value["choices"][0]
+
+            # Handle chat completion format
+            if "message" in choice and "content" in choice["message"]:
+                return QueryResult(
+                    query_id=json_value.get("id", ""),
+                    response_output=choice["message"]["content"],
+                )
+            # Handle text completion format
+            elif "text" in choice:
+                return QueryResult(
+                    query_id=json_value.get("id", ""),
+                    response_output=choice["text"],
+                )
+            else:
+                raise ValueError(
+                    "Invalid OpenAI response format: missing content in choices"
+                )
+
+        # Handle error responses
+        elif "error" in json_value:
+            error_info = json_value["error"]
+            error_msg = (
+                error_info.get("message", str(error_info))
+                if isinstance(error_info, dict)
+                else str(error_info)
+            )
+            return QueryResult(
+                query_id=json_value.get("id", ""),
+                response_output="",
+                error=error_msg,
+            )
+
+        # Fallback to internal format (backward compatibility)
+        elif "id" in json_value:
+            return QueryResult(
+                query_id=json_value["id"],
+                response_output=json_value.get("response_output", ""),
+                error=json_value.get("error"),
+                metadata=json_value.get("metadata", {}),
+            )
+
+        else:
+            raise ValueError("Unrecognized response format")
 
 
 @dataclass

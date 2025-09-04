@@ -4,10 +4,11 @@ import json
 import logging
 import threading
 import time
+from typing import Any
 
 from aiohttp import web
 
-from inference_endpoint.core.types import ChatCompletionQuery, QueryResult
+from inference_endpoint.core.types import ChatCompletionQuery
 
 
 class EchoServer:
@@ -40,20 +41,45 @@ class EchoServer:
         query_params = dict(request.query)
         headers = dict(request.headers)
 
-        # Get request body
-        try:
-            if request.content_type == "application/json":
-                json_payload = await request.json()
-                raw_payload = json.dumps(json_payload)
-            else:
-                raw_payload = await request.text()
-                try:
-                    json_payload = json.loads(raw_payload)
-                except (json.JSONDecodeError, TypeError):
-                    json_payload = None
-        except Exception:
-            json_payload = None
-            raw_payload = ""
+        if is_chat:
+            return {
+                "id": response_id,
+                "object": "chat.completion",
+                "created": timestamp,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": content},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(content.split()),
+                    "completion_tokens": len(content.split()),
+                    "total_tokens": 2 * len(content.split()),
+                },
+            }
+        else:
+            return {
+                "id": response_id,
+                "object": "text_completion",
+                "created": timestamp,
+                "model": model,
+                "choices": [
+                    {
+                        "text": content,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": len(content.split()),
+                    "completion_tokens": len(content.split()),
+                    "total_tokens": 2 * len(content.split()),
+                },
+            }
 
         request_data = {
             "method": request.method,
@@ -78,7 +104,110 @@ class EchoServer:
         return web.json_response(
             echo_response,
             status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
         )
+        await response.prepare(request)
+
+        # Send content as chunks (word by word)
+        words = content.split()
+        response_id = f"{'chatcmpl' if is_chat else 'cmpl'}-{request_id}"
+
+        for i, word in enumerate(words):
+            # Add space before word (except first)
+            chunk_content = f" {word}" if i > 0 else word
+
+            if is_chat:
+                chunk_data = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": chunk_content},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            else:
+                chunk_data = {
+                    "id": response_id,
+                    "object": "text_completion",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [
+                        {
+                            "text": chunk_content,
+                            "index": 0,
+                            "logprobs": None,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+
+            await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode())
+
+        # Send final chunk with finish_reason
+        if is_chat:
+            final_chunk = {
+                "id": response_id,
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+            }
+        else:
+            final_chunk = {
+                "id": response_id,
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {"text": "", "index": 0, "logprobs": None,
+                        "finish_reason": "stop"}
+                ],
+            }
+
+        await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
+        await response.write(b"data: [DONE]\n\n")
+
+        return response
+
+    async def _handle_echo_completions_request(
+        self, request: web.Request
+    ) -> web.Response:
+        """Handle completions request with OpenAI-compliant response."""
+        try:
+            json_payload = await request.json()
+
+            # Extract parameters
+            prompt = json_payload.get("prompt", "")
+            is_streaming = json_payload.get("stream", False)
+            model = json_payload.get("model", "text-davinci-003")
+            request_id = str(int(time.time() * 1000))
+
+            if is_streaming:
+                return await self._handle_streaming_response(
+                    request, prompt, request_id, model, is_chat=False
+                )
+            else:
+                response = self._create_openai_response(
+                    request_id, prompt, model, is_chat=False
+                )
+                return web.json_response(response, status=200)
+
+        except Exception as e:
+            print(f"Error handling request: {e}")
+            return web.json_response(
+                {"error": {"message": str(
+                    e), "type": "server_error", "code": 500}},
+                status=500,
+            )
 
     async def _handle_echo_chat_completions_request(
         self, request: web.Request
@@ -201,11 +330,13 @@ Examples:
         """,
     )
 
-    parser.add_argument("--version", action="version", version="%(prog)s 0.1.0")
+    parser.add_argument("--version", action="version",
+                        version="%(prog)s 0.1.0")
     parser.add_argument(
         "--host", type=str, help="hostname/address to bind to", default="localhost"
     )
-    parser.add_argument("--port", type=int, help="port to bind to", default=12345)
+    parser.add_argument("--port", type=int,
+                        help="port to bind to", default=12345)
 
     return parser
 

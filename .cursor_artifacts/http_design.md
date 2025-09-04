@@ -9,8 +9,6 @@ This document describes the design of the HTTP endpoint client for the MLPerf In
 - **uvloop** for high-performance async event loops in workers
 - **Multiprocessing** for true parallelism
 
-The client is designed to be a pluggable component implementing the abstract endpoint client interface defined in `endpoint_client/interface.py`.
-
 ## Architecture
 
 ```
@@ -89,8 +87,8 @@ class AioHttpConfig:
 
     # ClientTimeout configs
     client_timeout_total: float = None  # None means no timeout
-    client_timeout_connect: float = 10.0
-    client_timeout_sock_read: float = None  # None means no timeout
+    client_timeout_connect: float = None
+    client_timeout_sock_read: float = None
 
     # Streaming configs
     streaming_buffer_size: int = 64 * 1024  # 64KB buffer for streaming
@@ -113,10 +111,13 @@ class ZMQConfig:
 
 ```python
 import asyncio
+import logging
 from typing import Dict, Any, Optional, Callable, List
 from dataclasses import dataclass, field
 import zmq.asyncio
 from inference_endpoint.core.types import Query, QueryResult
+
+logger = logging.getLogger(__name__)
 
 class HTTPEndpointClient:
     """HTTP implementation of the EndpointClient interface."""
@@ -139,6 +140,7 @@ class HTTPEndpointClient:
         self.current_worker_idx = 0
 
         self._shutdown_event = asyncio.Event()
+        self._response_handler_task: Optional[asyncio.Task] = None
 
         # Create concurrency semaphore if configured
         self._concurrency_semaphore = None
@@ -189,7 +191,7 @@ class HTTPEndpointClient:
         await self.worker_manager.initialize()
 
         # Start response handler
-        asyncio.create_task(self._handle_responses())
+        self._response_handler_task = asyncio.create_task(self._handle_responses())
 
     async def _handle_responses(self) -> None:
         """Handle responses from workers"""
@@ -202,12 +204,21 @@ class HTTPEndpointClient:
 
         try:
             while not self._shutdown_event.is_set():
-                # Blocking receive - no timeout needed
-                response = await response_socket.receive()
+                try:
+                    # Blocking receive, timeout is used for shutdown check
+                    response = await asyncio.wait_for(
+                        response_socket.receive(), timeout=1.0
+                    )
 
-                # Execute client callback if configured
-                if self.complete_callback:
-                    await self.complete_callback(response)
+                    # Execute client callback if configured
+                    if self.complete_callback:
+                        await self.complete_callback(response)
+
+                except asyncio.TimeoutError:
+                    # Check shutdown and continue
+                    continue
+                except Exception as e:
+                    logger.error(f"Error handling response: {e}")
 
         finally:
             response_socket.close()
@@ -215,6 +226,14 @@ class HTTPEndpointClient:
     async def shutdown(self) -> None:
         """Graceful shutdown of all components"""
         self._shutdown_event.set()
+
+        # Cancel response handler
+        if self._response_handler_task:
+            self._response_handler_task.cancel()
+            try:
+                await self._response_handler_task
+            except asyncio.CancelledError:
+                pass
 
         # Close push sockets
         for socket in self.worker_push_sockets:
@@ -306,7 +325,7 @@ class WorkerManager:
         while not self._shutdown_event.is_set():
             for i, worker in enumerate(self.workers):
                 if not worker.is_alive():
-                    print(f"Worker {i} died, restarting...")
+                    logger.warning(f"Worker {i} died, restarting...")
                     # Terminate zombie process
                     if worker.pid:
                         try:
@@ -357,9 +376,12 @@ def worker_main(
     response_queue_addr: str
 ):
     """Entry point for worker process"""
-    # Install uvloop
-    import uvloop
-    uvloop.install()
+    # Install uvloop for better performance
+    try:
+        import uvloop
+        uvloop.install()
+    except ImportError:
+        logger.info("uvloop not available, using default event loop")
 
     # Create and run worker
     worker = Worker(
@@ -452,7 +474,7 @@ class Worker:
             force_close=self.aiohttp_config.tcp_connector_force_close,
             keepalive_timeout=self.aiohttp_config.tcp_connector_keepalive_timeout,
             use_dns_cache=self.aiohttp_config.tcp_connector_use_dns_cache,
-            enable_tcp_nodelay=self.aiohttp_config.tcp_connector_enable_tcp_nodelay
+            # Note: enable_tcp_nodelay was removed from implementation
         )
 
         self._session = aiohttp.ClientSession(
@@ -467,19 +489,24 @@ class Worker:
             signal.signal(signal.SIGTERM, self._handle_signal)
             signal.signal(signal.SIGINT, self._handle_signal)
 
-            print(f"Worker {self.worker_id} started")
+            logger.info(f"Worker {self.worker_id} started")
 
             # Main processing loop
             while not self._shutdown:
                 try:
-                    # Pull query from queue (blocking receive)
-                    query = await self._request_socket.receive()
+                    # Pull query from queue with timeout
+                    query = await asyncio.wait_for(
+                        self._request_socket.receive(), timeout=1.0
+                    )
 
                     # Process query asynchronously
                     asyncio.create_task(self._process_request(query))
 
+                except asyncio.TimeoutError:
+                    # Check shutdown and continue
+                    continue
                 except Exception as e:
-                    print(f"Worker {self.worker_id} error: {e}")
+                    logger.error(f"Worker {self.worker_id} error: {e}")
 
         finally:
             # Cleanup
@@ -582,13 +609,13 @@ class Worker:
         self,
         query: Query
     ) -> None:
-        """Handle non-streaming response"""
+        """Handle non-streaming response."""
         url = self.http_config.endpoint_url
 
         async with self._session.post(
             url,
             json=query.to_json(),
-            headers=query.headers
+            headers=query.headers if hasattr(query, 'headers') else {},
         ) as response:
             response_text = await response.text()
 
@@ -602,11 +629,19 @@ class Worker:
                 await self._response_socket.send(error_response)
                 return
 
-            # Parse response using QueryResult.from_json
+            # Parse OpenAI-compliant response
             try:
                 response_data = json.loads(response_text)
-                response_data['id'] = query.id
+
+                # Ensure the response has the query ID
+                if "id" not in response_data:
+                    response_data["id"] = query.id
+
                 response_obj = QueryResult.from_json(response_data)
+
+                # Override query_id to ensure it matches our query
+                response_obj.query_id = query.id
+
                 await self._response_socket.send(response_obj)
 
             except json.JSONDecodeError as e:
@@ -617,15 +652,23 @@ class Worker:
                     error=f"Failed to parse response: {str(e)}"
                 )
                 await self._response_socket.send(error_response)
+            except ValueError as e:
+                # Send error response for invalid format
+                error_response = QueryResult(
+                    query_id=query.id,
+                    response_output="",
+                    error=str(e)
+                )
+                await self._response_socket.send(error_response)
 
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals"""
-        print(f"Worker {self.worker_id} received signal {signum}")
+        logger.info(f"Worker {self.worker_id} received signal {signum}")
         self._shutdown = True
 
     async def _cleanup(self):
         """Clean up resources"""
-        print(f"Worker {self.worker_id} shutting down...")
+        logger.info(f"Worker {self.worker_id} shutting down...")
 
         # Close aiohttp session
         if self._session:
@@ -796,7 +839,7 @@ class AsyncHTTPEndpointClient:
             try:
                 await self.user_callback(result)
             except Exception as e:
-                print(f"Error in user callback: {e}")
+                logger.error(f"Error in user callback: {e}")
 
     async def start(self) -> None:
         """Start the underlying client."""

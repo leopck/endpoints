@@ -231,7 +231,7 @@ class Worker:
             raise
 
     async def _handle_non_streaming_request(self, query: Query) -> None:
-        """Handle non-streaming response - for echo server."""
+        """Handle non-streaming response."""
         url = self.http_config.endpoint_url
 
         async with self._session.post(
@@ -251,23 +251,18 @@ class Worker:
                 await self._response_socket.send(error_response)
                 return
 
-            # Parse echo server response
+            # Parse response using QueryResult's built-in parser
             try:
                 response_data = json.loads(response_text)
 
-                # Echo server returns the prompt in json_payload
-                if (
-                    "request" in response_data
-                    and "json_payload" in response_data["request"]
-                ):
-                    json_payload = response_data["request"]["json_payload"]
-                    # Parse the json_payload as a QueryResult (it's in OpenAI format)
-                    response_obj = QueryResult.from_json(json_payload)
-                else:
-                    # Fallback for unexpected format
-                    response_obj = QueryResult(
-                        query_id=query.id, response_output=response_text
-                    )
+                # Ensure the response has the query ID
+                if "id" not in response_data:
+                    response_data["id"] = query.id
+
+                response_obj = QueryResult.from_json(response_data)
+
+                # Override query_id to ensure it matches our query
+                response_obj.query_id = query.id
 
                 await self._response_socket.send(response_obj)
 
@@ -277,6 +272,14 @@ class Worker:
                     query_id=query.id,
                     response_output="",
                     error=f"Failed to parse response: {str(e)}",
+                )
+                await self._response_socket.send(error_response)
+            except ValueError as e:
+                # Send error response for invalid format
+                error_response = QueryResult(
+                    query_id=query.id,
+                    response_output="",
+                    error=str(e),
                 )
                 await self._response_socket.send(error_response)
 
