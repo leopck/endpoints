@@ -11,9 +11,13 @@ from inference_endpoint.core.types import ChatCompletionQuery, QueryResult
 
 
 class EchoServer:
-    def __init__(self, host: str = "localhost", port: int = 12345):
+    def __init__(
+        self, *, host: str = "localhost", port: int = 12345, max_osl: int | None = None
+    ):
         self.host = host
         self.port = port
+        self.max_osl = max_osl
+
         self.url = f"http://{self.host}:{self.port}"
         self.app = None
         self.runner = None
@@ -23,8 +27,14 @@ class EchoServer:
         self._shutdown_event = threading.Event()
         self.logger = logging.getLogger(__name__)
 
+    def set_max_osl(self, max_osl: int):
+        self.max_osl = max_osl
+
+    def get_max_osl(self):
+        return self.max_osl
+
     async def _handle_echo_request(self, request: web.Request) -> web.Response:
-        """Handle incoming HTTP requests and echo back the payload."""
+        """Handle incoming HTTP requests and echo back the payload without checking the payload."""
         # Extract request data
         endpoint = request.path
         query_params = dict(request.query)
@@ -74,10 +84,6 @@ class EchoServer:
         self, request: web.Request
     ) -> web.Response:
         """Handle incoming HTTP OpenAI chat completions requests and echo back a QueryResult payload."""
-        # Extract request data
-        endpoint = request.path
-        query_params = dict(request.query)
-        headers = dict(request.headers)
 
         # Get request body
         try:
@@ -87,9 +93,21 @@ class EchoServer:
                 raw_payload = await request.text()
                 json_payload = json.loads(raw_payload)
             completion_request = ChatCompletionQuery.from_json(json_payload)
+            raw_response = completion_request.prompt
+            if self.max_osl is not None:
+                # if max_osl is specified, it can be either larger or smaller than the length of the prompt
+                # if max_osl is larger, we can repeate the prompt until we reach the max_osl
+                if len(raw_response) > self.max_osl:
+                    raw_response = raw_response[: self.max_osl]
+                # if max_osl is smaller, we can truncate the prompt
+                else:
+                    raw_response = raw_response * (
+                        self.max_osl // len(raw_response) + 1
+                    )
+                    raw_response = raw_response[: self.max_osl]
             response = QueryResult(
                 query_id=completion_request.id,
-                response_output=completion_request.prompt,
+                response_output=raw_response,
             )
         except Exception as e:
             # A catch-all exception handler to help debug the issue without bringing down the server
@@ -98,24 +116,8 @@ class EchoServer:
                 status=400,
             )
 
-        request_data = {
-            "method": request.method,
-            "url": str(request.url),
-            "endpoint": endpoint,
-            "query_params": query_params,
-            "headers": headers,
-            "json_payload": response.to_json(),
-            "timestamp": time.time(),
-        }
-        self.logger.info(f"Request data: {request_data}")
-
         # Default: echo back the request
-        echo_response = {
-            "echo": True,
-            "request": request_data,
-            "message": "Request payload echoed back successfully",
-        }
-        self.logger.info(f"Echo response: {echo_response}")
+        echo_response = response.to_json()
 
         return web.json_response(
             echo_response,
@@ -140,7 +142,7 @@ class EchoServer:
         self.app.router.add_post(
             "/v1/chat/completions", self._handle_echo_chat_completions_request
         )
-        self.app.router.add_post("/v1/completions", self._handle_echo_request)
+        self.app.router.add_post("/echo", self._handle_echo_request)
 
         # Start the server
         self.runner = web.AppRunner(self.app)
