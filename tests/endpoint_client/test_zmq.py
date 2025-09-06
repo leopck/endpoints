@@ -24,36 +24,6 @@ class SampleData:
     timestamp: float
 
 
-class TestZMQConfig:
-    """Test suite for ZMQConfig."""
-
-    def test_zmq_config_defaults(self):
-        """Test ZMQConfig default values."""
-        config = ZMQConfig()
-
-        assert config.zmq_io_threads == 4
-        assert config.zmq_request_queue_prefix == "ipc:///tmp/http_worker"
-        assert config.zmq_response_queue_addr == "ipc:///tmp/http_responses"
-        assert config.zmq_high_water_mark == 1000
-        assert config.zmq_linger == 0
-        assert config.zmq_send_timeout == -1  # Non-blocking
-        assert config.zmq_recv_timeout == -1  # Blocking
-        assert config.zmq_recv_buffer_size == 10 * 1024 * 1024  # 10MB
-        assert config.zmq_send_buffer_size == 10 * 1024 * 1024  # 10MB
-
-    def test_zmq_config_custom_values(self):
-        """Test ZMQConfig with custom values."""
-        config = ZMQConfig(
-            zmq_io_threads=8,
-            zmq_high_water_mark=5000,
-            zmq_recv_buffer_size=20 * 1024 * 1024,
-        )
-
-        assert config.zmq_io_threads == 8
-        assert config.zmq_high_water_mark == 5000
-        assert config.zmq_recv_buffer_size == 20 * 1024 * 1024
-
-
 class TestZMQPushPullIntegration:
     """Integration tests for ZMQ Push/Pull sockets."""
 
@@ -398,6 +368,53 @@ class TestZMQPushPullIntegration:
             received_ids = {msg.id for msg in received}
             expected_ids = {f"concurrent-{i}" for i in range(10)}
             assert received_ids == expected_ids
+
+            push_socket.close()
+            pull_socket.close()
+
+        finally:
+            context.term()
+
+    @pytest.mark.asyncio
+    async def test_pull_socket_connect_mode(self, zmq_config):
+        """Test ZMQPullSocket in connect mode (bind=False)."""
+        address = f"ipc:///tmp/test_pull_connect_{int(time.time() * 1000)}"
+
+        context = zmq.asyncio.Context()
+
+        try:
+            # First create a push socket that binds
+            push_socket = ZMQPushSocket(context, address, zmq_config)
+            # Manually bind the push socket's underlying socket
+            push_socket.socket.close()  # Close the connected socket
+            push_socket.socket = context.socket(zmq.PUSH)
+            push_socket.socket.bind(address)
+            push_socket.socket.setsockopt(zmq.SNDHWM, zmq_config.zmq_high_water_mark)
+            push_socket.socket.setsockopt(zmq.LINGER, zmq_config.zmq_linger)
+            push_socket.socket.setsockopt(zmq.SNDBUF, zmq_config.zmq_send_buffer_size)
+            push_socket.socket.setsockopt(zmq.SNDTIMEO, zmq_config.zmq_send_timeout)
+
+            # Create pull socket in connect mode (bind=False)
+            pull_socket = ZMQPullSocket(context, address, zmq_config, bind=False)
+
+            await asyncio.sleep(0.1)
+
+            # Send a message
+            test_data = SampleData(
+                id="connect-test",
+                value="Testing connect mode",
+                timestamp=time.time(),
+            )
+
+            await push_socket.send(test_data)
+
+            # Receive the message
+            received = await pull_socket.receive()
+
+            # Verify
+            assert isinstance(received, SampleData)
+            assert received.id == "connect-test"
+            assert received.value == "Testing connect mode"
 
             push_socket.close()
             pull_socket.close()

@@ -46,7 +46,7 @@ class ZMQConfig:
     zmq_io_threads: int = 4  # Number of ZMQ IO threads
     zmq_request_queue_prefix: str = "ipc:///tmp/http_worker"
     zmq_response_queue_addr: str = "ipc:///tmp/http_responses"
-    zmq_high_water_mark: int = 1000  # max msg queue size
+    zmq_high_water_mark: int = 10_000  # max msg queue size
     zmq_linger: int = 0  # Don't block on close
     zmq_send_timeout: int = -1  # Non-blocking send
     zmq_recv_timeout: int = -1  # Blocking receive

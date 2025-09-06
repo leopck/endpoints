@@ -16,7 +16,7 @@ This document describes the design of the HTTP endpoint client for the MLPerf In
 │                    HTTPEndpointClient                           │
 │              (implements EndpointClient ABC)                    │
 │  ┌─────────────────┐                                           │
-│  │  send_request    │                                           │
+│  │  issue_query    │                                           │
 │  └────────┬─────────┘                                           │
 │           │                                                      │
 │           ├─────ZMQ PUSH (Query)────▶ Worker 1 Queue           │
@@ -147,7 +147,7 @@ class HTTPEndpointClient:
         if config.max_concurrency > 0:
             self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrency)
 
-    async def send_request(
+    async def issue_query(
         self,
         query: Query
     ) -> None:
@@ -160,11 +160,11 @@ class HTTPEndpointClient:
         # Apply concurrency limit if configured
         if self._concurrency_semaphore:
             async with self._concurrency_semaphore:
-                await self._send_request_impl(query)
+                await self._issue_query_impl(query)
         else:
-            await self._send_request_impl(query)
+            await self._issue_query_impl(query)
 
-    async def _send_request_impl(self, query: Query) -> None:
+    async def _issue_query_impl(self, query: Query) -> None:
         """Internal implementation of send request."""
         # Round-robin to next worker
         worker_idx = self.current_worker_idx
@@ -748,7 +748,7 @@ class ZMQPullSocket:
 
 **Key Features**:
 
-- Returns asyncio.Future objects from send_request
+- Returns asyncio.Future objects from issue_query
 - Maintains mapping of query_id to futures
 - Supports both callback and await patterns
 - Thin wrapper with minimal overhead
@@ -794,12 +794,12 @@ class AsyncHTTPEndpointClient:
             complete_callback=self._handle_response
         )
 
-    async def send_request(self, query: Query) -> asyncio.Future[QueryResult]:
+    async def issue_query(self, query: Query) -> asyncio.Future[QueryResult]:
         """
         Send a request and return a future for the response.
 
         The returned future can be:
-        - Awaited directly: `result = await client.send_request(query)`
+        - Awaited directly: `result = await client.issue_query(query)`
         - Checked for completion: `if future.done(): result = future.result()`
         - Used with asyncio utilities: `done, pending = await asyncio.wait([future])`
 
@@ -814,7 +814,7 @@ class AsyncHTTPEndpointClient:
         self._pending_futures[query.id] = future
 
         # Send request through underlying client
-        await self._client.send_request(query)
+        await self._client.issue_query(query)
 
         return future
 
@@ -871,7 +871,7 @@ await client.start()
 # Send and await response
 query = ChatCompletionQuery(prompt="Hello")
 try:
-    result = await client.send_request(query)
+    result = await client.issue_query(query)
     print(f"Response: {result.response_output}")
 except Exception as e:
     print(f"Error: {e}")
@@ -884,7 +884,7 @@ except Exception as e:
 futures = []
 for i in range(10):
     query = ChatCompletionQuery(prompt=f"Query {i}")
-    future = await client.send_request(query)
+    future = await client.issue_query(query)
     futures.append(future)
 
 # Check completed futures
@@ -912,7 +912,7 @@ client = AsyncHTTPEndpointClient(
 await client.start()
 
 # Send request - both future and callback will work
-future = await client.send_request(query)
+future = await client.issue_query(query)
 # Can still await the future even with callback
 result = await future
 ```
@@ -922,7 +922,7 @@ result = await future
 ```python
 # Send multiple requests and wait for first completion
 queries = [ChatCompletionQuery(prompt=f"Q{i}") for i in range(5)]
-futures = [await client.send_request(q) for q in queries]
+futures = [await client.issue_query(q) for q in queries]
 
 # Wait for first to complete
 done, pending = await asyncio.wait(futures, return_when=asyncio.FIRST_COMPLETED)
@@ -977,7 +977,7 @@ query = ChatCompletionQuery(
 
 # Send request and await response
 try:
-    result = await client.send_request(query)
+    result = await client.issue_query(query)
     print(f"Response: {result.response_output}")
 except Exception as e:
     print(f"Error: {e}")
@@ -1000,7 +1000,7 @@ client = AsyncHTTPEndpointClient(
 await client.start()
 
 # Send request - both callback and future work
-future = await client.send_request(query)
+future = await client.issue_query(query)
 # Can still await even with callback
 result = await future
 
@@ -1019,7 +1019,7 @@ queries = [
 # Collect futures
 futures = []
 for query in queries:
-    future = await client.send_request(query)
+    future = await client.issue_query(query)
     futures.append(future)
 
 # Wait for all to complete with timeout

@@ -19,108 +19,64 @@ from inference_endpoint.endpoint_client.zmq_utils import ZMQPullSocket, ZMQPushS
 logger = logging.getLogger(__name__)
 
 
-class AsyncHTTPEndpointClient:
-    """
-    Future-based wrapper around HTTPEndpointClient.
-
-    Provides both callback and future-based interfaces for maximum flexibility.
-    """
-
-    def __init__(
-        self,
-        config: HTTPClientConfig,
-        aiohttp_config: AioHttpConfig,
-        zmq_config: ZMQConfig,
-        complete_callback: Callable | None = None,
-    ):
-        """
-        Initialize the future-based client.
-
-        Args:
-            config: HTTP client configuration
-            aiohttp_config: aiohttp configuration
-            zmq_config: ZMQ configuration
-            complete_callback: Optional user callback for responses
-        """
-        self.user_callback = complete_callback
-        self._pending_futures: dict[str, asyncio.Future] = {}
-
-        # Create underlying client with our internal callback
-        self._client = HTTPEndpointClient(
-            config=config,
-            aiohttp_config=aiohttp_config,
-            zmq_config=zmq_config,
-            complete_callback=self._handle_response,
-        )
-
-    async def send_request(self, query: Query) -> asyncio.Future[QueryResult]:
-        """
-        Send a request and return a future for the response.
-
-        The returned future can be:
-        - Awaited directly: `result = await client.send_request(query)`
-        - Checked for completion: `if future.done(): result = future.result()`
-        - Used with asyncio utilities: `done, pending = await asyncio.wait([future])`
-
-        Args:
-            query: Query to send
-
-        Returns:
-            asyncio.Future that will contain the QueryResult
-        """
-        # Create future for this request
-        future = asyncio.get_event_loop().create_future()
-        self._pending_futures[query.id] = future
-
-        # Send request through underlying client
-        await self._client.send_request(query)
-
-        return future
-
-    async def _handle_response(self, result: QueryResult) -> None:
-        """
-        Internal callback that completes futures and calls user callback.
-
-        Args:
-            result: Response from the endpoint
-        """
-        # Complete the future if pending
-        future = self._pending_futures.pop(result.query_id, None)
-        if future and not future.done():
-            if result.error:
-                # Create exception for errors
-                future.set_exception(Exception(result.error))
-            else:
-                future.set_result(result)
-
-        # Also call user callback if provided
-        if self.user_callback:
-            try:
-                await self.user_callback(result)
-            except Exception as e:
-                logger.error(f"Error in user callback: {e}")
-
-    async def start(self) -> None:
-        """Start the underlying client."""
-        await self._client.start()
-
-    async def shutdown(self) -> None:
-        """
-        Shutdown the client and cancel pending futures.
-        """
-        # Cancel all pending futures
-        for future in self._pending_futures.values():
-            if not future.done():
-                future.cancel()
-
-        self._pending_futures.clear()
-
-        # Shutdown underlying client
-        await self._client.shutdown()
-
-
 class HTTPEndpointClient:
-    """HTTP implementation of the EndpointClient interface."""
+    """
+    HTTP endpoint client with multiprocessing workers and ZMQ communication.
+
+    This client provides high-performance HTTP request handling by:
+    - Using multiple worker processes to parallelize running concurrent HTTP requests
+    - ZMQ for inter-process communication for efficient message passing
+    - both future-based and callback-based response handling
+    - round-robin load balancing across workers
+
+    Architecture:
+    - Main process: Accepts requests, distributes to workers, handles responses
+    - Worker processes: Make actual HTTP requests to the endpoint
+
+    Usage Examples:
+
+    1. Future-based (recommended for async code):
+        ```python
+        client = HTTPEndpointClient(config, aiohttp_config, zmq_config)
+        await client.start()
+
+        # Send request and get future immediately
+        query = ChatCompletionQuery(prompt="Hello")
+        future = client.issue_query(query)
+
+        # Can await the future when needed
+        result = await future
+        print(result.response_output)
+        ```
+
+    2. Callback-based (for event-driven patterns):
+        ```python
+        async def handle_response(result: QueryResult):
+            print(f"Got response: {result.response_output}")
+
+        client = HTTPEndpointClient(
+            config, aiohttp_config, zmq_config,
+            complete_callback=handle_response
+        )
+        await client.start()
+
+        # Send request - callback will be invoked
+        future = client.issue_query(query)
+        # Future is still returned even with callback
+        ```
+
+    3. Multiple concurrent requests:
+        ```python
+        # Send multiple requests
+        futures = []
+        for i in range(10):
+            query = ChatCompletionQuery(prompt=f"Query {i}")
+            futures.append(client.issue_query(query))
+
+        # Wait for all to complete
+        results = await asyncio.gather(*futures)
+        ```
+    """
 
     def __init__(
         self,
@@ -150,35 +106,61 @@ class HTTPEndpointClient:
 
         self._shutdown_event = asyncio.Event()
         self._response_handler_task: asyncio.Task | None = None
+        self._pending_futures: dict[str, asyncio.Future] = {}
 
         # Create concurrency semaphore if configured
         self._concurrency_semaphore = None
         if config.max_concurrency > 0:
             self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrency)
 
-    async def send_request(self, query: Query) -> None:
+    def issue_query(self, query: Query) -> asyncio.Future[QueryResult]:
         """
-        Send a query to the endpoint. Non-blocking, results delivered via callback.
+        Send a query to the endpoint and return a future for the response.
+
+        The returned future can be:
+        - Awaited directly: `result = await client.issue_query(query)`
+        - Checked for completion: `if future.done(): result = future.result()`
+        - Used with asyncio utilities: `done, pending = await asyncio.wait([future])`
 
         Args:
             query: Query object containing request details
-        """
-        # Apply concurrency limit if configured
-        if self._concurrency_semaphore:
-            async with self._concurrency_semaphore:
-                await self._send_request_impl(query)
-        else:
-            await self._send_request_impl(query)
 
-    async def _send_request_impl(self, query: Query) -> None:
+        Returns:
+            asyncio.Future that will contain the QueryResult
+        """
+        # Create future for this request
+        future = asyncio.get_event_loop().create_future()
+        self._pending_futures[query.id] = future
+
+        # Schedule the actual send
+        asyncio.create_task(self._issue_query_impl(query))
+
+        return future
+
+    async def _issue_query_impl(self, query: Query) -> None:
         """Internal implementation of send request."""
+        try:
+            # Apply concurrency limit if configured
+            if self._concurrency_semaphore:
+                async with self._concurrency_semaphore:
+                    await self._send_to_worker(query)
+            else:
+                await self._send_to_worker(query)
+        except Exception as e:
+            # If sending fails, complete the future with error
+            future = self._pending_futures.get(query.id)
+            if future and not future.done():
+                future.set_exception(e)
+
+    async def _send_to_worker(self, query: Query) -> None:
+        """Send query to worker via ZMQ."""
         # Round-robin to next worker
         worker_idx = self.current_worker_idx
         self.current_worker_idx = (self.current_worker_idx + 1) % len(
             self.worker_push_sockets
         )
 
-        # Send query directly to worker's queue (non-blocking)
+        # Send query directly to worker's queue
         await self.worker_push_sockets[worker_idx].send(query)
 
     async def start(self) -> None:
@@ -215,9 +197,21 @@ class HTTPEndpointClient:
                         response_socket.receive(), timeout=1.0
                     )
 
-                    # Execute client callback if configured
+                    # Complete the future if pending
+                    future = self._pending_futures.pop(response.query_id, None)
+                    if future and not future.done():
+                        if response.error:
+                            # Create exception for errors
+                            future.set_exception(Exception(response.error))
+                        else:
+                            future.set_result(response)
+
+                    # Also call user callback if provided
                     if self.complete_callback:
-                        await self.complete_callback(response)
+                        try:
+                            await self.complete_callback(response)
+                        except Exception as e:
+                            logger.error(f"Error in user callback: {e}")
 
                 except TimeoutError:
                     # Check shutdown and continue
@@ -231,6 +225,12 @@ class HTTPEndpointClient:
     async def shutdown(self) -> None:
         """Graceful shutdown of all components."""
         self._shutdown_event.set()
+
+        # Cancel all pending futures
+        for future in self._pending_futures.values():
+            if not future.done():
+                future.cancel()
+        self._pending_futures.clear()
 
         # Cancel response handler
         if self._response_handler_task:

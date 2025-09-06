@@ -31,7 +31,7 @@ def worker_main(
     response_queue_addr: str,
 ):
     """Entry point for worker process."""
-    # Install uvloop for better performance
+    # Install uvloop which also enables it
     try:
         import uvloop
 
@@ -147,7 +147,6 @@ class Worker:
                 await self._handle_non_streaming_request(query)
 
         except Exception as e:
-            # Send error response
             error_response = QueryResult(
                 query_id=query.id, response_output="", error=str(e)
             )
@@ -178,46 +177,54 @@ class Worker:
                 accumulated_content = []
                 first_chunk_sent = False
 
-                async for line in response.content:
-                    # Decode line
-                    line_str = line.decode("utf-8").strip()
-                    if not line_str:
-                        continue
+                # Read lines from the stream
+                async for line_bytes in response.content:
+                    # Decode line and handle multiple lines in one chunk
+                    line_str = line_bytes.decode("utf-8")
 
-                    # Parse SSE format (data: ...)
-                    if line_str.startswith("data: "):
-                        data_str = line_str[6:]
-                        if data_str == "[DONE]":
-                            break
-
-                        try:
-                            chunk_data = json.loads(data_str)
-
-                            # For streaming, check for content in choices
-                            if "choices" in chunk_data and chunk_data["choices"]:
-                                choice = chunk_data["choices"][0]
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    content = choice["delta"]["content"]
-                                    if content:
-                                        accumulated_content.append(content)
-
-                                        # Send only the first chunk as a streaming indicator
-                                        if not first_chunk_sent:
-                                            first_chunk_response = QueryResult(
-                                                query_id=query.id,
-                                                response_output=content,
-                                                metadata={
-                                                    "first_chunk": True,
-                                                    "final_chunk": False,
-                                                },
-                                            )
-                                            await self._response_socket.send(
-                                                first_chunk_response
-                                            )
-                                            first_chunk_sent = True
-
-                        except json.JSONDecodeError:
+                    # Split by newlines in case multiple lines come in one chunk
+                    for line in line_str.split("\n"):
+                        line = line.strip()
+                        if not line:
                             continue
+
+                        # Parse SSE format (data: ...)
+                        if line.startswith("data: "):
+                            data_str = line[6:]
+                            if data_str == "[DONE]":
+                                break
+
+                            try:
+                                chunk_data = json.loads(data_str)
+
+                                # For streaming, check for content in choices
+                                if "choices" in chunk_data and chunk_data["choices"]:
+                                    choice = chunk_data["choices"][0]
+                                    if (
+                                        "delta" in choice
+                                        and "content" in choice["delta"]
+                                    ):
+                                        content = choice["delta"]["content"]
+                                        if content:
+                                            accumulated_content.append(content)
+
+                                            # Send only the first chunk as a streaming indicator
+                                            if not first_chunk_sent:
+                                                first_chunk_response = QueryResult(
+                                                    query_id=query.id,
+                                                    response_output=content,
+                                                    metadata={
+                                                        "first_chunk": True,
+                                                        "final_chunk": False,
+                                                    },
+                                                )
+                                                await self._response_socket.send(
+                                                    first_chunk_response
+                                                )
+                                                first_chunk_sent = True
+
+                            except json.JSONDecodeError:
+                                continue
 
                 # Send final complete response
                 final_response = QueryResult(

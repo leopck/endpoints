@@ -12,14 +12,29 @@ from inference_endpoint.core.types import ChatCompletionQuery
 
 
 class EchoServer:
+<<<<<<< HEAD
     def __init__(
         self, *, host: str = "localhost", port: int = 12345, max_osl: int | None = None
     ):
+||||||| parent of fca223d (updates)
+    def __init__(self, host: str = "localhost", port: int = 12345):
+=======
+    def __init__(self, host: str = "localhost", port: int = 0):
+>>>>>>> fca223d (updates)
         self.host = host
+<<<<<<< HEAD
         self.port = port
         self.max_osl = max_osl
 
         self.url = f"http://{self.host}:{self.port}"
+||||||| parent of fca223d (updates)
+        self.port = port
+        self.url = f"http://{self.host}:{self.port}"
+=======
+        self.port = port  # 0 means find available port
+        self.actual_port = None  # Will be set after binding
+        self.url = None  # Will be set after binding
+>>>>>>> fca223d (updates)
         self.app = None
         self.runner = None
         self.site = None
@@ -276,9 +291,24 @@ class EchoServer:
         # Start the server
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
+
+        # Create site with port (0 means find available port)
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
+<<<<<<< HEAD
         self.logger.info(
+||||||| parent of fca223d (updates)
+        print(
+=======
+
+        # Get the actual port that was bound
+        self.actual_port = self.site._server.sockets[0].getsockname()[1]
+
+        # Update URL with actual port
+        self.url = f"http://{self.host}:{self.actual_port}"
+
+        print(
+>>>>>>> fca223d (updates)
             f"==========================\nServer started at {self.url}\n==========================",
         )
 

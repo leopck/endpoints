@@ -5,11 +5,10 @@ This module provides HTTP client implementation with multiprocessing and ZMQ.
 """
 
 from .configs import AioHttpConfig, HTTPClientConfig, ZMQConfig
-from .http_client import AsyncHTTPEndpointClient, HTTPEndpointClient
+from .http_client import HTTPEndpointClient
 
 __all__ = [
     "HTTPEndpointClient",
-    "AsyncHTTPEndpointClient",
     "HTTPClientConfig",
     "AioHttpConfig",
     "ZMQConfig",
