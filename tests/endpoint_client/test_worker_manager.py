@@ -240,7 +240,15 @@ class TestWorkerManagerAdvanced:
             original_pids = [worker.pid for worker in manager.workers]
             for worker in manager.workers:
                 worker.terminate()
-                worker.join(timeout=1.0)
+
+            # Wait for graceful termination
+            await asyncio.sleep(2.0)
+
+            # Force kill any workers that didn't terminate gracefully
+            for worker in manager.workers:
+                if worker.is_alive():
+                    worker.kill()
+                worker.join(timeout=2.0)
 
             # Verify all workers are dead
             for worker in manager.workers:

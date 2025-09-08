@@ -192,7 +192,7 @@ class HTTPEndpointClient:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    # Blocking receive with short timeout for shutdown check
+                    # Blocking receive with 1.0s timeout for shutdown check
                     response = await asyncio.wait_for(
                         response_socket.receive(), timeout=1.0
                     )
@@ -208,10 +208,7 @@ class HTTPEndpointClient:
 
                     # Also call user callback if provided
                     if self.complete_callback:
-                        try:
-                            await self.complete_callback(response)
-                        except Exception as e:
-                            logger.error(f"Error in user callback: {e}")
+                        await self.complete_callback(response)
 
                 except TimeoutError:
                     # Check shutdown and continue

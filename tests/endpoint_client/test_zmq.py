@@ -1,8 +1,10 @@
 """Tests for ZMQ components used in endpoint client."""
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
+from unittest import mock
 
 import pytest
 import zmq
@@ -22,6 +24,102 @@ class SampleData:
     id: str
     value: str
     timestamp: float
+
+
+class TestZMQConfig:
+    """Tests for ZMQConfig class."""
+
+    def test_default_path_generation_unix(self):
+        """Test that default paths are generated correctly on Unix systems."""
+        with mock.patch("os.name", "posix"):
+            with mock.patch("os.getpid", return_value=12345):
+                config = ZMQConfig()
+
+                assert (
+                    config.zmq_request_queue_prefix
+                    == "ipc://mlperf_endpoint_http_worker_12345"
+                )
+                assert (
+                    config.zmq_response_queue_addr
+                    == "ipc://mlperf_endpoint_http_responses_12345"
+                )
+
+    def test_custom_paths_preserved(self):
+        """Test that custom paths are preserved when provided."""
+        custom_request = "ipc:///custom/request/path"
+        custom_response = "ipc:///custom/response/path"
+
+        config = ZMQConfig(
+            zmq_request_queue_prefix=custom_request,
+            zmq_response_queue_addr=custom_response,
+        )
+
+        assert config.zmq_request_queue_prefix == custom_request
+        assert config.zmq_response_queue_addr == custom_response
+
+    def test_partial_custom_paths(self):
+        """Test that only unspecified paths are auto-generated."""
+        custom_request = "ipc:///custom/request/path"
+
+        with mock.patch("os.name", "posix"):
+            with mock.patch("os.getpid", return_value=12345):
+                config = ZMQConfig(zmq_request_queue_prefix=custom_request)
+
+                assert config.zmq_request_queue_prefix == custom_request
+                assert (
+                    config.zmq_response_queue_addr
+                    == "ipc://mlperf_endpoint_http_responses_12345"
+                )
+
+    def test_path_generation_includes_pid(self):
+        """Test that path generation includes the process ID."""
+        with mock.patch("os.name", "posix"):
+            config = ZMQConfig()
+
+            # Should include PID in the path
+            pid = os.getpid()
+            assert (
+                f"ipc://mlperf_endpoint_http_worker_{pid}"
+                == config.zmq_request_queue_prefix
+            )
+            assert (
+                f"ipc://mlperf_endpoint_http_responses_{pid}"
+                == config.zmq_response_queue_addr
+            )
+
+    def test_different_processes_get_different_paths(self):
+        """Test that different processes get different socket paths."""
+        with mock.patch("os.name", "posix"):
+            # Simulate different PIDs
+            with mock.patch("os.getpid", return_value=111):
+                config1 = ZMQConfig()
+
+            with mock.patch("os.getpid", return_value=222):
+                config2 = ZMQConfig()
+
+            # Paths should be different due to PID
+            assert config1.zmq_request_queue_prefix != config2.zmq_request_queue_prefix
+            assert config1.zmq_response_queue_addr != config2.zmq_response_queue_addr
+
+    def test_zmq_config_other_attributes(self):
+        """Test that other ZMQConfig attributes work correctly."""
+        config = ZMQConfig(
+            zmq_io_threads=8,
+            zmq_high_water_mark=20000,
+            zmq_linger=100,
+            zmq_send_timeout=5000,
+            zmq_recv_timeout=10000,
+            zmq_recv_buffer_size=20 * 1024 * 1024,
+            zmq_send_buffer_size=20 * 1024 * 1024,
+        )
+
+        assert config.zmq_io_threads == 8
+        assert config.zmq_high_water_mark == 20000
+        assert config.zmq_linger == 100
+        assert config.zmq_send_timeout == 5000
+        assert config.zmq_recv_timeout == 10000
+        assert config.zmq_recv_buffer_size == 20 * 1024 * 1024
+        assert config.zmq_send_buffer_size == 20 * 1024 * 1024
 
 
 class TestZMQPushPullIntegration:

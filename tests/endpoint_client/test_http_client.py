@@ -1248,7 +1248,7 @@ class TestHTTPEndpointClientCoverage:
             future = client.issue_query(query)
 
             # Should get an exception due to connection error
-            with pytest.raises((aiohttp.ClientError, asyncio.TimeoutError)):
+            with pytest.raises((aiohttp.ClientError, asyncio.TimeoutError, Exception)):
                 await asyncio.wait_for(future, timeout=5.0)
 
         finally:

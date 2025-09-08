@@ -1,13 +1,13 @@
 """Worker process implementation for HTTP endpoint client."""
 
 import asyncio
-import json
 import logging
 import os
 import signal
 from multiprocessing import Process
 
 import aiohttp
+import orjson
 import zmq
 import zmq.asyncio
 
@@ -77,6 +77,7 @@ class Worker:
         self._zmq_context: zmq.asyncio.Context | None = None
         self._request_socket: ZMQPullSocket | None = None
         self._response_socket: ZMQPushSocket | None = None
+        self.tcp_connector: aiohttp.TCPConnector | None = None
 
     async def run(self) -> None:
         """Main worker loop - pull requests, execute, push responses."""
@@ -89,25 +90,19 @@ class Worker:
             self._zmq_context, self.response_socket_addr, self.zmq_config
         )
 
-        # Configure aiohttp session
-        timeout = aiohttp.ClientTimeout(
-            total=self.aiohttp_config.client_timeout_total,
-            connect=self.aiohttp_config.client_timeout_connect,
-            sock_read=self.aiohttp_config.client_timeout_sock_read,
-        )
-        connector = aiohttp.TCPConnector(
-            limit=self.aiohttp_config.tcp_connector_limit,
-            ttl_dns_cache=self.aiohttp_config.tcp_connector_ttl_dns_cache,
-            enable_cleanup_closed=self.aiohttp_config.tcp_connector_enable_cleanup_closed,
-            force_close=self.aiohttp_config.tcp_connector_force_close,
-            keepalive_timeout=self.aiohttp_config.tcp_connector_keepalive_timeout,
-            use_dns_cache=self.aiohttp_config.tcp_connector_use_dns_cache,
-        )
+        # Create TCP connector
+        self.tcp_connector = self.aiohttp_config.create_tcp_connector()
 
+        # Create aiohttp session with TCP connector
         self._session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=timeout,
+            connector=self.tcp_connector,
+            timeout=aiohttp.ClientTimeout(
+                total=self.aiohttp_config.client_timeout_total,
+                connect=self.aiohttp_config.client_timeout_connect,
+                sock_read=self.aiohttp_config.client_timeout_sock_read,
+            ),
             connector_owner=self.aiohttp_config.client_session_connector_owner,
+            skip_auto_headers=self.aiohttp_config.skip_auto_headers,
         )
 
         try:
@@ -138,6 +133,37 @@ class Worker:
             # Cleanup
             await self._cleanup()
 
+    async def _send_error_response(self, query_id: str, error_message: str) -> None:
+        """Helper to create and send error responses."""
+        error_response = QueryResult(
+            query_id=query_id,
+            response_output=None,
+            error=error_message,
+        )
+        await self._response_socket.send(error_response)
+
+    async def _check_http_status(self, response, query_id: str) -> bool:
+        """Check HTTP status and send error if not 200. Returns True if OK."""
+        if response.status != 200:
+            error_text = await response.text()
+            await self._send_error_response(
+                query_id, f"HTTP {response.status}: {error_text}"
+            )
+            return False
+        return True
+
+    async def _parse_json_response(
+        self, response_text: str, query_id: str
+    ) -> dict | None:
+        """Parse JSON response, send error if invalid. Returns None on error."""
+        try:
+            return orjson.loads(response_text)
+        except (ValueError, TypeError) as e:
+            await self._send_error_response(
+                query_id, f"Failed to parse response: {str(e)}"
+            )
+            return None
+
     async def _process_request(self, query: Query) -> None:
         """Process a single query."""
         try:
@@ -147,95 +173,78 @@ class Worker:
                 await self._handle_non_streaming_request(query)
 
         except Exception as e:
-            error_response = QueryResult(
-                query_id=query.id, response_output="", error=str(e)
-            )
-            await self._response_socket.send(error_response)
+            await self._send_error_response(query.id, str(e))
 
     async def _handle_streaming_request(self, query: Query) -> None:
         """Handle streaming response."""
         url = self.http_config.endpoint_url
 
-        try:
-            async with self._session.post(
-                url,
-                json=query.to_json(),
-                headers=query.headers if hasattr(query, "headers") else {},
-            ) as response:
-                # Check for HTTP errors
-                if response.status != 200:
-                    error_text = await response.text()
-                    error_response = QueryResult(
-                        query_id=query.id,
-                        response_output="",
-                        error=f"HTTP {response.status}: {error_text}",
-                    )
-                    await self._response_socket.send(error_response)
-                    return
+        async with self._session.post(
+            url,
+            json=query.to_json(),
+            headers=query.headers if hasattr(query, "headers") else {},
+        ) as response:
+            # Check for HTTP errors
+            if not await self._check_http_status(response, query.id):
+                return
 
-                # Stream chunks
-                accumulated_content = []
-                first_chunk_sent = False
+            # Stream chunks
+            accumulated_content = []
+            first_chunk_sent = False
 
-                # Read lines from the stream
-                async for line_bytes in response.content:
-                    # Decode line and handle multiple lines in one chunk
-                    line_str = line_bytes.decode("utf-8")
+            # Read lines from the stream
+            async for line_bytes in response.content:
+                # Decode line and handle multiple lines in one chunk
+                line_str = line_bytes.decode("utf-8")
 
-                    # Split by newlines in case multiple lines come in one chunk
-                    for line in line_str.split("\n"):
-                        line = line.strip()
-                        if not line:
+                # Split by newlines in case multiple lines come in one chunk
+                for line in line_str.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    # Parse SSE format (data: ...)
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk_data = orjson.loads(data_str)
+
+                            # For streaming, check for content in choices
+                            if "choices" in chunk_data and chunk_data["choices"]:
+                                choice = chunk_data["choices"][0]
+                                if "delta" in choice and "content" in choice["delta"]:
+                                    content = choice["delta"]["content"]
+                                    if content:
+                                        accumulated_content.append(content)
+
+                                        # Send only the first chunk as a streaming indicator
+                                        if not first_chunk_sent:
+                                            first_chunk_response = QueryResult(
+                                                query_id=query.id,
+                                                response_output=content,
+                                                metadata={
+                                                    "first_chunk": True,
+                                                    "final_chunk": False,
+                                                },
+                                            )
+                                            await self._response_socket.send(
+                                                first_chunk_response
+                                            )
+                                            first_chunk_sent = True
+
+                        except (ValueError, TypeError):
                             continue
 
-                        # Parse SSE format (data: ...)
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
-                                break
-
-                            try:
-                                chunk_data = json.loads(data_str)
-
-                                # For streaming, check for content in choices
-                                if "choices" in chunk_data and chunk_data["choices"]:
-                                    choice = chunk_data["choices"][0]
-                                    if (
-                                        "delta" in choice
-                                        and "content" in choice["delta"]
-                                    ):
-                                        content = choice["delta"]["content"]
-                                        if content:
-                                            accumulated_content.append(content)
-
-                                            # Send only the first chunk as a streaming indicator
-                                            if not first_chunk_sent:
-                                                first_chunk_response = QueryResult(
-                                                    query_id=query.id,
-                                                    response_output=content,
-                                                    metadata={
-                                                        "first_chunk": True,
-                                                        "final_chunk": False,
-                                                    },
-                                                )
-                                                await self._response_socket.send(
-                                                    first_chunk_response
-                                                )
-                                                first_chunk_sent = True
-
-                            except json.JSONDecodeError:
-                                continue
-
-                # Send final complete response
-                final_response = QueryResult(
-                    query_id=query.id,
-                    response_output="".join(accumulated_content),
-                    metadata={"first_chunk": False, "final_chunk": True},
-                )
-                await self._response_socket.send(final_response)
-
-        except Exception:
-            raise
+            # Send final complete response
+            final_response = QueryResult(
+                query_id=query.id,
+                response_output="".join(accumulated_content),
+                metadata={"first_chunk": False, "final_chunk": True},
+            )
+            await self._response_socket.send(final_response)
 
     async def _handle_non_streaming_request(self, query: Query) -> None:
         """Handle non-streaming response."""
@@ -248,47 +257,25 @@ class Worker:
         ) as response:
             response_text = await response.text()
 
-            if response.status != 200:
-                # Send error response
-                error_response = QueryResult(
-                    query_id=query.id,
-                    response_output="",
-                    error=f"HTTP {response.status}: {response_text}",
-                )
-                await self._response_socket.send(error_response)
+            # Check HTTP status
+            if not await self._check_http_status(response, query.id):
                 return
 
-            # Parse response using QueryResult's built-in parser
-            try:
-                response_data = json.loads(response_text)
+            # Parse JSON response
+            response_data = await self._parse_json_response(response_text, query.id)
+            if response_data is None:
+                return
 
-                # Ensure the response has the query ID
-                if "id" not in response_data:
-                    response_data["id"] = query.id
+            # Ensure the response has the query ID
+            if "id" not in response_data:
+                response_data["id"] = query.id
 
-                response_obj = QueryResult.from_json(response_data)
+            response_obj = QueryResult.from_json(response_data)
 
-                # Override query_id to ensure it matches our query
-                response_obj.query_id = query.id
+            # Override query_id to ensure it matches our query
+            response_obj.query_id = query.id
 
-                await self._response_socket.send(response_obj)
-
-            except json.JSONDecodeError as e:
-                # Send error response
-                error_response = QueryResult(
-                    query_id=query.id,
-                    response_output="",
-                    error=f"Failed to parse response: {str(e)}",
-                )
-                await self._response_socket.send(error_response)
-            except ValueError as e:
-                # Send error response for invalid format
-                error_response = QueryResult(
-                    query_id=query.id,
-                    response_output="",
-                    error=str(e),
-                )
-                await self._response_socket.send(error_response)
+            await self._response_socket.send(response_obj)
 
     def _handle_signal(self, signum, frame):
         """Handle shutdown signals."""
@@ -298,6 +285,11 @@ class Worker:
     async def _cleanup(self):
         """Clean up resources."""
         logger.info(f"Worker {self.worker_id} shutting down...")
+
+        # Close TCP connector
+        if self.tcp_connector:
+            await self.tcp_connector.close()
+            self.tcp_connector = None
 
         # Close aiohttp session
         if self._session:
@@ -389,7 +381,7 @@ class WorkerManager:
                     self.workers[i] = new_worker
                     self.worker_pids[i] = new_worker.pid
 
-            await asyncio.sleep(5.0)  # Check every 5 seconds
+            await asyncio.sleep(2.0)  # Check every 2 seconds
 
     async def shutdown(self) -> None:
         """Graceful shutdown of all workers."""
