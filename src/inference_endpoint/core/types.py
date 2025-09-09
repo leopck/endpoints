@@ -126,7 +126,7 @@ class QueryResult:
 
     @classmethod
     def from_json(cls, json_value: dict[str, Any]) -> "QueryResult":
-        """Parse QueryResult from JSON, supporting both internal and OpenAI formats."""
+        """Parse QueryResult from JSON in OpenAI format."""
         # Check if this is an OpenAI response format
         if "choices" in json_value and json_value["choices"]:
             choice = json_value["choices"][0]
