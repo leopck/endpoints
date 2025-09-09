@@ -185,7 +185,7 @@ class ZMQConfig:
 
         # Include PID to avoid conflicts between processes
         pid = os.getpid()
-        return f"ipc://mlperf_endpoint_{name}_{pid}"
+        return f"ipc:///tmp/mlperf_endpoint_{name}_{pid}"
 
 
 __all__ = ["HTTPClientConfig", "AioHttpConfig", "ZMQConfig", "SocketConfig"]
