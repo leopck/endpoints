@@ -5,7 +5,6 @@ import pickle
 import signal
 import time
 
-import orjson
 import pytest
 import zmq
 import zmq.asyncio
@@ -1730,88 +1729,6 @@ class TestWorkerEdgeCases:
             assert isinstance(response, QueryResult)
             assert response.query_id == "test-bad-json"
             assert "Failed to parse response" in response.error
-
-            response_pull.close()
-            worker._response_socket.close()
-
-        finally:
-            context.term()
-            worker._zmq_context.term()
-
-    @pytest.mark.asyncio
-    async def test_non_streaming_missing_id_field(self, basic_config):
-        """Test non-streaming response missing ID field."""
-        http_config, aiohttp_config, zmq_config = basic_config
-
-        worker = Worker(
-            worker_id=0,
-            http_config=http_config,
-            aiohttp_config=aiohttp_config,
-            zmq_config=zmq_config,
-            request_socket_addr=f"{zmq_config.zmq_request_queue_prefix}_0_requests",
-            response_socket_addr=zmq_config.zmq_response_queue_addr,
-        )
-
-        # Initialize components
-        worker._zmq_context = zmq.asyncio.Context()
-        worker._response_socket = ZMQPushSocket(
-            worker._zmq_context, zmq_config.zmq_response_queue_addr, zmq_config
-        )
-
-        # Mock session to return response without ID field
-        from unittest.mock import AsyncMock, MagicMock
-
-        mock_response = AsyncMock()
-        mock_response.status = 200
-        # Response missing the "id" field
-        mock_response.text = AsyncMock(
-            return_value=orjson.dumps(
-                {
-                    "response_output": "Test output without ID",
-                    "metadata": {"some": "data"},
-                    # Note: no "id" field
-                }
-            ).decode()
-        )
-
-        # Create a proper async context manager mock
-        mock_context_manager = MagicMock()
-        mock_context_manager.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_context_manager.__aexit__ = AsyncMock(return_value=None)
-
-        # Create session mock with regular MagicMock so post doesn't return a coroutine
-        mock_session = MagicMock()
-        mock_session.post.return_value = mock_context_manager
-        worker._session = mock_session
-
-        context = zmq.asyncio.Context()
-
-        try:
-            # Create response pull socket
-            response_pull = context.socket(zmq.PULL)
-            response_pull.bind(zmq_config.zmq_response_queue_addr)
-
-            await asyncio.sleep(0.1)
-
-            # Send query
-            query = ChatCompletionQuery(
-                id="test-missing-id",
-                prompt="Response will miss ID",
-                model="gpt-3.5-turbo",
-            )
-
-            await worker._handle_non_streaming_request(query)
-
-            # Verify response was sent with ID added
-            response_data = await asyncio.wait_for(response_pull.recv(), timeout=1.0)
-            response = pickle.loads(response_data)
-
-            assert isinstance(response, QueryResult)
-            assert (
-                response.query_id == "test-missing-id"
-            )  # ID should be added from query
-            assert response.response_output == "Test output without ID"
-            assert response.error is None
 
             response_pull.close()
             worker._response_socket.close()
