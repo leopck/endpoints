@@ -156,14 +156,26 @@ class HTTPEndpointClient:
                         timeout=self.config.response_handler_timeout,
                     )
 
-                    # Complete the future if pending
-                    future = self._pending_futures.pop(response.query_id, None)
-                    if future and not future.done():
-                        if response.error:
-                            # Create exception for errors
-                            future.set_exception(Exception(response.error))
-                        else:
-                            future.set_result(response)
+                    # For streaming responses, only resolve future on final chunk
+                    # For non-streaming responses, resolve immediately
+                    is_final_chunk = (
+                        response.metadata.get("final_chunk", True)
+                        if response.metadata
+                        else True
+                    )
+
+                    if is_final_chunk:
+                        # Complete the future if pending
+                        future = self._pending_futures.pop(response.query_id, None)
+                        if future and not future.done():
+                            if response.error:
+                                # Create exception for errors
+                                future.set_exception(Exception(response.error))
+                            else:
+                                future.set_result(response)
+                    else:
+                        # For non-final chunks, keep the future pending
+                        future = self._pending_futures.get(response.query_id, None)
 
                     # Also call user callback if provided
                     if self.complete_callback:
