@@ -4,7 +4,9 @@ import asyncio
 import logging
 import os
 import signal
+from collections.abc import AsyncGenerator
 from multiprocessing import Process
+from typing import Any
 
 import aiohttp
 import orjson
@@ -117,14 +119,14 @@ class Worker:
                 try:
                     # Pull query from queue with timeout
                     query = await asyncio.wait_for(
-                        self._request_socket.receive(), timeout=1.0
+                        self._request_socket.receive(),
+                        timeout=self.http_config.worker_request_timeout,
                     )
 
                     # Process query asynchronously
                     asyncio.create_task(self._process_request(query))
 
                 except TimeoutError:
-                    # Check shutdown and continue
                     continue
                 except Exception as e:
                     logger.error(f"Worker {self.worker_id} error: {e}")
@@ -133,8 +135,9 @@ class Worker:
             # Cleanup
             await self._cleanup()
 
-    async def _send_error_response(self, query_id: str, error_message: str) -> None:
-        """Helper to create and send error responses."""
+    async def _handle_error(self, query_id: str, error: Exception | str) -> None:
+        """Send error response for a query."""
+        error_message = str(error) if isinstance(error, Exception) else error
         error_response = QueryResult(
             query_id=query_id,
             response_output=None,
@@ -142,27 +145,31 @@ class Worker:
         )
         await self._response_socket.send(error_response)
 
-    async def _check_http_status(self, response, query_id: str) -> bool:
-        """Check HTTP status and send error if not 200. Returns True if OK."""
-        if response.status != 200:
-            error_text = await response.text()
-            await self._send_error_response(
-                query_id, f"HTTP {response.status}: {error_text}"
-            )
-            return False
-        return True
+    async def _make_http_request(
+        self, query: Query
+    ) -> AsyncGenerator[aiohttp.ClientResponse, None]:
+        """
+        Common HTTP request setup and execution.
 
-    async def _parse_json_response(
-        self, response_text: str, query_id: str
-    ) -> dict | None:
-        """Parse JSON response, send error if invalid. Returns None on error."""
-        try:
-            return orjson.loads(response_text)
-        except (ValueError, TypeError) as e:
-            await self._send_error_response(
-                query_id, f"Failed to parse response: {str(e)}"
-            )
-            return None
+        Yields the response object if status is 200.
+        Handles error cases and sends error responses.
+        """
+        url = self.http_config.endpoint_url
+        headers = query.headers if hasattr(query, "headers") else {}
+
+        async with self._session.post(
+            url,
+            json=query.to_json(),
+            headers=headers,
+        ) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                await self._handle_error(
+                    query.id, f"HTTP {response.status}: {error_text}"
+                )
+                return
+
+            yield response
 
     async def _process_request(self, query: Query) -> None:
         """Process a single query."""
@@ -173,22 +180,11 @@ class Worker:
                 await self._handle_non_streaming_request(query)
 
         except Exception as e:
-            await self._send_error_response(query.id, str(e))
+            await self._handle_error(query.id, e)
 
     async def _handle_streaming_request(self, query: Query) -> None:
         """Handle streaming response."""
-        url = self.http_config.endpoint_url
-
-        async with self._session.post(
-            url,
-            json=query.to_json(),
-            headers=query.headers if hasattr(query, "headers") else {},
-        ) as response:
-            # Check for HTTP errors
-            if not await self._check_http_status(response, query.id):
-                return
-
-            # Stream chunks
+        async for response in self._make_http_request(query):
             accumulated_content = []
             first_chunk_sent = False
 
@@ -197,7 +193,6 @@ class Worker:
                 # Decode line and handle multiple lines in one chunk
                 line_str = line_bytes.decode("utf-8")
 
-                # Split by newlines in case multiple lines come in one chunk
                 for line in line_str.split("\n"):
                     line = line.strip()
                     if not line:
@@ -227,7 +222,7 @@ class Worker:
                                                 response_output=content,
                                                 metadata={
                                                     "first_chunk": True,
-                                                    "final_chunk": False,
+                                                    "final_chunk": False,  # TODO(vir): first chunk can be final chunk as well
                                                 },
                                             )
                                             await self._response_socket.send(
@@ -248,25 +243,18 @@ class Worker:
 
     async def _handle_non_streaming_request(self, query: Query) -> None:
         """Handle non-streaming response."""
-        url = self.http_config.endpoint_url
-
-        async with self._session.post(
-            url,
-            json=query.to_json(),
-            headers=query.headers if hasattr(query, "headers") else {},
-        ) as response:
+        async for response in self._make_http_request(query):
             response_text = await response.text()
 
-            # Check HTTP status
-            if not await self._check_http_status(response, query.id):
-                return
-
             # Parse JSON response
-            response_data = await self._parse_json_response(response_text, query.id)
-            if response_data is None:
+            try:
+                response_data = orjson.loads(response_text)
+            except (ValueError, TypeError) as e:
+                await self._handle_error(
+                    query.id, f"Failed to parse response: {str(e)}"
+                )
                 return
 
-            # Ensure the response has the query ID
             if "id" not in response_data:
                 response_data["id"] = query.id
 
@@ -277,12 +265,12 @@ class Worker:
 
             await self._response_socket.send(response_obj)
 
-    def _handle_signal(self, signum, frame):
+    def _handle_signal(self, signum: int, frame: Any) -> None:
         """Handle shutdown signals."""
         logger.info(f"Worker {self.worker_id} received signal {signum}")
         self._shutdown = True
 
-    async def _cleanup(self):
+    async def _cleanup(self) -> None:
         """Clean up resources."""
         logger.info(f"Worker {self.worker_id} shutting down...")
 
@@ -338,7 +326,7 @@ class WorkerManager:
         self._monitor_task = asyncio.create_task(self._monitor_workers())
 
         # Wait for workers to be ready
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(self.http_config.worker_ready_wait_time)
 
     def _spawn_worker(self, worker_id: int) -> Process:
         """Spawn a single worker process."""
@@ -381,7 +369,7 @@ class WorkerManager:
                     self.workers[i] = new_worker
                     self.worker_pids[i] = new_worker.pid
 
-            await asyncio.sleep(2.0)  # Check every 2 seconds
+            await asyncio.sleep(self.http_config.worker_health_check_interval)
 
     async def shutdown(self) -> None:
         """Graceful shutdown of all workers."""
@@ -401,10 +389,10 @@ class WorkerManager:
                 worker.terminate()
 
         # Wait for graceful shutdown
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(self.http_config.worker_graceful_shutdown_wait)
 
         # Force kill any remaining workers
         for worker in self.workers:
             if worker.is_alive():
                 worker.kill()
-                worker.join(timeout=1.0)
+                worker.join(timeout=self.http_config.worker_force_kill_timeout)

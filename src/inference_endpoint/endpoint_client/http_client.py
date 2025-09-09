@@ -26,56 +26,14 @@ class HTTPEndpointClient:
     This client provides high-performance HTTP request handling by:
     - Using multiple worker processes to parallelize running concurrent HTTP requests
     - ZMQ for inter-process communication for efficient message passing
-    - both future-based and callback-based response handling
-    - round-robin load balancing across workers
+    - Both future-based and callback-based response handling
+    - Round-robin load balancing across workers
 
     Architecture:
     - Main process: Accepts requests, distributes to workers, handles responses
     - Worker processes: Make actual HTTP requests to the endpoint
 
-    Usage Examples:
-
-    1. Future-based (recommended for async code):
-        ```python
-        client = HTTPEndpointClient(config, aiohttp_config, zmq_config)
-        await client.start()
-
-        # Send request and get future immediately
-        query = ChatCompletionQuery(prompt="Hello")
-        future = client.issue_query(query)
-
-        # Can await the future when needed
-        result = await future
-        print(result.response_output)
-        ```
-
-    2. Callback-based (for event-driven patterns):
-        ```python
-        async def handle_response(result: QueryResult):
-            print(f"Got response: {result.response_output}")
-
-        client = HTTPEndpointClient(
-            config, aiohttp_config, zmq_config,
-            complete_callback=handle_response
-        )
-        await client.start()
-
-        # Send request - callback will be invoked
-        future = client.issue_query(query)
-        # Future is still returned even with callback
-        ```
-
-    3. Multiple concurrent requests:
-        ```python
-        # Send multiple requests
-        futures = []
-        for i in range(10):
-            query = ChatCompletionQuery(prompt=f"Query {i}")
-            futures.append(client.issue_query(query))
-
-        # Wait for all to complete
-        results = await asyncio.gather(*futures)
-        ```
+    See README.md for detailed usage examples and configuration options.
     """
 
     def __init__(
@@ -192,9 +150,10 @@ class HTTPEndpointClient:
         try:
             while not self._shutdown_event.is_set():
                 try:
-                    # Blocking receive with 1.0s timeout for shutdown check
+                    # Blocking receive with timeout for shutdown check
                     response = await asyncio.wait_for(
-                        response_socket.receive(), timeout=1.0
+                        response_socket.receive(),
+                        timeout=self.config.response_handler_timeout,
                     )
 
                     # Complete the future if pending

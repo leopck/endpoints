@@ -131,10 +131,59 @@ class TestZMQPushPullIntegration:
         return ZMQConfig()
 
     @pytest.mark.asyncio
-    async def test_basic_push_pull_communication(self, zmq_config):
-        """Test basic push/pull communication."""
+    @pytest.mark.parametrize(
+        "test_case",
+        [
+            # Basic prompt
+            {
+                "id": "test-simple",
+                "prompt": "Hello, world!",
+                "description": "simple prompt",
+            },
+            # Large payload
+            {
+                "id": "test-large",
+                "prompt": "x" * 10000,  # 10KB prompt
+                "description": "large payload",
+            },
+            # Special characters and unicode
+            {
+                "id": "test-special",
+                "prompt": "Test with special chars: 你好 🚀 €£¥ \n\t\r",
+                "description": "special characters",
+            },
+            # Empty prompt
+            {
+                "id": "test-empty",
+                "prompt": "",
+                "description": "empty prompt",
+            },
+            # JSON-like content
+            {
+                "id": "test-json",
+                "prompt": '{"message": "Test JSON", "nested": {"key": "value"}}',
+                "description": "JSON content",
+            },
+            # SQL injection attempt (testing edge cases)
+            {
+                "id": "test-sql",
+                "prompt": "'; DROP TABLE users; --",
+                "description": "SQL injection pattern",
+            },
+            # Multiple lines
+            {
+                "id": "test-multiline",
+                "prompt": "Line 1\nLine 2\nLine 3\n\nLine 5 with gaps",
+                "description": "multiline content",
+            },
+        ],
+    )
+    async def test_push_pull_communication_various_payloads(
+        self, zmq_config, test_case
+    ):
+        """Test push/pull communication with various payload types."""
         # Create unique address for this test
-        address = f"ipc:///tmp/test_basic_{int(time.time() * 1000)}"
+        address = f"ipc:///tmp/test_payload_{test_case['id']}_{int(time.time() * 1000)}"
 
         # Create context
         context = zmq.asyncio.Context()
@@ -149,13 +198,14 @@ class TestZMQPushPullIntegration:
             # Allow time for connection
             await asyncio.sleep(0.1)
 
-            # Send a query
+            # Send a query with the test case data
             test_query = ChatCompletionQuery(
-                id="test-123",
-                prompt="Hello, world!",
+                id=test_case["id"],
+                prompt=test_case["prompt"],
                 model="gpt-3.5-turbo",
                 max_tokens=50,
                 temperature=0.7,
+                metadata={"test_description": test_case["description"]},
             )
 
             await push_socket.send(test_query)
@@ -165,11 +215,12 @@ class TestZMQPushPullIntegration:
 
             # Verify
             assert isinstance(received, ChatCompletionQuery)
-            assert received.id == "test-123"
-            assert received.prompt == "Hello, world!"
+            assert received.id == test_case["id"]
+            assert received.prompt == test_case["prompt"]
             assert received.model == "gpt-3.5-turbo"
             assert received.max_tokens == 50
             assert received.temperature == 0.7
+            assert received.metadata["test_description"] == test_case["description"]
 
             # Cleanup
             push_socket.close()
@@ -179,9 +230,70 @@ class TestZMQPushPullIntegration:
             context.term()
 
     @pytest.mark.asyncio
-    async def test_query_result_communication(self, zmq_config):
-        """Test sending and receiving QueryResult objects."""
-        address = f"ipc:///tmp/test_result_{int(time.time() * 1000)}"
+    @pytest.mark.parametrize(
+        "result_case",
+        [
+            # Basic response
+            {
+                "query_id": "test-basic-result",
+                "response_output": "This is the generated response",
+                "error": None,
+                "metadata": {
+                    "model": "gpt-3.5-turbo",
+                    "tokens_used": 25,
+                    "latency": 1.5,
+                },
+                "description": "basic response",
+            },
+            # Empty response
+            {
+                "query_id": "test-empty-result",
+                "response_output": "",
+                "error": None,
+                "metadata": {"model": "gpt-3.5-turbo", "tokens_used": 0},
+                "description": "empty response",
+            },
+            # Error response
+            {
+                "query_id": "test-error-result",
+                "response_output": "",
+                "error": "HTTP 500: Internal Server Error",
+                "metadata": {"error_code": 500, "retry_after": 60},
+                "description": "error response",
+            },
+            # Large response
+            {
+                "query_id": "test-large-result",
+                "response_output": "Y" * 5000,  # 5KB response
+                "error": None,
+                "metadata": {
+                    "model": "gpt-3.5-turbo",
+                    "tokens_used": 1000,
+                    "chunks": 1,
+                },
+                "description": "large response",
+            },
+            # Response with special characters
+            {
+                "query_id": "test-special-result",
+                "response_output": "Response with special: 你好世界 🌍 €£¥\n\tTabbed line",
+                "error": None,
+                "metadata": {"model": "gpt-3.5-turbo", "language": "mixed"},
+                "description": "special characters response",
+            },
+            # JSON response
+            {
+                "query_id": "test-json-result",
+                "response_output": '{"status": "success", "data": {"items": [1, 2, 3]}}',
+                "error": None,
+                "metadata": {"model": "gpt-3.5-turbo", "format": "json"},
+                "description": "JSON formatted response",
+            },
+        ],
+    )
+    async def test_query_result_various_scenarios(self, zmq_config, result_case):
+        """Test sending and receiving QueryResult objects with various scenarios."""
+        address = f"ipc:///tmp/test_result_{result_case['query_id']}_{int(time.time() * 1000)}"
 
         context = zmq.asyncio.Context()
 
@@ -193,9 +305,10 @@ class TestZMQPushPullIntegration:
 
             # Send a QueryResult
             test_result = QueryResult(
-                query_id="test-456",
-                response_output="This is the generated response",
-                metadata={"model": "gpt-3.5-turbo", "tokens_used": 25, "latency": 1.5},
+                query_id=result_case["query_id"],
+                response_output=result_case["response_output"],
+                error=result_case["error"],
+                metadata=result_case["metadata"],
             )
 
             await push_socket.send(test_result)
@@ -203,11 +316,10 @@ class TestZMQPushPullIntegration:
 
             # Verify
             assert isinstance(received, QueryResult)
-            assert received.query_id == "test-456"
-            assert received.response_output == "This is the generated response"
-            assert received.metadata["model"] == "gpt-3.5-turbo"
-            assert received.metadata["tokens_used"] == 25
-            assert received.metadata["latency"] == 1.5
+            assert received.query_id == result_case["query_id"]
+            assert received.response_output == result_case["response_output"]
+            assert received.error == result_case["error"]
+            assert received.metadata == result_case["metadata"]
 
             push_socket.close()
             pull_socket.close()
@@ -268,9 +380,42 @@ class TestZMQPushPullIntegration:
             context.term()
 
     @pytest.mark.asyncio
-    async def test_multiple_push_single_pull(self, zmq_config):
-        """Test multiple push sockets sending to single pull socket."""
-        address = f"ipc:///tmp/test_multi_push_{int(time.time() * 1000)}"
+    @pytest.mark.parametrize(
+        "sequence_config",
+        [
+            # Multiple push sockets to single pull
+            {
+                "description": "multiple push sockets",
+                "num_push_sockets": 3,
+                "num_messages_per_socket": 1,
+                "concurrent": False,
+            },
+            # Single push socket with multiple sequential messages
+            {
+                "description": "sequential messages",
+                "num_push_sockets": 1,
+                "num_messages_per_socket": 5,
+                "concurrent": False,
+            },
+            # Single push socket with concurrent messages
+            {
+                "description": "concurrent messages",
+                "num_push_sockets": 1,
+                "num_messages_per_socket": 10,
+                "concurrent": True,
+            },
+            # Multiple push sockets with multiple messages each
+            {
+                "description": "multiple sockets with multiple messages",
+                "num_push_sockets": 2,
+                "num_messages_per_socket": 3,
+                "concurrent": False,
+            },
+        ],
+    )
+    async def test_multiple_message_sequences(self, zmq_config, sequence_config):
+        """Test various patterns of sending multiple messages."""
+        address = f"ipc:///tmp/test_sequence_{sequence_config['description'].replace(' ', '_')}_{int(time.time() * 1000)}"
 
         context = zmq.asyncio.Context()
 
@@ -278,110 +423,61 @@ class TestZMQPushPullIntegration:
             # Create pull socket
             pull_socket = ZMQPullSocket(context, address, zmq_config, bind=True)
 
-            # Create multiple push sockets
+            # Create push sockets
             push_sockets = []
-            for _ in range(3):
+            for _ in range(sequence_config["num_push_sockets"]):
                 push_socket = ZMQPushSocket(context, address, zmq_config)
                 push_sockets.append(push_socket)
 
             await asyncio.sleep(0.1)
 
-            # Send from each push socket
+            # Send messages
             sent_queries = []
-            for i, push_socket in enumerate(push_sockets):
-                query = ChatCompletionQuery(
-                    id=f"multi-{i}",
-                    prompt=f"Query from socket {i}",
-                    model="gpt-3.5-turbo",
-                )
-                sent_queries.append(query)
-                await push_socket.send(query)
+            total_messages = (
+                sequence_config["num_push_sockets"]
+                * sequence_config["num_messages_per_socket"]
+            )
+
+            if sequence_config["concurrent"]:
+                # Send all messages concurrently
+                tasks = []
+                for socket_idx, push_socket in enumerate(push_sockets):
+                    for msg_idx in range(sequence_config["num_messages_per_socket"]):
+                        query = ChatCompletionQuery(
+                            id=f"socket-{socket_idx}-msg-{msg_idx}",
+                            prompt=f"Query from socket {socket_idx}, message {msg_idx}",
+                            model="gpt-3.5-turbo",
+                        )
+                        sent_queries.append(query)
+                        tasks.append(push_socket.send(query))
+                await asyncio.gather(*tasks)
+            else:
+                # Send messages sequentially
+                for socket_idx, push_socket in enumerate(push_sockets):
+                    for msg_idx in range(sequence_config["num_messages_per_socket"]):
+                        query = ChatCompletionQuery(
+                            id=f"socket-{socket_idx}-msg-{msg_idx}",
+                            prompt=f"Query from socket {socket_idx}, message {msg_idx}",
+                            model="gpt-3.5-turbo",
+                        )
+                        sent_queries.append(query)
+                        await push_socket.send(query)
 
             # Receive all messages
             received_queries = []
-            for _ in range(3):
+            for _ in range(total_messages):
                 received = await pull_socket.receive()
                 received_queries.append(received)
 
             # Verify all messages received (order may vary)
             received_ids = {q.id for q in received_queries}
-            assert received_ids == {"multi-0", "multi-1", "multi-2"}
+            expected_ids = {q.id for q in sent_queries}
+            assert received_ids == expected_ids
+            assert len(received_queries) == total_messages
 
             # Cleanup
             for socket in push_sockets:
                 socket.close()
-            pull_socket.close()
-
-        finally:
-            context.term()
-
-    @pytest.mark.asyncio
-    async def test_large_payload_communication(self, zmq_config):
-        """Test sending large payloads."""
-        address = f"ipc:///tmp/test_large_{int(time.time() * 1000)}"
-
-        context = zmq.asyncio.Context()
-
-        try:
-            pull_socket = ZMQPullSocket(context, address, zmq_config, bind=True)
-            push_socket = ZMQPushSocket(context, address, zmq_config)
-
-            await asyncio.sleep(0.1)
-
-            # Create large query
-            large_prompt = "x" * 10000  # 10KB prompt
-            large_query = ChatCompletionQuery(
-                id="large-123",
-                prompt=large_prompt,
-                model="gpt-3.5-turbo",
-                max_tokens=1000,
-                metadata={"test": "large_payload"},
-            )
-
-            await push_socket.send(large_query)
-            received = await pull_socket.receive()
-
-            assert received.id == "large-123"
-            assert len(received.prompt) == 10000
-            assert received.prompt == large_prompt
-            assert received.metadata["test"] == "large_payload"
-
-            push_socket.close()
-            pull_socket.close()
-
-        finally:
-            context.term()
-
-    @pytest.mark.asyncio
-    async def test_error_response_handling(self, zmq_config):
-        """Test sending error responses."""
-        address = f"ipc:///tmp/test_error_{int(time.time() * 1000)}"
-
-        context = zmq.asyncio.Context()
-
-        try:
-            pull_socket = ZMQPullSocket(context, address, zmq_config, bind=True)
-            push_socket = ZMQPushSocket(context, address, zmq_config)
-
-            await asyncio.sleep(0.1)
-
-            # Send error response
-            error_result = QueryResult(
-                query_id="error-123",
-                response_output="",
-                error="HTTP 500: Internal Server Error",
-                metadata={"error_code": 500},
-            )
-
-            await push_socket.send(error_result)
-            received = await pull_socket.receive()
-
-            assert received.query_id == "error-123"
-            assert received.response_output == ""
-            assert received.error == "HTTP 500: Internal Server Error"
-            assert received.metadata["error_code"] == 500
-
-            push_socket.close()
             pull_socket.close()
 
         finally:
@@ -414,58 +510,6 @@ class TestZMQPushPullIntegration:
             assert received.id == "custom-001"
             assert received.value == "test value with special chars: 你好 🚀"
             assert isinstance(received.timestamp, float)
-
-            push_socket.close()
-            pull_socket.close()
-
-        finally:
-            context.term()
-
-    @pytest.mark.asyncio
-    async def test_concurrent_send_receive(self, zmq_config):
-        """Test concurrent sending and receiving."""
-        address = f"ipc:///tmp/test_concurrent_{int(time.time() * 1000)}"
-
-        context = zmq.asyncio.Context()
-
-        try:
-            pull_socket = ZMQPullSocket(context, address, zmq_config, bind=True)
-            push_socket = ZMQPushSocket(context, address, zmq_config)
-
-            await asyncio.sleep(0.1)
-
-            # Send multiple messages concurrently
-            async def send_messages():
-                tasks = []
-                for i in range(10):
-                    query = ChatCompletionQuery(
-                        id=f"concurrent-{i}",
-                        prompt=f"Concurrent query {i}",
-                        model="gpt-3.5-turbo",
-                    )
-                    tasks.append(push_socket.send(query))
-                await asyncio.gather(*tasks)
-
-            # Receive messages concurrently
-            async def receive_messages():
-                messages = []
-                for _ in range(10):
-                    msg = await pull_socket.receive()
-                    messages.append(msg)
-                return messages
-
-            # Start both operations
-            send_task = asyncio.create_task(send_messages())
-            receive_task = asyncio.create_task(receive_messages())
-
-            await send_task
-            received = await receive_task
-
-            # Verify all messages received
-            assert len(received) == 10
-            received_ids = {msg.id for msg in received}
-            expected_ids = {f"concurrent-{i}" for i in range(10)}
-            assert received_ids == expected_ids
 
             push_socket.close()
             pull_socket.close()

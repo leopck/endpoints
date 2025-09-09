@@ -60,7 +60,8 @@ class ChatCompletionQuery(Query):
     headers: dict[str, str] = field(
         default_factory=lambda: {
             "Content-Type": "application/json",
-            "Authorization": "Bearer dummy",  # TODO(vir): expose this config via __post_init__
+            # TODO(vir): expose this config via __post_init__
+            "Authorization": "Bearer dummy",
         }
     )
 
@@ -73,7 +74,7 @@ class ChatCompletionQuery(Query):
                 {"role": "user", "content": self.prompt},
             ],
             "stream": self.stream,
-            "max_tokens": self.max_tokens,
+            "max_completion_tokens": self.max_tokens,
             "temperature": self.temperature,
         }
 
@@ -92,9 +93,9 @@ class ChatCompletionQuery(Query):
             id=json_value.get("id", str(uuid.uuid4())),
             model=json_value.get("model", ""),
             prompt=prompt,
-            stream=json_value.get("stream", False),
-            max_tokens=json_value.get("max_tokens", 100),
-            temperature=json_value.get("temperature", 0.7),
+            stream=json_value.get("stream"),
+            max_tokens=json_value.get("max_completion_tokens"),
+            temperature=json_value.get("temperature"),
         )
 
 

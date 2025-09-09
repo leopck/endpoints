@@ -18,6 +18,17 @@ class HTTPClientConfig:
         -1
     )  # -1 means unlimited, otherwise limits concurrent requests via semaphore
 
+    # Worker lifecycle timeouts
+    # [INIT] Time to wait for workers to be ready
+    worker_ready_wait_time: float = 0.5  # init
+    worker_health_check_interval: float = 2.0  # runtime
+    worker_graceful_shutdown_wait: float = 0.5  # post-run
+    worker_force_kill_timeout: float = 1.0  # post-run
+
+    # Response handling timeouts, for signal handling
+    response_handler_timeout: float = 1.0
+    worker_request_timeout: float = 1.0
+
 
 @dataclass
 class SocketConfig:
@@ -162,22 +173,19 @@ class ZMQConfig:
 
     @staticmethod
     def _generate_ipc_path(name: str) -> str:
-        """Generate a portable IPC socket path.
+        """Generate an IPC socket path.
 
         Args:
             name: Base name for the socket
 
         Returns:
-            Portable IPC socket path
+            IPC socket path with PID to avoid conflicts
         """
-        # Unix-like systems use file-based IPC
-        if os.name != "nt":  # linux
-            # Include PID to avoid conflicts between processes
-            pid = os.getpid()
-            return f"ipc://mlperf_endpoint_{name}_{pid}"
+        assert os.name != "nt", "Windows not yet supported"
 
-        else:
-            raise NotImplementedError(f"OS is not supported yet: {os.name}.")
+        # Include PID to avoid conflicts between processes
+        pid = os.getpid()
+        return f"ipc://mlperf_endpoint_{name}_{pid}"
 
 
 __all__ = ["HTTPClientConfig", "AioHttpConfig", "ZMQConfig", "SocketConfig"]

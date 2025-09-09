@@ -9,42 +9,60 @@ import zmq.asyncio
 from inference_endpoint.endpoint_client.configs import ZMQConfig
 
 
-class ZMQPushSocket:
-    """Async wrapper for ZMQ PUSH socket."""
+class ZMQSocket:
+    """Base class for async ZMQ sockets."""
 
-    def __init__(self, context: zmq.asyncio.Context, address: str, config: ZMQConfig):
-        """
-        Initialize ZMQ push socket.
+    def __init__(
+        self,
+        context: zmq.asyncio.Context,
+        socket_type: int,
+        address: str,
+        config: ZMQConfig,
+        bind: bool = False,
+    ):
+        """Initialize ZMQ socket with common configuration."""
+        self.socket = context.socket(socket_type)
 
-        Args:
-            context: ZMQ async context
-            address: Socket address to connect to
-            config: ZMQ configuration
-        """
-        self.socket = context.socket(zmq.PUSH)
-        self.socket.connect(address)
-        self.socket.setsockopt(zmq.SNDHWM, config.zmq_high_water_mark)
+        if bind:
+            self.socket.bind(address)
+        else:
+            self.socket.connect(address)
+
+        # Common socket options
         self.socket.setsockopt(zmq.LINGER, config.zmq_linger)
-        self.socket.setsockopt(zmq.SNDBUF, config.zmq_send_buffer_size)
-        # Non-blocking send
-        self.socket.setsockopt(zmq.SNDTIMEO, config.zmq_send_timeout)
 
-    async def send(self, data: Any) -> None:
-        """
-        Serialize and send data through push socket (non-blocking).
+        # Set type-specific options
+        self._set_socket_options(config)
 
-        Args:
-            data: Any pickleable Python object to send
-        """
-        serialized = pickle.dumps(data)
-        await self.socket.send(serialized, zmq.NOBLOCK)
+    def _set_socket_options(self, config: ZMQConfig) -> None:
+        """Override in subclasses to set specific socket options."""
+        pass
 
     def close(self) -> None:
         """Close socket cleanly."""
         self.socket.close()
 
 
-class ZMQPullSocket:
+class ZMQPushSocket(ZMQSocket):
+    """Async wrapper for ZMQ PUSH socket."""
+
+    def __init__(self, context: zmq.asyncio.Context, address: str, config: ZMQConfig):
+        """Initialize ZMQ push socket."""
+        super().__init__(context, zmq.PUSH, address, config, bind=False)
+
+    def _set_socket_options(self, config: ZMQConfig) -> None:
+        """Set PUSH socket specific options."""
+        self.socket.setsockopt(zmq.SNDHWM, config.zmq_high_water_mark)
+        self.socket.setsockopt(zmq.SNDBUF, config.zmq_send_buffer_size)
+        self.socket.setsockopt(zmq.SNDTIMEO, config.zmq_send_timeout)
+
+    async def send(self, data: Any) -> None:
+        """Serialize and send data through push socket (non-blocking)."""
+        serialized = pickle.dumps(data)
+        await self.socket.send(serialized, zmq.NOBLOCK)
+
+
+class ZMQPullSocket(ZMQSocket):
     """Async wrapper for ZMQ PULL socket."""
 
     def __init__(
@@ -54,35 +72,16 @@ class ZMQPullSocket:
         config: ZMQConfig,
         bind: bool = False,
     ):
-        """
-        Initialize ZMQ pull socket.
+        """Initialize ZMQ pull socket."""
+        super().__init__(context, zmq.PULL, address, config, bind=bind)
 
-        Args:
-            context: ZMQ async context
-            address: Socket address to bind/connect to
-            config: ZMQ configuration
-            bind: If True, bind to address; if False, connect to address
-        """
-        self.socket = context.socket(zmq.PULL)
-        if bind:
-            self.socket.bind(address)
-        else:
-            self.socket.connect(address)
+    def _set_socket_options(self, config: ZMQConfig) -> None:
+        """Set PULL socket specific options."""
         self.socket.setsockopt(zmq.RCVHWM, config.zmq_high_water_mark)
         self.socket.setsockopt(zmq.RCVBUF, config.zmq_recv_buffer_size)
-        # Blocking receive (no timeout)
         self.socket.setsockopt(zmq.RCVTIMEO, config.zmq_recv_timeout)
 
     async def receive(self) -> Any:
-        """
-        Receive and deserialize data from pull socket (blocking).
-
-        Returns:
-            Deserialized Python object
-        """
+        """Receive and deserialize data from pull socket (blocking)."""
         serialized = await self.socket.recv()
         return pickle.loads(serialized)
-
-    def close(self) -> None:
-        """Close socket cleanly."""
-        self.socket.close()
