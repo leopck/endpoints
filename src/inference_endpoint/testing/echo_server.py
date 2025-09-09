@@ -1,3 +1,5 @@
+"""HTTP Echo Server for testing inference endpoint clients."""
+
 import argparse
 import asyncio
 import json
@@ -80,6 +82,61 @@ class EchoServer:
             status=200,
         )
 
+    async def _handle_streaming_response(
+        self,
+        request: web.Request,
+        completion_request: ChatCompletionQuery,
+        content: str,
+    ) -> web.StreamResponse:
+        """Handle streaming response with SSE format."""
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await response.prepare(request)
+
+        # Send content in chunks (word by word for echo server)
+        words = content.split() if content else []
+
+        # Send chunks
+        for i, word in enumerate(words):
+            # Add space before word (except first)
+            chunk_content = f" {word}" if i > 0 else word
+
+            chunk_data = {
+                "id": f"chatcmpl-{completion_request.id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": completion_request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+            await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode())
+
+        # Send final chunk with finish_reason
+        final_chunk = {
+            "id": f"chatcmpl-{completion_request.id}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": completion_request.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+
+        await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
+        await response.write(b"data: [DONE]\n\n")
+
+        return response
+
     async def _handle_echo_chat_completions_request(
         self, request: web.Request
     ) -> web.Response:
@@ -105,24 +162,28 @@ class EchoServer:
                         self.max_osl // len(raw_response) + 1
                     )
                     raw_response = raw_response[: self.max_osl]
-            response = QueryResult(
-                query_id=completion_request.id,
-                response_output=raw_response,
-            )
+
+            # Check if this is a streaming request
+            if completion_request.stream:
+                # Return SSE (Server-Sent Events) format for streaming
+                return await self._handle_streaming_response(
+                    request, completion_request, raw_response
+                )
+            else:
+                # Non-streaming: return QueryResult as before
+                response = QueryResult(
+                    query_id=completion_request.id,
+                    response_output=raw_response,
+                )
+                echo_response = response.to_json()
+                return web.json_response(echo_response, status=200)
+
         except Exception as e:
             # A catch-all exception handler to help debug the issue without bringing down the server
             return web.json_response(
                 {"error": f"error encountered : {str(e)}"},
                 status=400,
             )
-
-        # Default: echo back the request
-        echo_response = response.to_json()
-
-        return web.json_response(
-            echo_response,
-            status=200,
-        )
 
     def _run_server(self):
         """Run the server in a separate thread."""

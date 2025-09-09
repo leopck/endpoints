@@ -212,6 +212,10 @@ class Worker:
                                 choice = chunk_data["choices"][0]
                                 if "delta" in choice and "content" in choice["delta"]:
                                     content = choice["delta"]["content"]
+                                    is_final_chunk = (
+                                        choice["delta"].get("finish_reason") is not None
+                                    )
+
                                     if content:
                                         accumulated_content.append(content)
 
@@ -222,7 +226,7 @@ class Worker:
                                                 response_output=content,
                                                 metadata={
                                                     "first_chunk": True,
-                                                    "final_chunk": False,  # TODO(vir): first chunk can be final chunk as well
+                                                    "final_chunk": is_final_chunk,
                                                 },
                                             )
                                             await self._response_socket.send(
