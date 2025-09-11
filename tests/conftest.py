@@ -84,8 +84,8 @@ def mock_http_echo_server():
             # The response will contain the exact payload you sent
     """
 
-    # Create and start the server
-    server = EchoServer()
+    # Create and start the server with dynamic port allocation (port=0)
+    server = EchoServer(port=0)
     server.start()
 
     try:

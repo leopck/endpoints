@@ -179,11 +179,11 @@ class TestZMQPushPullIntegration:
         ],
     )
     async def test_push_pull_communication_various_payloads(
-        self, zmq_config, test_case
+        self, zmq_config, test_case, tmp_path
     ):
         """Test push/pull communication with various payload types."""
-        # Create unique address for this test
-        address = f"ipc:///tmp/test_payload_{test_case['id']}_{int(time.time() * 1000)}"
+        # Create unique address for this test using tmp_path
+        address = f"ipc://{tmp_path}/test_payload_{test_case['id']}"
 
         # Create context
         context = zmq.asyncio.Context()
@@ -291,9 +291,11 @@ class TestZMQPushPullIntegration:
             },
         ],
     )
-    async def test_query_result_various_scenarios(self, zmq_config, result_case):
+    async def test_query_result_various_scenarios(
+        self, zmq_config, result_case, tmp_path
+    ):
         """Test sending and receiving QueryResult objects with various scenarios."""
-        address = f"ipc:///tmp/test_result_{result_case['query_id']}_{int(time.time() * 1000)}"
+        address = f"ipc://{tmp_path}/test_result_{result_case['query_id']}"
 
         context = zmq.asyncio.Context()
 
@@ -328,9 +330,9 @@ class TestZMQPushPullIntegration:
             context.term()
 
     @pytest.mark.asyncio
-    async def test_streaming_response_communication(self, zmq_config):
+    async def test_streaming_response_communication(self, zmq_config, tmp_path):
         """Test streaming response pattern with first/final chunks."""
-        address = f"ipc:///tmp/test_streaming_{int(time.time() * 1000)}"
+        address = f"ipc://{tmp_path}/test_streaming"
 
         context = zmq.asyncio.Context()
 

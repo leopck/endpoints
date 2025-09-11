@@ -1,7 +1,6 @@
 """Tests for WorkerManager functionality."""
 
 import asyncio
-import time
 
 import pytest
 import zmq
@@ -18,17 +17,17 @@ class TestWorkerManager:
     """Test WorkerManager functionality with real processes."""
 
     @pytest.fixture
-    def manager_config(self, mock_http_echo_server):
+    def manager_config(self, mock_http_echo_server, tmp_path):
         """Create manager configuration."""
         http_config = HTTPClientConfig(
             endpoint_url=f"{mock_http_echo_server.url}/v1/chat/completions",
             num_workers=2,
         )
         aiohttp_config = AioHttpConfig()
-        timestamp = int(time.time() * 1000)
+        # Use tmp_path for unique socket paths per test
         zmq_config = ZMQConfig(
-            zmq_request_queue_prefix=f"ipc:///tmp/test_manager_{timestamp}",
-            zmq_response_queue_addr=f"ipc:///tmp/test_manager_resp_{timestamp}",
+            zmq_request_queue_prefix=f"ipc://{tmp_path}/test_manager_req",
+            zmq_response_queue_addr=f"ipc://{tmp_path}/test_manager_resp",
         )
         zmq_context = zmq.asyncio.Context()
         return http_config, aiohttp_config, zmq_config, zmq_context
@@ -205,17 +204,17 @@ class TestWorkerManagerAdvanced:
     """Advanced WorkerManager tests for edge cases."""
 
     @pytest.fixture
-    def advanced_manager_config(self):
+    def advanced_manager_config(self, tmp_path):
         """Create advanced manager configuration."""
-        timestamp = int(time.time() * 1000)
+        # Use tmp_path for unique socket paths per test
         http_config = HTTPClientConfig(
             endpoint_url="http://localhost:99999/advanced",
             num_workers=2,
         )
         aiohttp_config = AioHttpConfig()
         zmq_config = ZMQConfig(
-            zmq_request_queue_prefix=f"ipc:///tmp/test_advanced_{timestamp}",
-            zmq_response_queue_addr=f"ipc:///tmp/test_advanced_resp_{timestamp}",
+            zmq_request_queue_prefix=f"ipc://{tmp_path}/test_advanced_req",
+            zmq_response_queue_addr=f"ipc://{tmp_path}/test_advanced_resp",
         )
         zmq_context = zmq.asyncio.Context()
         return http_config, aiohttp_config, zmq_config, zmq_context

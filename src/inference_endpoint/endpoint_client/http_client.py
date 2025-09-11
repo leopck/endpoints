@@ -3,11 +3,12 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from typing import Any
 
 import zmq
 import zmq.asyncio
 
-from inference_endpoint.core.types import Query, QueryResult
+from inference_endpoint.core.types import Query, QueryResult, StreamChunk
 from inference_endpoint.endpoint_client.configs import (
     AioHttpConfig,
     HTTPClientConfig,
@@ -17,6 +18,24 @@ from inference_endpoint.endpoint_client.worker import WorkerManager
 from inference_endpoint.endpoint_client.zmq_utils import ZMQPullSocket, ZMQPushSocket
 
 logger = logging.getLogger(__name__)
+
+
+class StreamingFuture(asyncio.Future):
+    """Future that also exposes first chunk for streaming responses."""
+
+    def __init__(self):
+        super().__init__()
+        self._first = asyncio.Future()
+
+    @property
+    def first(self):
+        """First chunk future - can be awaited or checked."""
+        return self._first
+
+    def _set_first_chunk(self, chunk: str):
+        """Set first chunk."""
+        assert not self._first.done(), "First chunk already set"
+        self._first.set_result(chunk)
 
 
 class HTTPEndpointClient:
@@ -41,7 +60,7 @@ class HTTPEndpointClient:
         config: HTTPClientConfig,
         aiohttp_config: AioHttpConfig,
         zmq_config: ZMQConfig,
-        complete_callback: Callable | None = None,
+        complete_callback: Callable[[Any], None] | None = None,
     ):
         """
         Initialize HTTP endpoint client.
@@ -50,7 +69,7 @@ class HTTPEndpointClient:
             config: HTTP client configuration
             aiohttp_config: aiohttp configuration
             zmq_config: ZMQ configuration
-            complete_callback: Optional callback for completed requests
+            complete_callback: Optional synchronous callback for completed requests
         """
         self.config = config
         self.aiohttp_config = aiohttp_config
@@ -71,7 +90,9 @@ class HTTPEndpointClient:
         if config.max_concurrency > 0:
             self._concurrency_semaphore = asyncio.Semaphore(config.max_concurrency)
 
-    def issue_query(self, query: Query) -> asyncio.Future[QueryResult]:
+    def issue_query(
+        self, query: Query
+    ) -> asyncio.Future[QueryResult] | StreamingFuture:
         """
         Send a query to the endpoint and return a future for the response.
 
@@ -80,14 +101,21 @@ class HTTPEndpointClient:
         - Checked for completion: `if future.done(): result = future.result()`
         - Used with asyncio utilities: `done, pending = await asyncio.wait([future])`
 
+        For streaming queries, returns a StreamingFuture which also exposes:
+        - `await future.first` to get the first chunk as soon as available
+
         Args:
             query: Query object containing request details
 
         Returns:
-            asyncio.Future that will contain the QueryResult
+            StreamingFuture for streaming queries, asyncio.Future otherwise
         """
-        # Create future for this request
-        future = asyncio.get_event_loop().create_future()
+        # Create appropriate future type
+        future = (
+            StreamingFuture()
+            if query.stream
+            else asyncio.get_event_loop().create_future()
+        )
         self._pending_futures[query.id] = future
 
         # Schedule the actual send
@@ -109,6 +137,10 @@ class HTTPEndpointClient:
             future = self._pending_futures.get(query.id)
             if future and not future.done():
                 future.set_exception(e)
+
+                # Also set exception on first chunk future for streaming
+                if isinstance(future, StreamingFuture) and not future.first.done():
+                    future.first.set_exception(e)
 
     async def _send_to_worker(self, query: Query) -> None:
         """Send query to worker via ZMQ."""
@@ -151,35 +183,69 @@ class HTTPEndpointClient:
             while not self._shutdown_event.is_set():
                 try:
                     # Blocking receive with timeout for shutdown check
-                    response = await asyncio.wait_for(
+                    message = await asyncio.wait_for(
                         response_socket.receive(),
                         timeout=self.config.response_handler_timeout,
                     )
 
-                    # For streaming responses, only resolve future on final chunk
-                    # For non-streaming responses, resolve immediately
-                    is_final_chunk = (
-                        response.metadata.get("final_chunk", True)
-                        if response.metadata
-                        else True
-                    )
+                    # Future must exist - we created it when issuing query
+                    future = self._pending_futures[message.query_id]
+                    assert future is not None, f"No future for {message.query_id}"
+                    assert not future.done(), f"Double response for {message.query_id}"
 
-                    if is_final_chunk:
-                        # Complete the future if pending
-                        future = self._pending_futures.pop(response.query_id, None)
-                        if future and not future.done():
-                            if response.error:
-                                # Create exception for errors
-                                future.set_exception(Exception(response.error))
+                    # Handle by message type
+                    match message:
+                        case StreamChunk():
+                            # Only streaming queries get StreamChunk
+                            assert isinstance(
+                                future, StreamingFuture
+                            ), "StreamChunk for non-streaming query"
+                            future._set_first_chunk(message.response_chunk)
+
+                            if message.is_complete:
+                                # Single chunk complete - create QueryResult and complete
+                                result = QueryResult(
+                                    query_id=message.query_id,
+                                    response_output=message.response_chunk,
+                                )
+                                future.set_result(result)
+                                self._pending_futures.pop(message.query_id)
+
+                        case QueryResult():
+                            # Complete the future
+                            if message.error:
+                                exception = Exception(message.error)
+                                future.set_exception(exception)
+
+                                # Set exception on first chunk if streaming and not set yet
+                                if (
+                                    isinstance(future, StreamingFuture)
+                                    and not future.first.done()
+                                ):
+                                    future.first.set_exception(exception)
                             else:
-                                future.set_result(response)
-                    else:
-                        # For non-final chunks, keep the future pending
-                        future = self._pending_futures.get(response.query_id, None)
+                                # Set first chunk for empty streaming responses
+                                if isinstance(future, StreamingFuture):
+                                    if (
+                                        message.metadata.get("first_chunk")
+                                        and not future.first.done()
+                                    ):
+                                        future._set_first_chunk("")  # Empty response
 
-                    # Also call user callback if provided
+                                future.set_result(message)
+
+                            self._pending_futures.pop(message.query_id)
+
+                    # Call callback after future is resolved
+                    # NOTE(vir):
+                    # We call the callback after future resolution to ensure that
+                    # even if the callback raises an exception, the future is still properly
+                    # resolved and the caller can await it. This prevents hangs in user code.
                     if self.complete_callback:
-                        await self.complete_callback(response)
+                        try:
+                            self.complete_callback(message)
+                        except Exception as e:
+                            logger.error(f"Error in user callback: {e}")
 
                 except TimeoutError:
                     # Check shutdown and continue

@@ -177,12 +177,17 @@ asyncio.run(main())
 ### Callback-Based Usage
 
 ```python
-async def handle_response(response: QueryResult):
-    """Callback function for handling responses."""
-    if response.error:
-        print(f"Error: {response.error}")
-    else:
-        print(f"Response: {response.response_output}")
+from inference_endpoint.core.types import QueryResult, StreamChunk
+
+def handle_response(response):
+    """Callback function for handling responses (synchronous)."""
+    match response:
+        case QueryResult(error=error) if error:
+            print(f"Error: {error}")
+        case QueryResult(response_output=output):
+            print(f"Response: {output}")
+        case StreamChunk(response_chunk=chunk):
+            print(f"Chunk: {chunk}")
 
 async def main():
     # Create client with callback
@@ -202,6 +207,8 @@ async def main():
 
     await client.shutdown()
 ```
+
+Note: The callback is synchronous (not async) and receives both `StreamChunk` and `QueryResult` messages for streaming responses. Use pattern matching with `match` to handle different message types cleanly.
 
 ### Multiple Concurrent Requests
 
@@ -256,19 +263,85 @@ async def main():
         stream=True  # Enable streaming
     )
 
-    # Send request
+    # Send request - returns StreamingFuture for streaming queries
     future = client.issue_query(query)
 
-    # For streaming, the worker sends two QueryResult messages:
-    # 1. First chunk with metadata["first_chunk"]: True
-    # 2. Final response with metadata["final_chunk"]: True
+    # Option 1: Just wait for complete response (same as non-streaming)
     result = await future
     print(f"Complete response: {result.response_output}")
+
+    # Option 2: Access first chunk early
+    first_chunk = await future.first
+    print(f"AI started with: {first_chunk}")
+    # ... do other work while waiting ...
+    full_result = await future
+    print(f"Complete: {full_result.response_output}")
 
     await client.shutdown()
 ```
 
-### Using Semaphore for Concurrency Control
+### Advanced Streaming - Mixed Example
+
+```python
+async def process_with_early_feedback(query):
+    """Show user immediate feedback when AI starts responding."""
+    future = client.issue_query(query)
+
+    # Get first chunk as soon as available
+    first_chunk = await future.first
+    update_ui(f"AI started responding: {first_chunk}...")
+
+    # Continue processing while waiting for full response
+    full_response = await future
+    update_ui(f"Complete: {full_response.response_output}")
+
+# Note: If the first chunk is marked as complete by the server (finish_reason is set),
+# StreamChunk.is_complete will be True.
+#
+# Note: For empty streaming responses (no chunks), only a QueryResult is sent with
+# metadata={"is_first": True} to indicate no chunks were produced.
+
+# Racing multiple queries to same model
+async def process_multiple_queries(model: str = "gpt-4"):
+    """Send multiple queries to same model, wait for first chunk then all completions."""
+    prompts = [
+        "What is the capital of France?",
+        "Explain quantum computing in simple terms",
+        "Write a haiku about programming",
+        "What are the benefits of async programming?"
+    ]
+
+    queries = [
+        ChatCompletionQuery(id=f"query-{i}", prompt=prompt, model=model, stream=True)
+        for i, prompt in enumerate(prompts)
+    ]
+
+    # Issue all queries
+    futures = [client.issue_query(q) for q in queries]
+
+    # Race for the very first chunk from any query
+    first_chunks = [f.first for f in futures]
+    done, pending = await asyncio.wait(first_chunks, return_when=asyncio.FIRST_COMPLETED)
+
+    # Print the first chunk that arrives
+    first_task = done.pop()
+    first_chunk = first_task.result()
+    # Find which query it came from
+    first_query_idx = first_chunks.index(first_task)
+    print(f"First chunk received from query-{first_query_idx}: '{first_chunk}'")
+
+    # Now wait for all queries to complete
+    print("\nWaiting for all queries to complete...")
+    all_results = await asyncio.gather(*futures)
+
+    # Print all completed responses
+    for result in all_results:
+        print(f"\nQuery {result.query_id} completed:")
+        print(f"  Prompt: {prompts[int(result.query_id.split('-')[1])]}")
+        print(f"  Response: {result.response_output[:100]}...")
+```
+
+### Controlling runtime max-concurrency
 
 ```python
 async def main():

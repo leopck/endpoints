@@ -14,20 +14,27 @@ from inference_endpoint.core.types import ChatCompletionQuery, QueryResult
 
 class EchoServer:
     def __init__(
-        self, *, host: str = "localhost", port: int = 12345, max_osl: int | None = None
+        self, *, host: str = "localhost", port: int = 0, max_osl: int | None = None
     ):
         self.host = host
-        self.port = port
+        self.port = port  # If 0, will auto-assign available port
         self.max_osl = max_osl
+        self._actual_port = None  # Store the actual port after binding
 
-        self.url = f"http://{self.host}:{self.port}"
         self.app = None
         self.runner = None
         self.site = None
         self._server_thread = None
         self._loop = None
         self._shutdown_event = threading.Event()
+        self._port_ready_event = threading.Event()  # Signal when port is ready
         self.logger = logging.getLogger(__name__)
+
+    @property
+    def url(self):
+        """Get the server URL with the actual port."""
+        port = self._actual_port or self.port
+        return f"http://{self.host}:{port}"
 
     def set_max_osl(self, max_osl: int):
         self.max_osl = max_osl
@@ -210,9 +217,21 @@ class EchoServer:
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
+
+        # Get the actual port if we used port 0
+        if self.port == 0:
+            # Get the actual port assigned by the OS
+            server_socket = self.site._server.sockets[0]
+            self._actual_port = server_socket.getsockname()[1]
+        else:
+            self._actual_port = self.port
+
         self.logger.info(
             f"==========================\nServer started at {self.url}\n==========================",
         )
+
+        # Signal that the port is ready
+        self._port_ready_event.set()
 
         # Wait for shutdown signal
         while not self._shutdown_event.is_set():
@@ -231,8 +250,11 @@ class EchoServer:
         self._server_thread.daemon = False  # Changed to False so main thread can wait
         self._server_thread.start()
 
-        # Delay for the server to start before returning
-        time.sleep(0.5)
+        # Wait for the server to be ready and port to be assigned
+        if self._port_ready_event.wait(timeout=5.0):
+            self.logger.info(f"Server ready on port {self._actual_port}")
+        else:
+            raise RuntimeError("Server failed to start within timeout")
 
     def stop(self):
         """Stop the HTTP Echo server."""
@@ -240,7 +262,7 @@ class EchoServer:
         if self._shutdown_event:
             self._shutdown_event.set()
         if self._server_thread:
-            self._server_thread.join(timeout=2)
+            self._server_thread.join(timeout=0.2)
         self.logger.info("HTTP Echo server stopped")
 
 

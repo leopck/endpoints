@@ -13,7 +13,7 @@ import orjson
 import zmq
 import zmq.asyncio
 
-from inference_endpoint.core.types import Query, QueryResult
+from inference_endpoint.core.types import Query, QueryResult, StreamChunk
 from inference_endpoint.endpoint_client.configs import (
     AioHttpConfig,
     HTTPClientConfig,
@@ -188,60 +188,54 @@ class Worker:
             accumulated_content = []
             first_chunk_sent = False
 
-            # Read lines from the stream
+            # Process SSE stream
             async for line_bytes in response.content:
-                # Decode line and handle multiple lines in one chunk
-                line_str = line_bytes.decode("utf-8")
+                lines = line_bytes.decode("utf-8").strip().split("\n")
 
-                for line in line_str.split("\n"):
-                    line = line.strip()
-                    if not line:
+                for line in lines:
+                    # Skip empty lines and non-SSE data
+                    if not line or not line.startswith("data: "):
                         continue
 
-                    # Parse SSE format (data: ...)
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
+                    data_str = line[6:]  # Remove "data: " prefix
+                    if data_str == "[DONE]":
+                        break
 
-                        try:
-                            chunk_data = orjson.loads(data_str)
-
-                            # For streaming, check for content in choices
-                            if "choices" in chunk_data and chunk_data["choices"]:
-                                choice = chunk_data["choices"][0]
-                                if "delta" in choice and "content" in choice["delta"]:
-                                    content = choice["delta"]["content"]
-                                    is_final_chunk = (
-                                        choice["delta"].get("finish_reason") is not None
-                                    )
-
-                                    if content:
-                                        accumulated_content.append(content)
-
-                                        # Send only the first chunk as a streaming indicator
-                                        if not first_chunk_sent:
-                                            first_chunk_response = QueryResult(
-                                                query_id=query.id,
-                                                response_output=content,
-                                                metadata={
-                                                    "first_chunk": True,
-                                                    "final_chunk": is_final_chunk,
-                                                },
-                                            )
-                                            await self._response_socket.send(
-                                                first_chunk_response
-                                            )
-                                            first_chunk_sent = True
-
-                        except (ValueError, TypeError):
+                    # Parse JSON and extract content
+                    try:
+                        chunk_data = orjson.loads(data_str)
+                        choices = chunk_data.get("choices", [])
+                        if not choices:
                             continue
+
+                        delta = choices[0].get("delta", {})
+                        content = delta.get("content", "")
+                        is_final = delta.get("finish_reason") is not None
+
+                        if not content:
+                            continue
+
+                        accumulated_content.append(content)
+
+                        # Send first chunk with metadata
+                        if not first_chunk_sent:
+                            stream_chunk = StreamChunk(
+                                query_id=query.id,
+                                response_chunk=content,
+                                is_complete=is_final,
+                                metadata={"first_chunk": True, "final_chunk": is_final},
+                            )
+                            await self._response_socket.send(stream_chunk)
+                            first_chunk_sent = True
+
+                    except (ValueError, TypeError, KeyError):
+                        continue
 
             # Send final complete response
             final_response = QueryResult(
                 query_id=query.id,
                 response_output="".join(accumulated_content),
-                metadata={"first_chunk": False, "final_chunk": True},
+                metadata={"first_chunk": not first_chunk_sent, "final_chunk": True},
             )
             await self._response_socket.send(final_response)
 
