@@ -1,3 +1,5 @@
+"""HTTP Echo Server for testing inference endpoint clients."""
+
 import argparse
 import asyncio
 import json
@@ -12,20 +14,27 @@ from inference_endpoint.core.types import ChatCompletionQuery, QueryResult
 
 class EchoServer:
     def __init__(
-        self, *, host: str = "localhost", port: int = 12345, max_osl: int | None = None
+        self, *, host: str = "localhost", port: int = 0, max_osl: int | None = None
     ):
         self.host = host
-        self.port = port
+        self.port = port  # If 0, will auto-assign available port
         self.max_osl = max_osl
+        self._actual_port = None  # Store the actual port after binding
 
-        self.url = f"http://{self.host}:{self.port}"
         self.app = None
         self.runner = None
         self.site = None
         self._server_thread = None
         self._loop = None
         self._shutdown_event = threading.Event()
+        self._port_ready_event = threading.Event()  # Signal when port is ready
         self.logger = logging.getLogger(__name__)
+
+    @property
+    def url(self):
+        """Get the server URL with the actual port."""
+        port = self._actual_port or self.port
+        return f"http://{self.host}:{port}"
 
     def set_max_osl(self, max_osl: int):
         self.max_osl = max_osl
@@ -80,6 +89,61 @@ class EchoServer:
             status=200,
         )
 
+    async def _handle_streaming_response(
+        self,
+        request: web.Request,
+        completion_request: ChatCompletionQuery,
+        content: str,
+    ) -> web.StreamResponse:
+        """Handle streaming response with SSE format."""
+        response = web.StreamResponse(
+            status=200,
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await response.prepare(request)
+
+        # Send content in chunks (word by word for echo server)
+        words = content.split() if content else []
+
+        # Send chunks
+        for i, word in enumerate(words):
+            # Add space before word (except first)
+            chunk_content = f" {word}" if i > 0 else word
+
+            chunk_data = {
+                "id": f"chatcmpl-{completion_request.id}",
+                "object": "chat.completion.chunk",
+                "created": int(time.time()),
+                "model": completion_request.model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "delta": {"content": chunk_content},
+                        "finish_reason": None,
+                    }
+                ],
+            }
+
+            await response.write(f"data: {json.dumps(chunk_data)}\n\n".encode())
+
+        # Send final chunk with finish_reason
+        final_chunk = {
+            "id": f"chatcmpl-{completion_request.id}",
+            "object": "chat.completion.chunk",
+            "created": int(time.time()),
+            "model": completion_request.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        }
+
+        await response.write(f"data: {json.dumps(final_chunk)}\n\n".encode())
+        await response.write(b"data: [DONE]\n\n")
+
+        return response
+
     async def _handle_echo_chat_completions_request(
         self, request: web.Request
     ) -> web.Response:
@@ -105,24 +169,28 @@ class EchoServer:
                         self.max_osl // len(raw_response) + 1
                     )
                     raw_response = raw_response[: self.max_osl]
-            response = QueryResult(
-                query_id=completion_request.id,
-                response_output=raw_response,
-            )
+
+            # Check if this is a streaming request
+            if completion_request.stream:
+                # Return SSE (Server-Sent Events) format for streaming
+                return await self._handle_streaming_response(
+                    request, completion_request, raw_response
+                )
+            else:
+                # Non-streaming: return QueryResult as before
+                response = QueryResult(
+                    query_id=completion_request.id,
+                    response_output=raw_response,
+                )
+                echo_response = response.to_json()
+                return web.json_response(echo_response, status=200)
+
         except Exception as e:
             # A catch-all exception handler to help debug the issue without bringing down the server
             return web.json_response(
                 {"error": f"error encountered : {str(e)}"},
                 status=400,
             )
-
-        # Default: echo back the request
-        echo_response = response.to_json()
-
-        return web.json_response(
-            echo_response,
-            status=200,
-        )
 
     def _run_server(self):
         """Run the server in a separate thread."""
@@ -149,9 +217,21 @@ class EchoServer:
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
+
+        # Get the actual port if we used port 0
+        if self.port == 0:
+            # Get the actual port assigned by the OS
+            server_socket = self.site._server.sockets[0]
+            self._actual_port = server_socket.getsockname()[1]
+        else:
+            self._actual_port = self.port
+
         self.logger.info(
             f"==========================\nServer started at {self.url}\n==========================",
         )
+
+        # Signal that the port is ready
+        self._port_ready_event.set()
 
         # Wait for shutdown signal
         while not self._shutdown_event.is_set():
@@ -170,8 +250,11 @@ class EchoServer:
         self._server_thread.daemon = False  # Changed to False so main thread can wait
         self._server_thread.start()
 
-        # Delay for the server to start before returning
-        time.sleep(0.5)
+        # Wait for the server to be ready and port to be assigned
+        if self._port_ready_event.wait(timeout=5.0):
+            self.logger.info(f"Server ready on port {self._actual_port}")
+        else:
+            raise RuntimeError("Server failed to start within timeout")
 
     def stop(self):
         """Stop the HTTP Echo server."""
@@ -179,7 +262,7 @@ class EchoServer:
         if self._shutdown_event:
             self._shutdown_event.set()
         if self._server_thread:
-            self._server_thread.join(timeout=2)
+            self._server_thread.join(timeout=0.2)
         self.logger.info("HTTP Echo server stopped")
 
 

@@ -65,7 +65,7 @@ def temp_dir(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return tmp_path_factory.mktemp("test_artifacts")
 
 
-@pytest.fixture
+@pytest.fixture(scope="class")
 def mock_http_echo_server():
     """
     Mock HTTP server that echoes back the request payload in the appropriate format.
@@ -84,8 +84,8 @@ def mock_http_echo_server():
             # The response will contain the exact payload you sent
     """
 
-    # Create and start the server
-    server = EchoServer()
+    # Create and start the server with dynamic port allocation (port=0)
+    server = EchoServer(port=0)
     server.start()
 
     try:

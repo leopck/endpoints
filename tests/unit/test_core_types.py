@@ -61,13 +61,10 @@ class TestQueryResult:
 
     def test_query_result_creation(self) -> None:
         """Test creating a query result."""
-        result = QueryResult(
-            query_id="test-123", response_output="Test response", latency=0.1
-        )
+        result = QueryResult(query_id="test-123", response_output="Test response")
 
         assert result.query_id == "test-123"
         assert result.response_output == "Test response"
-        assert result.latency == 0.1
         assert result.error is None
         assert result.completed_at is not None
 
