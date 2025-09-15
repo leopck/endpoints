@@ -111,7 +111,6 @@ class QueryResult:
 
     query_id: str
     response_output: str = ""
-    latency: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
     error: str | None = None
     completed_at: float | None = None
@@ -141,13 +140,13 @@ class QueryResult:
             # Handle chat completion format
             if "message" in choice and "content" in choice["message"]:
                 return QueryResult(
-                    query_id=json_value.get("id", ""),
+                    query_id=json_value.get("id"),
                     response_output=choice["message"]["content"],
                 )
             # Handle text completion format
             elif "text" in choice:
                 return QueryResult(
-                    query_id=json_value.get("id", ""),
+                    query_id=json_value.get("id"),
                     response_output=choice["text"],
                 )
             else:
@@ -164,7 +163,7 @@ class QueryResult:
                 else str(error_info)
             )
             return QueryResult(
-                query_id=json_value.get("id", ""),
+                query_id=json_value.get("id"),
                 response_output="",
                 error=error_msg,
             )

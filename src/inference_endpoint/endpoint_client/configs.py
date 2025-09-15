@@ -16,12 +16,10 @@ class HTTPClientConfig:
     num_workers: int = 4
     max_concurrency: int = (
         -1
-    )  # -1 means unlimited, otherwise limits concurrent requests via semaphore
+    )  # -1: unlimited, else: limit concurrent requests via semaphore
 
     # Worker lifecycle timeouts
-    worker_initialization_timeout: float = (
-        10.0  # Max time to wait for all workers to be ready
-    )
+    worker_initialization_timeout: float = 10.0  # init
     worker_health_check_interval: float = 2.0  # runtime
     worker_graceful_shutdown_wait: float = 0.5  # post-run
     worker_force_kill_timeout: float = 1.0  # post-run
@@ -47,7 +45,7 @@ class SocketConfig:
     # TCP keepalive parameters (Linux-specific)
     tcp_keepidle: int = 60  # Seconds before sending keepalive probes
     tcp_keepintvl: int = 10  # Interval between keepalive probes
-    tcp_keepcnt: int = 6  # Number of keepalive probes
+    tcp_keepcnt: int = 6  # Number of keepalive probes before closing
 
     def apply_to_socket(self, sock: socket.socket) -> None:
         """Apply Linux socket optimizations."""
