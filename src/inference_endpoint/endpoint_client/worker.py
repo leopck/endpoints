@@ -247,19 +247,12 @@ class Worker:
             # Parse JSON response
             try:
                 response_data = orjson.loads(response_text)
+                response_obj = QueryResult.from_json(response_data)
             except (ValueError, TypeError) as e:
                 await self._handle_error(
                     query.id, f"Failed to parse response: {str(e)}"
                 )
                 return
-
-            if "id" not in response_data:
-                response_data["id"] = query.id
-
-            response_obj = QueryResult.from_json(response_data)
-
-            # Override query_id to ensure it matches our query
-            response_obj.query_id = query.id
 
             await self._response_socket.send(response_obj)
 

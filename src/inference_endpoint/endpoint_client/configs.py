@@ -166,13 +166,13 @@ class ZMQConfig:
     def __post_init__(self):
         """Generate portable ZMQ socket paths if not provided."""
         if self.zmq_request_queue_prefix is None:
-            self.zmq_request_queue_prefix = self._generate_ipc_path("http_worker")
+            self.zmq_request_queue_prefix = ZMQConfig._get_ipc_path("http_worker")
 
         if self.zmq_response_queue_addr is None:
-            self.zmq_response_queue_addr = self._generate_ipc_path("http_responses")
+            self.zmq_response_queue_addr = ZMQConfig._get_ipc_path("http_responses")
 
     @staticmethod
-    def _generate_ipc_path(name: str) -> str:
+    def _get_ipc_path(name: str) -> str:
         """Generate an IPC socket path.
 
         Args:

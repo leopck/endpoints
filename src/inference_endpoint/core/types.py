@@ -94,8 +94,8 @@ class ChatCompletionQuery(Query):
                     break
 
         return ChatCompletionQuery(
-            id=json_value.get("id", str(uuid.uuid4())),
-            model=json_value.get("model", ""),
+            id=json_value.get("id"),
+            model=json_value.get("model"),
             prompt=prompt,
             stream=json_value.get("stream"),
             max_tokens=json_value.get("max_completion_tokens"),

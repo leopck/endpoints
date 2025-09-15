@@ -19,7 +19,7 @@ A high-performance HTTP client for the MLPerf Inference Endpoint Benchmarking Sy
 │              (implements EndpointClient ABC)                    │
 │  ┌─────────────────┐                                            │
 │  │  issue_query    │                                            │
-│  └────────┬─────────┘                                           │
+│  └────────┬────────┘                                            │
 │           │                                                     │
 │           ├─────ZMQ PUSH (Query)────▶ Worker 1 Queue            │
 │           ├─────ZMQ PUSH (Query)────▶ Worker 2 Queue            │
