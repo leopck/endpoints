@@ -35,11 +35,11 @@ A high-performance HTTP client for the MLPerf Inference Endpoint Benchmarking Sy
 │  │   (uvloop)   │  │   (uvloop)   │  │   (uvloop)   │           │
 │  │   aiohttp    │  │   aiohttp    │  │   aiohttp    │           │
 │  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘           │
-│         │                  │                  │                 │
-│         └──────────────────┴──────────────────┘                 │
-│                            │                                    │
+│         │                 │                 │                   │
+│         └─────────────────┴─────────────────┘                   │
+│                           │                                     │
 │                    ZMQ PUSH (QueryResult)                       │
-│                            ▼                                    │
+│                           ▼                                     │
 │                    ┌────────────────┐                           │
 │                    │ Response Queue │ (Shared)                  │
 │                    └────────────────┘                           │
