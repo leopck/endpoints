@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from inference_endpoint.testing.echo_server import EchoServer
 from inference_endpoint.dataset_manager.dataloader import DataLoader
+from inference_endpoint.testing.echo_server import EchoServer
 
 src_path = str(Path(__file__).parent.parent / "src")
 sys.path.insert(0, src_path)
@@ -94,6 +94,7 @@ def mock_http_echo_server():
     finally:
         server.stop()
 
+
 @pytest.fixture
 def dummy_dataloader():
     class DummyDataLoader(DataLoader):
@@ -104,4 +105,5 @@ def dummy_dataloader():
         def load_sample(self, sample_index: int) -> int:
             assert sample_index >= 0 and sample_index < self.n_samples
             return sample_index
+
     return DummyDataLoader()

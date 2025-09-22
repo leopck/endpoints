@@ -6,19 +6,17 @@ Such requirements benchmarks may or may not care about are:
 - The specific datasets being used
 """
 
-
+import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-
-import random
 
 from .. import metrics
 
 
 @dataclass(frozen=True)
 class RuntimeSettings:
-    """Internal class for runtime settings derived from a UserConfig and Ruleset. This should *never* be instantiated by the user, and only by `UserConfig.for_ruleset`.
-    """
+    """Internal class for runtime settings derived from a UserConfig and Ruleset. This should *never* be instantiated by the user, and only by `UserConfig.for_ruleset`."""
+
     metric_target: metrics.Metric
     reported_metrics: list[metrics.Metric]
     min_duration_ms: int
@@ -31,8 +29,8 @@ class RuntimeSettings:
 
 @dataclass(frozen=True)
 class BenchmarkSuiteRuleset(ABC):
-    """Base class for rulesets for benchmarking competitions.
-    """
+    """Base class for rulesets for benchmarking competitions."""
+
     version: str
     """Version number of this ruleset for the benchmark suite"""
 

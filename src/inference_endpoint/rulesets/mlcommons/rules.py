@@ -4,46 +4,60 @@ These values are derived directly from the MLPerf Inference Policies document:
 https://github.com/mlcommons/inference_policies/blob/master/inference_rules.adoc
 """
 
-
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 
-import random
-
-from . import models
 from ... import metrics
-from ...config.user_config import UserConfig
 from ...config.ruleset import BenchmarkSuiteRuleset, RuntimeSettings
+from ...config.user_config import UserConfig
+from . import models
 
 
 @dataclass(frozen=True)
 class PerModelRuleset:
     # max_samples_memory_capacity: int = None       # Formerly 'performance_sample_count'.
-                                                    # Maximum number of samples that can fit in memory. If None, the size of the dataset is used..
-                                                    # See notes below for more details on why this is commented out.
-    min_duration_ms_valid: int = 10 * 60 * 1000     # Minimum duration in milliseconds required for a valid run
-    max_duration_ms_valid: int = None               # Maximum duration in milliseconds. Used as a timeout / kill for a benchmark run. Set to None for no timeout.
-    min_query_count_valid: int = None               # Minimum number of queries required to be sent to the SUT for a valid run, if None, no minimum is enforced
-    metric: type[metrics.Metric] | None = None      # any subclass of Metric. Used as metric to evaluate the performance of the benchmark.
-    reported_metrics: list[type[metrics.Metric]] = field(default_factory=list)   # List of metrics that are reported to the submission checker.
+    # Maximum number of samples that can fit in memory. If None, the size of the dataset is used..
+    # See notes below for more details on why this is commented out.
+    min_duration_ms_valid: int = (
+        10 * 60 * 1000
+    )  # Minimum duration in milliseconds required for a valid run
+    max_duration_ms_valid: int = None  # Maximum duration in milliseconds. Used as a timeout / kill for a benchmark run. Set to None for no timeout.
+    min_query_count_valid: int = None  # Minimum number of queries required to be sent to the SUT for a valid run, if None, no minimum is enforced
+    metric: type[metrics.Metric] | None = (
+        None  # any subclass of Metric. Used as metric to evaluate the performance of the benchmark.
+    )
+    reported_metrics: list[type[metrics.Metric]] = field(
+        default_factory=list
+    )  # List of metrics that are reported to the submission checker.
 
 
 @dataclass(frozen=True)
 class PerQueryRuleset(PerModelRuleset):
     min_query_count_valid: int = 270336
     metric: type[metrics.Metric] = metrics.Throughput
-    target_latency_percentile: float = 99.0     # Percentile of per-query latencies to use for metric comparison
-    max_latency_threshold_ms: int = None        # Maximum latency threshold in milliseconds for the specified percentile latency allowed for a valid run.
-    reported_metrics: list[type[metrics.Metric]] = field(default_factory=lambda: [metrics.Throughput])
+    target_latency_percentile: float = (
+        99.0  # Percentile of per-query latencies to use for metric comparison
+    )
+    max_latency_threshold_ms: int = None  # Maximum latency threshold in milliseconds for the specified percentile latency allowed for a valid run.
+    reported_metrics: list[type[metrics.Metric]] = field(
+        default_factory=lambda: [metrics.Throughput]
+    )
 
 
 @dataclass(frozen=True)
 class TokenBasedRuleset(PerModelRuleset):
     min_query_count_valid: int = 270336
     metric: type[metrics.Metric] = metrics.Throughput
-    max_ttft_latency_ms: int = None         # Maximum TTFT latency in milliseconds allowed for a valid run
-    max_tpot_latency_ms: int = None         # Maximum TPoT latency in milliseconds allowed for a valid run
-    reported_metrics: list[type[metrics.Metric]] = field(default_factory=lambda: [metrics.Throughput, metrics.TTFT, metrics.TPOT])
+    max_ttft_latency_ms: int = (
+        None  # Maximum TTFT latency in milliseconds allowed for a valid run
+    )
+    max_tpot_latency_ms: int = (
+        None  # Maximum TPoT latency in milliseconds allowed for a valid run
+    )
+    reported_metrics: list[type[metrics.Metric]] = field(
+        default_factory=lambda: [metrics.Throughput, metrics.TTFT, metrics.TPOT]
+    )
 
 
 # Notes:
@@ -68,33 +82,40 @@ class TokenBasedRuleset(PerModelRuleset):
 class OptimizationPriority(Enum):
     # TODO: Name subject to change
     THROUGHPUT = "Moderate 99% percentile latency, max throughput"
-    LOW_LATENCY_INTERACTIVE = "Strict latency constraint for Interactive sessions, TPOT > TTFT > throughput"
+    LOW_LATENCY_INTERACTIVE = (
+        "Strict latency constraint for Interactive sessions, TPOT > TTFT > throughput"
+    )
 
 
 @dataclass(frozen=True)
 class _RuntimeSettings(RuntimeSettings):
-    """Internal class for runtime settings derived from a UserConfig and Ruleset. This should *never* be instantiated by the user, and only by `UserConfig.for_ruleset`.
-    """
+    """Internal class for runtime settings derived from a UserConfig and Ruleset. This should *never* be instantiated by the user, and only by `UserConfig.for_ruleset`."""
+
     model: models._Model
     optimization_priority: OptimizationPriority
     rules: PerModelRuleset
-
 
 
 @dataclass(frozen=True)
 class RoundRuleset(BenchmarkSuiteRuleset):
     benchmark_rulesets: dict[models._Model, dict[OptimizationPriority, PerModelRuleset]]
 
-    def apply_user_config(self,
-                          model: models._Model,
-                          user_config: UserConfig,
-                          opt_prio: OptimizationPriority = OptimizationPriority.THROUGHPUT) -> _RuntimeSettings:
+    def apply_user_config(
+        self,
+        model: models._Model,
+        user_config: UserConfig,
+        opt_prio: OptimizationPriority = OptimizationPriority.THROUGHPUT,
+    ) -> _RuntimeSettings:
         if model not in self.benchmark_rulesets:
-            raise ValueError(f"Model {model.name} not found in rules for round {self.version}")
+            raise ValueError(
+                f"Model {model.name} not found in rules for round {self.version}"
+            )
 
         # Check if model supports the requested optimization priority
         if opt_prio not in self.benchmark_rulesets[model]:
-            raise ValueError(f"Model {model.name} does not support optimization priority {opt_prio}")
+            raise ValueError(
+                f"Model {model.name} does not support optimization priority {opt_prio}"
+            )
 
         ruleset = self.benchmark_rulesets[model][opt_prio]
 
@@ -112,13 +133,17 @@ class RoundRuleset(BenchmarkSuiteRuleset):
                 reported_metrics.append(metrics.TPOT(ruleset.max_tpot_latency_ms))
             elif mtype == metrics.QueryLatency and ruleset.metric == metrics.Throughput:
                 # If we specify throughput and want to also report per query latency, infer latency from inverting qps.
-                reported_metrics.append(metrics.QueryLatency(target_qps=user_config.user_metric_target))
+                reported_metrics.append(
+                    metrics.QueryLatency(target_qps=user_config.user_metric_target)
+                )
             elif mtype == metrics.Throughput and ruleset.metric == metrics.QueryLatency:
                 # If we specify per query latency, infer qps by inverting
                 target_qps = 1000 / user_config.user_metric_target
                 reported_metrics.append(metrics.Throughput(target_qps=target_qps))
             else:
-                raise ValueError(f"Invalid metric type: {mtype} for ruleset type {ruleset.__class__.__name__}")
+                raise ValueError(
+                    f"Invalid metric type: {mtype} for ruleset type {ruleset.__class__.__name__}"
+                )
 
         min_duration_ms = ruleset.min_duration_ms_valid
         if user_config.min_duration_ms is not None:
@@ -127,7 +152,9 @@ class RoundRuleset(BenchmarkSuiteRuleset):
         max_duration_ms = ruleset.max_duration_ms_valid
         if user_config.max_duration_ms is not None:
             max_duration_ms = user_config.max_duration_ms
-        assert max_duration_ms >= min_duration_ms, "Max duration must be greater than or equal to min duration"
+        assert (
+            max_duration_ms >= min_duration_ms
+        ), "Max duration must be greater than or equal to min duration"
 
         n_samples_from_dataset = model.dataset.size
         if user_config.ds_subset_size:
@@ -158,24 +185,40 @@ _v5_1 = RoundRuleset(
     sample_index_rng_seed=14771362308971278857,
     benchmark_rulesets={
         models.DeepSeek_R1: {
-            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(max_ttft_latency_ms=2000, max_tpot_latency_ms=80)
+            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(
+                max_ttft_latency_ms=2000, max_tpot_latency_ms=80
+            )
         },
         models.Llama3_1_8b: {
-            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(max_ttft_latency_ms=2000, max_tpot_latency_ms=100),
-            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(max_ttft_latency_ms=500, max_tpot_latency_ms=30),
+            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(
+                max_ttft_latency_ms=2000, max_tpot_latency_ms=100
+            ),
+            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(
+                max_ttft_latency_ms=500, max_tpot_latency_ms=30
+            ),
         },
         models.Llama2_70b: {
-            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(max_ttft_latency_ms=2000, max_tpot_latency_ms=200),
-            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(max_ttft_latency_ms=450, max_tpot_latency_ms=40),
+            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(
+                max_ttft_latency_ms=2000, max_tpot_latency_ms=200
+            ),
+            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(
+                max_ttft_latency_ms=450, max_tpot_latency_ms=40
+            ),
         },
         models.Llama3_1_405b: {
-            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(max_ttft_latency_ms=6000, max_tpot_latency_ms=175),
-            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(max_ttft_latency_ms=4500, max_tpot_latency_ms=80)
+            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(
+                max_ttft_latency_ms=6000, max_tpot_latency_ms=175
+            ),
+            OptimizationPriority.LOW_LATENCY_INTERACTIVE: TokenBasedRuleset(
+                max_ttft_latency_ms=4500, max_tpot_latency_ms=80
+            ),
         },
         models.Mixtral8x7B: {
-            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(max_ttft_latency_ms=2000, max_tpot_latency_ms=200),
+            OptimizationPriority.THROUGHPUT: TokenBasedRuleset(
+                max_ttft_latency_ms=2000, max_tpot_latency_ms=200
+            ),
         },
-    }
+    },
 )
 
 

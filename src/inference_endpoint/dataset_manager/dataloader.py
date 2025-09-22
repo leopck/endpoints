@@ -27,7 +27,7 @@ class DataLoader(ABC):
         """
         raise NotImplementedError
 
-    def mark_unneeded(self, index: int):
+    def mark_unneeded(self, index: int):  # noqa: B027
         """
         Marks a sample as no longer needed. The DataLoader implementation should implement some strategy for unloading this sample from memory
         as necessary (i.e. when the memory limit is reached and load_sample is called).
