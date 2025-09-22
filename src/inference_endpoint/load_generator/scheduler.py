@@ -1,17 +1,16 @@
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from enum import Enum
-from functools import partial
-from typing import Callable, Iterator
-
 import math
 import random
 import threading
 import uuid
+from abc import ABC, abstractmethod
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import partial
 
+from .. import metrics
 from ..config.ruleset import RuntimeSettings
 from ..dataset_manager.dataloader import DataLoader
-from .. import metrics
 
 
 class SampleEvent(Enum):
@@ -26,7 +25,9 @@ class Sample:
     uuid: int
     callbacks: dict[SampleEvent, Callable]
     get_bytes: Callable
-    _events: dict[SampleEvent, threading.Event] = field(init=False, default_factory=dict)
+    _events: dict[SampleEvent, threading.Event] = field(
+        init=False, default_factory=dict
+    )
 
     def __post_init__(self):
         for event in SampleEvent:
@@ -53,25 +54,27 @@ class SampleFactory:
         return dataloader.load_sample(sample_index)
 
     def get_sample_callbacks(self, sample_index: int) -> dict[SampleEvent, Callable]:
-        """Gets the callbacks for the given sample ID.
-        """
+        """Gets the callbacks for the given sample ID."""
         return {
-            SampleEvent.COMPLETE: partial(self.__class__.sample_complete_callback, sid=sample_index),
+            SampleEvent.COMPLETE: partial(
+                self.__class__.sample_complete_callback, sid=sample_index
+            ),
         }
 
     def __call__(self, sample_index: int) -> Sample:
         return Sample(
             uuid=uuid.uuid4().int,
             callbacks=self.get_sample_callbacks(sample_index),
-            get_bytes=partial(self.__class__.sample_get_bytes, self.dataloader, sample_index)
+            get_bytes=partial(
+                self.__class__.sample_get_bytes, self.dataloader, sample_index
+            ),
         )
 
 
 class SampleOrder(ABC):
-    def __init__(self,
-                 total_samples_to_issue: int,
-                 n_samples_in_dataset: int,
-                 rng = random):
+    def __init__(
+        self, total_samples_to_issue: int, n_samples_in_dataset: int, rng=random
+    ):
         """
         Args:
             total_samples_to_issue (int): The total number of samples to issue.
@@ -94,12 +97,14 @@ class SampleOrder(ABC):
 
 
 class WithoutReplacementSampleOrder(SampleOrder):
-    """Sample order where a sample index cannot repeat until all samples in a dataset have been issued.
-    """
+    """Sample order where a sample index cannot repeat until all samples in a dataset have been issued."""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.index_order = list(range(self.n_samples_in_dataset))
-        self._curr_idx = self.n_samples_in_dataset + 1  # Ensure we start at an invalid index to force shuffle
+        self._curr_idx = (
+            self.n_samples_in_dataset + 1
+        )  # Ensure we start at an invalid index to force shuffle
 
     def _reset(self):
         self.rng.shuffle(self.index_order)
@@ -114,8 +119,8 @@ class WithoutReplacementSampleOrder(SampleOrder):
 
 
 class WithReplacementSampleOrder(SampleOrder):
-    """Sample order where a sample index can repeat, even if the dataset has not been exhausted, i.e. sampling with replacement.
-    """
+    """Sample order where a sample index can repeat, even if the dataset has not been exhausted, i.e. sampling with replacement."""
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -128,36 +133,48 @@ def uniform_delay_fn(max_delay_ns: int = 0, rng: random.Random = random):
         if max_delay_ns == 0:
             return 0
         return rng.uniform(0, max_delay_ns)
+
     return _fn
 
 
 def poisson_delay_fn(expected_queries_per_second: float, rng: random.Random = random):
     queries_per_ns = expected_queries_per_second / 1e9
+
     def _fn():
         if queries_per_ns == 0:
             return 0
         return rng.expovariate(lambd=queries_per_ns)  # lambd=1/mean, where mean=latency
+
     return _fn
 
 
-class Scheduler(ABC):
-    """Schedulers are responsible for building queries and determining when they should be issued to the SUT.
-    """
+class Scheduler:
+    """Schedulers are responsible for building queries and determining when they should be issued to the SUT."""
 
-    def __init__(self,
-                 runtime_settings: RuntimeSettings,
-                 dataloader: DataLoader,
-                 sample_factory_cls: type[SampleFactory],
-                 sample_order_cls: type[SampleOrder]):
+    def __init__(
+        self,
+        runtime_settings: RuntimeSettings,
+        dataloader: DataLoader,
+        sample_factory_cls: type[SampleFactory],
+        sample_order_cls: type[SampleOrder],
+    ):
         self.runtime_settings = runtime_settings
         self.dataloader = dataloader
         self.sample_factory = sample_factory_cls(dataloader)
 
-        self.total_samples_to_issue = runtime_settings.n_samples_to_issue \
-            if runtime_settings.n_samples_to_issue \
+        self.total_samples_to_issue = (
+            runtime_settings.n_samples_to_issue
+            if runtime_settings.n_samples_to_issue
             else self.calc_total_samples_to_issue()
+        )
         self.n_unique_samples = runtime_settings.n_samples_from_dataset
-        self.sample_order = iter(sample_order_cls(self.total_samples_to_issue, self.n_unique_samples, rng=self.runtime_settings.rng_sample_index))
+        self.sample_order = iter(
+            sample_order_cls(
+                self.total_samples_to_issue,
+                self.n_unique_samples,
+                rng=self.runtime_settings.rng_sample_index,
+            )
+        )
         self.delay_fn = None  # Subclasses must set this
 
     def calc_total_samples_to_issue(self) -> int:
@@ -172,11 +189,17 @@ class Scheduler(ABC):
         metric_target = self.runtime_settings.metric_target
         if isinstance(metric_target, metrics.Throughput):
             expected_sps = metric_target.target
-            expected_samples = expected_sps * (self.runtime_settings.min_duration_ms / 1000)
+            expected_samples = expected_sps * (
+                self.runtime_settings.min_duration_ms / 1000
+            )
         elif isinstance(metric_target, metrics.QueryLatency):
-            expected_samples = self.runtime_settings.min_duration_ms / metric_target.target
+            expected_samples = (
+                self.runtime_settings.min_duration_ms / metric_target.target
+            )
         else:
-            raise NotImplementedError(f"Scheduler does not support metric target type: {type(metric_target)}")
+            raise NotImplementedError(
+                f"Scheduler does not support metric target type: {type(metric_target)}"
+            )
         return math.ceil(expected_samples * (1.1))  # 10% padding for variance
 
     def __iter__(self):
@@ -200,5 +223,7 @@ class NetworkActivitySimulationScheduler(Scheduler):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.delay_fn = poisson_delay_fn(expected_queries_per_second=self.runtime_settings.metric_target.target,
-                                         rng=self.runtime_settings.rng_sched)
+        self.delay_fn = poisson_delay_fn(
+            expected_queries_per_second=self.runtime_settings.metric_target.target,
+            rng=self.runtime_settings.rng_sched,
+        )

@@ -4,6 +4,7 @@ Metrics are used to evaluate the performance of a benchmark, or set baseline exp
 target values are set by the benchmark submitter and are used to calculate the size / frequency of the load sent by loadgen to the SUT.
 Empirical measurements are compared against the target values to determine if the submission is valid.
 """
+
 import math
 
 
@@ -12,6 +13,7 @@ class Metric:
     and are used to calculate the size / frequency of the load sent by loadgen to the SUT. Empirical measurements are compared
     against the target values to determine if the submission is valid.
     """
+
     def __init__(self, target: float):
         self.target = target
 
@@ -41,7 +43,9 @@ class QueryLatency(Metric):
         if target_qps:
             target_latency_ms = 1000 / target_qps
         else:
-            assert target_latency_ms is not None, "Either target_latency_ms or target_qps must be set"
+            assert (
+                target_latency_ms is not None
+            ), "Either target_latency_ms or target_qps must be set"
         super().__init__(target_latency_ms)
 
     def is_valid(self, measurement: float) -> bool:

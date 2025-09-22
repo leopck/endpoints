@@ -357,7 +357,7 @@ class TestHTTPEndpointClientConcurrency:
                 assert len(results) == num_requests
                 print(
                     f"  Completed {num_requests} requests in {duration:.2f}s "
-                    f"({num_requests/duration:.0f} req/s)"
+                    f"({num_requests / duration:.0f} req/s)"
                 )
 
             finally:
