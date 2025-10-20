@@ -45,6 +45,12 @@ test:
   tags:
     - type/docker # Ensure runner supports Docker containers
     - os/linux # Linux-based runner
+    - perflab
+    - hostname/xpl-dvt-55.k8s.nvidia.com # this runner has greater than 64MB of shared memory.
+
+  # TODO: add shared memory size variable once we move to github and have configurable runners.
+  # variables:
+  #   DOCKER_SHM_SIZE: "256m"
 
   # Run on merge requests and pushes to main branches
   rules:
