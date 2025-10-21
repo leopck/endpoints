@@ -77,17 +77,21 @@ class HTTPEndpointClient:
 
     def start(self):
         """Start event loop thread and initialize client."""
-        self.loop = uvloop.new_event_loop()
-        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop = uvloop.new_event_loop()
+            asyncio.set_event_loop(self.loop)
 
-        self.loop_thread = threading.Thread(
-            target=self.loop.run_forever,
-            daemon=True,
-            name=f"HttpClient-EventLoop-{self.client_id}",
-        )
-        self.loop_thread.start()
+            self.loop_thread = threading.Thread(
+                target=self.loop.run_forever,
+                daemon=True,
+                name=f"HttpClient-EventLoop-{self.client_id}",
+            )
+            self.loop_thread.start()
 
-        asyncio.run_coroutine_threadsafe(self.async_start(), self.loop).result()
+            asyncio.run_coroutine_threadsafe(self.async_start(), self.loop).result()
+        except Exception as e:
+            logger.error(f"Failed to start HTTP endpoint client: {e}")
+            raise e
 
     async def async_start(self):
         """Initialize ZMQ, workers, and sockets."""

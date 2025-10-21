@@ -4,6 +4,7 @@ Benchmarking System.
 This file provides shared fixtures and configuration for all tests.
 """
 
+import logging
 import sqlite3
 import sys
 import uuid
@@ -12,6 +13,8 @@ from typing import Any
 
 import pytest
 from inference_endpoint.dataset_manager.dataloader import (
+    DataLoader,
+    DeepSeekR1ChatCompletionDataLoader,
     HFDataLoader,
     PickleReader,
 )
@@ -80,6 +83,42 @@ def mock_http_echo_server():
         raise RuntimeError(f"Mock Echo Server error: {e}") from e
     finally:
         server.stop()
+
+
+@pytest.fixture
+def dummy_dataloader():
+    """
+    Returns a DummyDataLoader object which just returns the sample index.
+    """
+
+    class DummyDataLoader(DataLoader):
+        def __init__(self, n_samples: int = 100):
+            """
+            Initialize the DummyDataLoader.
+
+            Args:
+                n_samples (int): The number of samples to load.
+            """
+            super().__init__(None)
+            self.n_samples = n_samples
+
+        def load_sample(self, sample_index: int) -> int:
+            """
+            Load a sample from the dataset.
+
+            Args:
+                sample_index (int): The index of the sample to load.
+            """
+            assert sample_index >= 0 and sample_index < self.n_samples
+            return sample_index
+
+        def num_samples(self) -> int:
+            """
+            Returns the number of samples in the dataset.
+            """
+            return self.n_samples
+
+    return DummyDataLoader()
 
 
 @pytest.fixture
@@ -159,3 +198,86 @@ def events_db(tmp_path):
     cur.close()
     conn.close()
     Path(test_db).unlink()
+
+
+class OracleServer(EchoServer):
+    def __init__(self, file_path):
+        """
+        Initialize the Oracle server with a dataset and load predefined prompt-response mappings.
+
+        The server loads chat completion samples from the specified file path using a custom parser.
+        Each sample is mapped from its input prompt to its reference output, allowing subsequent
+        retrieval of responses based on exact prompt matching.
+
+        Args:
+            file_path (str): Path to the dataset file containing chat completion samples
+        """
+        super().__init__()
+        self.logger = logging.getLogger(__name__)
+        self.file_path = file_path
+
+        def parser(x):
+            """
+            Extract the prompt and reference output from a dataset sample object.
+
+            Converts a dataset sample into a dictionary with 'prompt' and 'output' keys,
+            using the sample's text input as the prompt and reference output as the response.
+
+            Returns:
+                dict: A dictionary with 'prompt' and 'output' keys derived from the input sample.
+            """
+            return {"prompt": x.text_input, "output": x.ref_output}
+
+        self.parser = parser
+        data_loader = DeepSeekR1ChatCompletionDataLoader(
+            self.file_path, parser=self.parser
+        )
+        data_loader.load()
+        self.data = {}
+        for i in range(data_loader.num_samples()):
+            sample = data_loader.load_sample(i)
+            self.data[sample["prompt"]] = sample["output"]
+
+    def get_response(self, request: str) -> str:
+        """
+        Retrieve a predefined response for a given request from the loaded dataset.
+
+        Returns the stored output corresponding to the input request. If no matching
+        response is found, returns a default "No response found" message.
+
+        Args:
+            request (str): The input prompt to look up in the dataset.
+
+        Returns:
+            str: The matching output for the request, or a default message if not found.
+        """
+        return self.data.get(request, "No response found")
+
+
+@pytest.fixture
+def mock_http_oracle_server(ds_pickle_dataset_path):
+    """
+    Pytest fixture that creates and manages a mock HTTP oracle server for dataset-driven testing.
+
+    Creates an OracleServer instance from a specified dataset pickle file, starts the server
+    on a dynamically allocated port, and manages its lifecycle during testing.
+
+    Args:
+        ds_pickle_dataset_path (str): Path to the dataset pickle file containing chat completion samples
+
+    Yields:
+        OracleServer: A running mock HTTP server serving predefined responses from the dataset
+
+    Raises:
+        RuntimeError: If any errors occur during server setup or execution
+    """
+    # Create and start the server with dynamic port allocation (port=0)
+    server = OracleServer(ds_pickle_dataset_path)
+    server.start()
+
+    try:
+        yield server
+    except Exception as e:
+        raise RuntimeError(f"Mock Oracle Server error: {e}") from e
+    finally:
+        server.stop()

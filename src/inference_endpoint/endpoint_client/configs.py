@@ -31,7 +31,7 @@ class HTTPClientConfig:
     stream_all_chunks: bool = False
 
     # Worker lifecycle timeouts
-    worker_initialization_timeout: float = 10.0  # init
+    worker_initialization_timeout: float = 40.0  # init
     worker_graceful_shutdown_wait: float = 0.5  # post-run
     worker_force_kill_timeout: float = 0.5  # post-run
 
