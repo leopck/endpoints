@@ -8,10 +8,14 @@ class Event(Enum):
 class SessionEvent(Event):
     TEST_STARTED = "test_started"
     TEST_ENDED = "test_ended"
+    LOADGEN_ISSUE_CALLED = "loadgen_issue_called"
+    LOADGEN_STOP = "loadgen_stop"
+    LOADGEN_DATA_LOAD = "loadgen_data_load"
+
+    # TODO: Add an event to record errors occurring
 
 
 class SampleEvent(Event):
     COMPLETE = "complete"
     FIRST_CHUNK = "first_chunk_received"
     NON_FIRST_CHUNK = "non_first_chunk_received"
-    REQUEST_SENT = "request_sent"

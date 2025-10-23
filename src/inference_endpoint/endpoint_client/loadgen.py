@@ -8,7 +8,7 @@ from typing import Any
 from inference_endpoint.core.types import Query, QueryResult, StreamChunk
 from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.load_generator import SampleIssuer
-from inference_endpoint.load_generator.scheduler import Sample, SampleEvent
+from inference_endpoint.load_generator.sample import Sample, SampleEventHandler
 from inference_endpoint.profiling import profile
 
 logger = logging.getLogger(__name__)
@@ -32,15 +32,13 @@ class HttpClientSampleIssuer(SampleIssuer):
         # Task for handling responses
         self.response_task: asyncio.Task | None = None
 
-        # Map query ID -> Sample for routing
-        # Only accessed from event loop thread (lock-free)
-        self.query_id_to_sample: dict[str, Sample] = {}
-
         # Signals when all pending queries complete
-        self._all_complete_event = threading.Event()
+        self._client_idle_event = threading.Event()
 
         # Shutdown flag for response handler
         self._shutdown = False
+
+        self.n_inflight = 0
 
     def start(self):
         """Start response handler on the HTTP client's event loop."""
@@ -57,42 +55,24 @@ class HttpClientSampleIssuer(SampleIssuer):
                 if response is None:  # timed out without a response
                     continue
 
-                # Safe: single-threaded access (event loop thread)
-                sample = self.query_id_to_sample.get(response.id)
-
-                assert (
-                    sample is not None
-                ), f"Sample not found for response: {response.id}"
-
                 # Route to appropriate callback based on response type
                 match response:
                     case StreamChunk(is_complete=False):
-                        if response.metadata.get("first_chunk", False):
-                            sample.callbacks[SampleEvent.FIRST_CHUNK](response)
-                        else:
-                            sample.callbacks[SampleEvent.NON_FIRST_CHUNK](response)
-
+                        SampleEventHandler.stream_chunk_complete(response)
                     case StreamChunk(is_complete=True):
                         raise NotImplementedError(
                             "StreamChunk(is_complete=True) should not be received, QueryResult is expected instead"
                         )
-
                     case QueryResult(error=err) if err is not None:
                         logger.error(f"Error in request {response.id}: {err}")
-                        self.query_id_to_sample.pop(response.id, None)
-
                     case QueryResult():
-                        # Final response for both streaming and non-streaming
-                        sample.callbacks[SampleEvent.COMPLETE](response)
+                        SampleEventHandler.query_result_complete(response)
 
-                        # Remove from map and check if all complete
-                        self.query_id_to_sample.pop(response.id, None)
-                        if len(self.query_id_to_sample) == 0:
-                            self._all_complete_event.set()
-
+                        self.n_inflight -= 1
+                        if self.n_inflight == 0:
+                            self._client_idle_event.set()
                     case _:
                         raise ValueError(f"Unexpected response type: {type(response)}")
-
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -101,29 +81,10 @@ class HttpClientSampleIssuer(SampleIssuer):
 
     @profile
     def issue(self, sample: Sample):
-        """Issue sample to HTTP endpoint.
-
-        Flow:
-        1. Create Query from sample data, and to track response
-        2. Issue via HTTP client
-        4. Call REQUEST_SENT callback on Query
-        """
-        # Convert int uuid to string for consistency with Query.id type
-        query_id: str = str(sample.uuid)
-        query = Query(id=query_id, data=sample.get_bytes())
-
-        # Schedule state mutation on event loop thread
-        # This ensures all dict access happens from single thread
-        def _add_to_map(query_id: str, sample: Sample):
-            self.query_id_to_sample[query_id] = sample
-
-        self.http_client.loop.call_soon_threadsafe(_add_to_map, query_id, sample)
-
-        # Issue via HTTP client (thread-safe, non-blocking)
-        self.http_client.issue_query(query)
-
-        # Notify that request was issued
-        sample.callbacks[SampleEvent.REQUEST_SENT](query)
+        """Issue sample to HTTP endpoint."""
+        self.n_inflight += 1
+        self._client_idle_event.clear()
+        self.http_client.issue_query(Query(id=sample.uuid, data=sample.data))
 
     def wait_for_all_complete(self, timeout: float | None = None):
         """Wait (blocking) for all pending queries to complete.
@@ -134,7 +95,7 @@ class HttpClientSampleIssuer(SampleIssuer):
         Returns:
             True if all complete, False if timeout
         """
-        result = self._all_complete_event.wait(timeout=timeout)
+        result = self._client_idle_event.wait(timeout=timeout)
         return result
 
     def shutdown(self):

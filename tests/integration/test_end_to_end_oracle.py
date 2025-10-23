@@ -1,13 +1,11 @@
 import logging
 import random
-import time
-from collections import defaultdict
 
 import pytest
 from inference_endpoint import metrics
 from inference_endpoint.config.ruleset import RuntimeSettings
+from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataloader import (
-    DataLoader,
     DeepSeekR1ChatCompletionDataLoader,
 )
 from inference_endpoint.endpoint_client.configs import (
@@ -17,29 +15,23 @@ from inference_endpoint.endpoint_client.configs import (
 )
 from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.endpoint_client.loadgen import HttpClientSampleIssuer
-from inference_endpoint.load_generator import LoadGenerator
-from inference_endpoint.load_generator.scheduler import (
+from inference_endpoint.load_generator import (
+    BenchmarkSession,
     MaxThroughputScheduler,
-    SampleFactory,
+    SampleEvent,
+    SampleEventHandler,
     WithoutReplacementSampleOrder,
 )
 
 from tests.test_helpers import get_test_socket_path
 
 
-class DeepSeekR1SampleFactory(SampleFactory):
-    _output_histogram = defaultdict(int)
-    request_data: {str: str} = {}
+class ResponseCache:
+    def __init__(self):
+        self.cache: {str: str} = {}
 
-    @staticmethod
-    def sample_get_bytes(dataloader: DataLoader, sample_index: int):
-        logging.info(f"Sample get bytes: {sample_index}")
-        return dataloader.load_sample(sample_index)
-
-    @staticmethod
-    def sample_complete_callback(output, sid):
-        logging.info(f"Sample complete callback: {output}")
-        DeepSeekR1SampleFactory.request_data[sid] = output
+    def on_complete_hook(self, result: QueryResult):
+        self.cache[result.id] = result.response_output
 
 
 class DeepSeekR1SampleIssuer(HttpClientSampleIssuer):
@@ -68,12 +60,18 @@ class DeepSeekR1SampleIssuer(HttpClientSampleIssuer):
 
 @pytest.mark.asyncio
 async def test_load_generator_full_run(
-    mock_http_oracle_server, ds_pickle_dataset_path, tmp_path
+    mock_http_oracle_server,
+    ds_pickle_dataset_path,
+    tmp_path,
+    clean_sample_event_hooks,
 ):
-    DeepSeekR1SampleFactory._output_histogram.clear()
-
     def parser(x):
         return {"prompt": x.text_input, "output": x.ref_output}
+
+    response_cache = ResponseCache()
+    SampleEventHandler.register_hook(
+        SampleEvent.COMPLETE, response_cache.on_complete_hook
+    )
 
     dummy_dataloader = DeepSeekR1ChatCompletionDataLoader(
         ds_pickle_dataset_path, parser
@@ -94,8 +92,6 @@ async def test_load_generator_full_run(
 
     scheduler = MaxThroughputScheduler(
         rt_settings,
-        dummy_dataloader,
-        DeepSeekR1SampleFactory,
         WithoutReplacementSampleOrder,
     )
     logging.info(f"Number of samples to issue: {scheduler.total_samples_to_issue}")
@@ -106,19 +102,23 @@ async def test_load_generator_full_run(
         sample_issuer.http_client.start()
         # Then start the sample issuer which needs the client's loop
         sample_issuer.start()
-        load_generator = LoadGenerator(scheduler, sample_issuer)
-        sess = load_generator.start_test()
+
+        sess = BenchmarkSession.start(
+            rt_settings,
+            dummy_dataloader,
+            sample_issuer,
+            scheduler,
+            name="pytest_test_load_generator_full_run",
+            stop_sample_issuer_on_test_end=False,
+        )
 
         sess.wait_for_test_end()
-        end_time_ns = time.monotonic_ns()
     except Exception as e:
         logging.info(f"Error: {e}")
         raise e
     finally:
-        logging.info(f"Request data: {DeepSeekR1SampleFactory.request_data}")
+        logging.info(f"Request data: {response_cache.cache}")
 
-    assert sess.start_time_ns is not None
-    assert end_time_ns is not None
     try:
         vals = {}
         for i in range(dummy_dataloader.num_samples()):
@@ -128,19 +128,19 @@ async def test_load_generator_full_run(
 
         logging.info(f"Number of samples in dataset: {num_samples_in_dataset}")
         logging.info(f"Total samples to issue: {scheduler.total_samples_to_issue}")
-        logging.info(f"Request data: {len(DeepSeekR1SampleFactory.request_data)}")
+        logging.info(f"Request data: {len(response_cache.cache)}")
         assert (
             num_samples_in_dataset == scheduler.total_samples_to_issue
         ), "Number of samples in dataset and number of samples in request data should be the same"
 
-        for req, resp in DeepSeekR1SampleFactory.request_data.items():
-            response = resp.response_output
+        for sample_uuid, resp in response_cache.cache.items():
+            sample_index = sess.sample_uuid_map[sample_uuid].index
             logging.info(
-                f"Sample {req} should have been response {vals[req][0:30]}, but was response {response[0:30]}"
+                f"Sample {sample_uuid} should have been response {vals[sample_index][0:30]}, but was response {resp[0:30]}"
             )
             assert (
-                response == vals[req]
-            ), f"Sample {req} should have been response {vals[req][0:30]}, but was response {response[0:30]}"
+                resp == vals[sample_index]
+            ), f"Sample {sample_uuid} should have been response {vals[sample_index][0:30]}, but was response {resp[0:30]}"
     except Exception as e:
         logging.info(f"Error: {e}")
         raise e

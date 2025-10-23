@@ -1,0 +1,149 @@
+import logging
+import time
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
+
+from ..core.types import QueryResult, StreamChunk
+from ..metrics.recorder import EventRecorder
+from .events import SampleEvent
+
+logger = logging.getLogger(__name__)
+
+
+class Sample:
+    """Represents a sample for the SampleIssuer to send to the inference endpoint.
+
+    A Sample is immutable once created, except specifically in the case the `data` attribute is None.
+    `Sample.data` can be set to a non-None value after creation, but once it is set, it cannot be changed.
+    """
+
+    __slots__ = ["uuid", "data"]
+
+    def __init__(self, data: Any):
+        # 128-bit UUID might be a little overkill for our use case, we can investigate slimming down memory usage
+        self.uuid = uuid.uuid4().hex
+        self.data = data
+
+    def __setattr__(self, name: str, value: Any):
+        if not hasattr(self, name) or (name == "data" and self.data is None):
+            object.__setattr__(self, name, value)
+        else:
+            raise AttributeError(f"Sample is immutable - cannot set attribute: {name}")
+
+
+class _SampleEventHandler:
+    """Contains handlers for SampleEvents given a sample UUID. This is also to avoid needing other classes
+    to do their own bookkeeping for Sample objects, which can be discarded once they are issued, as long as
+    their UUIDs are saved.
+
+    This class is a singleton rather than a class method mainly because it needs to hold some state (i.e. hooks)
+
+    A user can register hooks to any event type, and will be run in the order they were registered.
+    A valid hook is a callable that takes a single argument, representing the response object (StreamChunk or QueryResult).
+
+    A simple example use-case of a hook is to update a progress bar on-completion of a sample.
+    """
+
+    __slots__ = ["first_chunk_hooks", "non_first_chunk_hooks", "complete_hooks"]
+
+    SINGLETON = None
+    _initialized = False
+
+    def __new__(cls):
+        if cls.SINGLETON is None:
+            cls.SINGLETON = super().__new__(cls)
+        return cls.SINGLETON
+
+    def __init__(self):
+        if _SampleEventHandler._initialized:
+            return
+        _SampleEventHandler._initialized = True
+
+        self.first_chunk_hooks = []
+        self.non_first_chunk_hooks = []
+        self.complete_hooks = []
+
+    def register_hook(
+        self, event_type: SampleEvent, hook: Callable[[StreamChunk | QueryResult], None]
+    ) -> None:
+        if event_type == SampleEvent.FIRST_CHUNK:
+            self.first_chunk_hooks.append(hook)
+        elif event_type == SampleEvent.NON_FIRST_CHUNK:
+            self.non_first_chunk_hooks.append(hook)
+        elif event_type == SampleEvent.COMPLETE:
+            self.complete_hooks.append(hook)
+        else:
+            raise ValueError(f"Invalid event type: {event_type}")
+
+    def clear_hooks(self, ev_type: SampleEvent | None = None) -> None:
+        if ev_type is None:
+            self.first_chunk_hooks.clear()
+            self.non_first_chunk_hooks.clear()
+            self.complete_hooks.clear()
+        elif ev_type == SampleEvent.FIRST_CHUNK:
+            self.first_chunk_hooks.clear()
+        elif ev_type == SampleEvent.NON_FIRST_CHUNK:
+            self.non_first_chunk_hooks.clear()
+        elif ev_type == SampleEvent.COMPLETE:
+            self.complete_hooks.clear()
+
+    def stream_chunk_complete(self, chunk: StreamChunk) -> None:
+        timestamp_ns = time.monotonic_ns()
+
+        assert isinstance(chunk, StreamChunk), f"Invalid chunk type: {type(chunk)}"
+
+        hooks = []
+        if chunk.metadata.get("first_chunk", False):
+            EventRecorder.record_event(
+                SampleEvent.FIRST_CHUNK,
+                timestamp_ns,
+                sample_uuid=chunk.id,
+            )
+            hooks = self.first_chunk_hooks
+        else:
+            EventRecorder.record_event(
+                SampleEvent.NON_FIRST_CHUNK,
+                timestamp_ns,
+                sample_uuid=chunk.id,
+            )
+            hooks = self.non_first_chunk_hooks
+
+        for hook in hooks:
+            hook(chunk)
+
+    def query_result_complete(self, result: QueryResult) -> None:
+        timestamp_ns = time.monotonic_ns()
+
+        assert isinstance(result, QueryResult), f"Invalid result type: {type(result)}"
+
+        if result.error is not None:
+            logger.error(f"Error in request {result.id}: {result.error}")
+            return
+
+        EventRecorder.record_event(
+            SampleEvent.COMPLETE,
+            timestamp_ns,
+            sample_uuid=result.id,
+        )
+
+        for hook in self.complete_hooks:
+            hook(result)
+
+
+@dataclass
+class IssuedSample:
+    """Contains data about a sample that has been issued to the inference endpoint.
+
+    SampleIssuer is not allowed to know the actual sample index of the data to prevent cheating
+    and response caching. This class contains metadata about the sample for bookkeeping by the
+    LoadGenerator and BenchmarkSession.
+    """
+
+    sample: Sample
+    index: int
+    issue_timestamp_ns: int
+
+
+SampleEventHandler = _SampleEventHandler()

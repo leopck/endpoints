@@ -77,12 +77,28 @@ class OpenAIAdapter:
         )
 
     @staticmethod
-    def from_openai_response(response: CreateChatCompletionResponse) -> QueryResult:
-        """Convert an OpenAI response to a QueryResult."""
+    def from_openai_response(
+        response: CreateChatCompletionResponse,
+        result_id: str | None = None,
+    ) -> QueryResult:
+        """Convert an OpenAI response to a QueryResult.
+        Args:
+            response: The OpenAI response to convert.
+            result_id: If provided, use this as the ID for the QueryResult. Otherwise,
+                       uses the response ID from the OpenAI response. This is useful
+                       since QueryResult is a frozen dataclass, and `id` cannot be changed
+                       after creation. (Default: None)
+        Returns:
+            A QueryResult object.
+        """
         if not response.choices:
             raise ValueError("Response must contain at least one choice")
+
+        if result_id is None:
+            result_id = response.id
+
         return QueryResult(
-            id=response.id,
+            id=result_id,
             response_output=response.choices[0].message.content,
         )
 
