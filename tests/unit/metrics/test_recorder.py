@@ -1,30 +1,37 @@
 import multiprocessing
-import sqlite3
 import uuid
 from collections import defaultdict, namedtuple
 from unittest.mock import patch
 
 import pytest
-from inference_endpoint.load_generator.events import SampleEvent
+from inference_endpoint.load_generator.events import SampleEvent, SessionEvent
 from inference_endpoint.metrics.recorder import (
     EventRecorder,
+    EventRecorderSingletonViolation,
     MetricsReporter,
     RollupQueryTable,
+    sqlite3_cursor,
 )
 
 
-def test_derive_ttft(events_db):
+def test_derive_ttft(events_db, sample_uuids):
+    uuid1 = sample_uuids(1)
+    uuid2 = sample_uuids(2)
+
     with MetricsReporter(events_db, intermediate_chunks_logged=True) as reporter:
         ttft_rows = reporter.derive_TTFT()
     assert len(ttft_rows) == 2
     assert ttft_rows[0].metric_type == "ttft"
     assert ttft_rows[1].metric_type == "ttft"
     d = {row.sample_uuid: row.metric_value for row in ttft_rows}
-    assert d[1] == 10
-    assert d[2] == 187
+    assert d[uuid1] == 10
+    assert d[uuid2] == 187
 
 
-def test_derive_tpot(events_db):
+def test_derive_tpot(events_db, sample_uuids):
+    uuid1 = sample_uuids(1)
+    uuid2 = sample_uuids(2)
+
     with MetricsReporter(events_db, intermediate_chunks_logged=True) as reporter:
         tpot_rows = reporter.derive_TPOT()
     assert len(tpot_rows) == 7
@@ -33,8 +40,55 @@ def test_derive_tpot(events_db):
         assert row.metric_type == "tpot"
         d[row.sample_uuid].append(row.metric_value)
 
-    assert d[1] == [191, 2, 8]
-    assert d[2] == [20, 4, 3, 2]
+    assert d[uuid1] == [191, 2, 8]
+    assert d[uuid2] == [20, 4, 3, 2]
+
+
+def test_derive_sample_latency(events_db, sample_uuids):
+    uuid1 = sample_uuids(1)
+    uuid2 = sample_uuids(2)
+
+    with MetricsReporter(events_db, intermediate_chunks_logged=True) as reporter:
+        sample_latency_rows = reporter.derive_sample_latency()
+
+    assert len(sample_latency_rows) == 2
+    latency1, latency2 = tuple(sorted(sample_latency_rows, key=lambda x: x.sample_uuid))
+    assert latency1.metric_type == "sample_latency"
+    assert latency1.sample_uuid == uuid1
+    assert latency1.metric_value == 10211 - 10000
+
+    assert latency2.metric_type == "sample_latency"
+    assert latency2.sample_uuid == uuid2
+    assert latency2.metric_value == 10219 - 10003
+
+
+def test_derive_duration(events_db):
+    with MetricsReporter(events_db, intermediate_chunks_logged=True) as reporter:
+        duration = reporter.derive_duration()
+    assert duration == (10300 - 5000)
+
+
+def test_derive_duration_malformed(tmp_path):
+    test_db_path = str(tmp_path / "bad_events.db")
+    with sqlite3_cursor(test_db_path) as (cursor, _):
+        cursor.execute(
+            "CREATE TABLE IF NOT EXISTS events (sample_uuid VARCHAR(32), event_type VARCHAR(32), timestamp_ns INTEGER)"
+        )
+        cursor.executemany(
+            "INSERT INTO events (sample_uuid, event_type, timestamp_ns) VALUES (?, ?, ?)",
+            [
+                ("", SessionEvent.TEST_STARTED.value, 5000),
+                ("", SessionEvent.TEST_ENDED.value, 10300),
+                ("", SessionEvent.TEST_STARTED.value, 11000),
+                ("", SessionEvent.TEST_ENDED.value, 12000),
+            ],
+        )
+
+    with MetricsReporter(test_db_path) as reporter:
+        with pytest.raises(
+            RuntimeError, match="Multiple TEST_STARTED or TEST_ENDED events found"
+        ):
+            reporter.derive_duration()
 
 
 def test_tpot_to_histogram(events_db):
@@ -77,69 +131,124 @@ def get_EventRecorder(*args, **kwargs):
     return EventRecorder(*args, min_memory_req_bytes=128 * 1024 * 1024, **kwargs)
 
 
-def test_record_event(events_db):
+def test_event_recorder_singleton_violation_create_multiple():
+    with get_EventRecorder():
+        with pytest.raises(EventRecorderSingletonViolation):
+            with get_EventRecorder():
+                pass
+
+
+def test_event_recorder_singleton_violation_close_non_active():
+    with get_EventRecorder():
+        other_rec = get_EventRecorder()
+        with pytest.raises(EventRecorderSingletonViolation):
+            other_rec.close()
+
+
+def test_event_recorder_singleton_violation_record_event_non_active(sample_uuids):
+    assert (
+        EventRecorder.LIVE is None
+    ), "Cannot run test - EventRecorder is active from previous test"
+    with pytest.raises(EventRecorderSingletonViolation):
+        EventRecorder.record_event(
+            SessionEvent.LOADGEN_ISSUE_CALLED, 10000, sample_uuid=sample_uuids(1)
+        )
+    assert (
+        EventRecorder.record_event(
+            SessionEvent.LOADGEN_ISSUE_CALLED,
+            10000,
+            sample_uuid=sample_uuids(1),
+            assert_active=False,
+        )
+        is False
+    )
+
+
+def test_record_event(events_db, sample_uuids):
+    uuid1 = sample_uuids(1)
+    uuid2 = sample_uuids(2)
+    uuid3 = sample_uuids(3)
+
     with get_EventRecorder() as rec:
-        rec.record_event(SampleEvent.REQUEST_SENT, 10000, sample_uuid=1)
-        rec.record_event(SampleEvent.REQUEST_SENT, 10003, sample_uuid=2)
-        rec.record_event(SampleEvent.FIRST_CHUNK, 10010, sample_uuid=1)
-        rec.record_event(SampleEvent.FIRST_CHUNK, 10190, sample_uuid=2)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10201, sample_uuid=1)
-        rec.record_event(SampleEvent.REQUEST_SENT, 10202, sample_uuid=3)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10203, sample_uuid=1)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10210, sample_uuid=2)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10211, sample_uuid=1)
-        rec.record_event(SampleEvent.COMPLETE, 10211, sample_uuid=1)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10214, sample_uuid=2)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10217, sample_uuid=2)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10219, sample_uuid=2)
-        rec.record_event(SampleEvent.COMPLETE, 10219, sample_uuid=2)
-        rec.commit_txns(force=True)
+        rec.record_event(SessionEvent.LOADGEN_ISSUE_CALLED, 10000, sample_uuid=uuid1)
+        rec.record_event(SessionEvent.LOADGEN_ISSUE_CALLED, 10003, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.FIRST_CHUNK, 10010, sample_uuid=uuid1)
+        rec.record_event(SampleEvent.FIRST_CHUNK, 10190, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10201, sample_uuid=uuid1)
+        rec.record_event(SessionEvent.LOADGEN_ISSUE_CALLED, 10202, sample_uuid=uuid3)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10203, sample_uuid=uuid1)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10210, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10211, sample_uuid=uuid1)
+        rec.record_event(SampleEvent.COMPLETE, 10211, sample_uuid=uuid1)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10214, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10217, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10219, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.COMPLETE, 10219, sample_uuid=uuid2)
 
-        recorder_cursor = rec.conn.cursor()
-        actual_rows = recorder_cursor.execute("SELECT * FROM events").fetchall()
-        recorder_cursor.close()
+        # Wait for writer thread to process all events
+        rec.wait_for_writes()
 
-    conn = sqlite3.connect(events_db)
-    cur = conn.cursor()
-    expected_rows = cur.execute("SELECT * FROM events").fetchall()
+        # Read from the database directly
+        with sqlite3_cursor(rec.connection_name) as (cursor, _):
+            actual_rows = cursor.execute("SELECT * FROM events").fetchall()
+
+    expected_rows = [
+        (uuid1, SessionEvent.LOADGEN_ISSUE_CALLED.value, 10000),
+        (uuid2, SessionEvent.LOADGEN_ISSUE_CALLED.value, 10003),
+        (uuid1, SampleEvent.FIRST_CHUNK.value, 10010),
+        (uuid2, SampleEvent.FIRST_CHUNK.value, 10190),
+        (uuid1, SampleEvent.NON_FIRST_CHUNK.value, 10201),
+        (uuid3, SessionEvent.LOADGEN_ISSUE_CALLED.value, 10202),
+        (uuid1, SampleEvent.NON_FIRST_CHUNK.value, 10203),
+        (uuid2, SampleEvent.NON_FIRST_CHUNK.value, 10210),
+        (uuid1, SampleEvent.NON_FIRST_CHUNK.value, 10211),
+        (uuid1, SampleEvent.COMPLETE.value, 10211),
+        (uuid2, SampleEvent.NON_FIRST_CHUNK.value, 10214),
+        (uuid2, SampleEvent.NON_FIRST_CHUNK.value, 10217),
+        (uuid2, SampleEvent.NON_FIRST_CHUNK.value, 10219),
+        (uuid2, SampleEvent.COMPLETE.value, 10219),
+    ]
+
     assert expected_rows == actual_rows
     assert len(actual_rows) == 14
 
 
-def worker_proc_read_entries(sess_id, events_created_ev):
+def worker_proc_read_entries(sess_id, events_created_ev, uuid1, uuid2):
     events_created_ev.wait()
     expected_rows = [
-        (1, "request_sent", 10000),
-        (2, "request_sent", 10003),
-        (1, "first_chunk_received", 10010),
-        (2, "first_chunk_received", 10190),
-        (1, "non_first_chunk_received", 10201),
+        (uuid1, SessionEvent.LOADGEN_ISSUE_CALLED.value, 10000),
+        (uuid2, SessionEvent.LOADGEN_ISSUE_CALLED.value, 10003),
+        (uuid1, SampleEvent.FIRST_CHUNK.value, 10010),
+        (uuid2, SampleEvent.FIRST_CHUNK.value, 10190),
+        (uuid1, SampleEvent.NON_FIRST_CHUNK.value, 10201),
     ]
-    with get_EventRecorder(session_id=sess_id) as rec:
-        recorder_cursor = rec.conn.cursor()
-        actual_rows = recorder_cursor.execute("SELECT * FROM events").fetchall()
-        recorder_cursor.close()
+    with sqlite3_cursor(EventRecorder.db_path(sess_id)) as (cursor, _):
+        actual_rows = cursor.execute("SELECT * FROM events").fetchall()
     assert expected_rows == actual_rows
 
 
-def test_shm_usage():
+def test_shm_usage(sample_uuids):
+    uuid1 = sample_uuids(1)
+    uuid2 = sample_uuids(2)
+
     # Set mp start method
     ctx = multiprocessing.get_context("spawn")
     events_created_ev = ctx.Event()
     sess_id = uuid.uuid4().hex
 
     worker_proc = ctx.Process(
-        target=worker_proc_read_entries, args=(sess_id, events_created_ev)
+        target=worker_proc_read_entries, args=(sess_id, events_created_ev, uuid1, uuid2)
     )
     worker_proc.start()
 
     with get_EventRecorder(session_id=sess_id) as rec:
-        rec.record_event(SampleEvent.REQUEST_SENT, 10000, sample_uuid=1)
-        rec.record_event(SampleEvent.REQUEST_SENT, 10003, sample_uuid=2)
-        rec.record_event(SampleEvent.FIRST_CHUNK, 10010, sample_uuid=1)
-        rec.record_event(SampleEvent.FIRST_CHUNK, 10190, sample_uuid=2)
-        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10201, sample_uuid=1)
-        rec.commit_txns(force=True)
+        rec.record_event(SessionEvent.LOADGEN_ISSUE_CALLED, 10000, sample_uuid=uuid1)
+        rec.record_event(SessionEvent.LOADGEN_ISSUE_CALLED, 10003, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.FIRST_CHUNK, 10010, sample_uuid=uuid1)
+        rec.record_event(SampleEvent.FIRST_CHUNK, 10190, sample_uuid=uuid2)
+        rec.record_event(SampleEvent.NON_FIRST_CHUNK, 10201, sample_uuid=uuid1)
+        # Wait for writer thread to process all events
+        rec.wait_for_writes()
     events_created_ev.set()
 
     worker_proc.join(timeout=5)
@@ -169,7 +278,9 @@ def test_shm_too_small(mock_run):
         total=64 * 1024 * 1024, used=0, free=64 * 1024 * 1024
     )
     with pytest.raises(MemoryError) as err:
-        EventRecorder()  # Instantiate will not init the connection
+        EventRecorder(
+            min_memory_req_bytes=512 * 1024 * 1024
+        )  # Instantiate will not init the connection
     assert "total space" in err.value.args[0]
 
 
@@ -179,6 +290,8 @@ def test_shm_not_enough_space(mock_run):
         total=1024 * 1024 * 1024, used=64 * 1024 * 1024, free=960 * 1024 * 1024
     )
     with pytest.raises(MemoryError) as err:
-        EventRecorder()  # Instantiate will not init the connection
+        EventRecorder(
+            min_memory_req_bytes=1024 * 1024 * 1024
+        )  # Instantiate will not init the connection
     assert "free space" in err.value.args[0]
     assert "960MB" in err.value.args[0]

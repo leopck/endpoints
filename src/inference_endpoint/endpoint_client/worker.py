@@ -391,11 +391,9 @@ class Worker:
             response_bytes = await response.read()
             response_data = orjson.loads(response_bytes)
             response_obj = OpenAIAdapter.from_openai_response(
-                CreateChatCompletionResponse(**response_data, ignore_extra=True)
+                CreateChatCompletionResponse(**response_data, ignore_extra=True),
+                result_id=query.id,
             )
-
-            # Override query id for loadgen
-            response_obj.id = query.id
 
             # Send response back to the main process
             await self._response_socket.send(response_obj)

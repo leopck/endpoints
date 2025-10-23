@@ -31,14 +31,19 @@ class Query(msgspec.Struct, kw_only=True):
     created_at: float = msgspec.field(default_factory=time.time)
 
 
-class QueryResult(msgspec.Struct, tag="query_result", kw_only=True):
+class QueryResult(msgspec.Struct, tag="query_result", kw_only=True, frozen=True):
     """Result of a completed query."""
 
     id: str = ""
     response_output: str | None = None
     metadata: dict[str, Any] = msgspec.field(default_factory=dict)
     error: str | None = None
-    completed_at: float = msgspec.field(default_factory=time.time)
+    completed_at: float = msgspec.UNSET
+
+    def __post_init__(self):
+        # Disallow user setting completed_at time to prevent cheating.
+        # Timestamp must be generated internally
+        msgspec.structs.force_setattr(self, "completed_at", time.monotonic_ns())
 
 
 class StreamChunk(msgspec.Struct, tag="stream_chunk", kw_only=True):

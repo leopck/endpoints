@@ -5,7 +5,7 @@ from dataclasses import dataclass, fields
 from pathlib import Path
 
 import pytest
-from inference_endpoint.load_generator.events import SampleEvent
+from inference_endpoint.load_generator.events import SampleEvent, SessionEvent
 from inference_endpoint.metrics.recorder import EventRecorder, MetricsReporter
 from inference_endpoint.profiling.line_profiler import ENV_VAR_ENABLE_LINE_PROFILER
 
@@ -51,8 +51,8 @@ class TimingLog:
 
 
 @pytest.fixture
-def timing_log():
-    with TimingLog() as log:
+def timing_log(tmp_path):
+    with TimingLog(tmp_path / "timing_log.txt") as log:
         yield log
 
 
@@ -118,7 +118,7 @@ def test_many_chunk_performance(
         start_time = time.monotonic_ns()
         for sample_uuid in range(n_samples):
             rec.record_event(
-                SampleEvent.REQUEST_SENT,
+                SessionEvent.LOADGEN_ISSUE_CALLED,
                 time.monotonic_ns(),
                 sample_uuid=sample_uuid + 1,
             )
@@ -141,7 +141,7 @@ def test_many_chunk_performance(
             rec.record_event(
                 SampleEvent.COMPLETE, time.monotonic_ns(), sample_uuid=sample_uuid + 1
             )
-        rec.commit_txns(force=True)
+        rec.wait_for_writes(force_commit=True)
         end_time = time.monotonic_ns()
 
     assert (
@@ -205,7 +205,7 @@ def test_2_chunk_per_query_performance(
         start_time = time.monotonic_ns()
         for sample_uuid in range(n_queries):
             rec.record_event(
-                SampleEvent.REQUEST_SENT,
+                SessionEvent.LOADGEN_ISSUE_CALLED,
                 time.monotonic_ns(),
                 sample_uuid=sample_uuid + 1,
             )
@@ -233,7 +233,7 @@ def test_2_chunk_per_query_performance(
                 SampleEvent.COMPLETE, time.monotonic_ns(), sample_uuid=sample_uuid + 1
             )
 
-        rec.commit_txns(force=True)
+        rec.wait_for_writes(force_commit=True)
         end_time = time.monotonic_ns()
 
     assert (
@@ -275,9 +275,11 @@ def test_db_write_performance(cleanup_connections, check_time_fn):
         def bulk_write():
             for i in range(n_events):
                 rec.record_event(
-                    SampleEvent.REQUEST_SENT, time.monotonic_ns(), sample_uuid=i + 1
+                    SessionEvent.LOADGEN_ISSUE_CALLED,
+                    time.monotonic_ns(),
+                    sample_uuid=i + 1,
                 )
-            rec.commit_txns(force=True)
+            rec.wait_for_writes(force_commit=True)
 
         check_time_fn(
             bulk_write,
