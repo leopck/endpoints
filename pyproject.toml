@@ -7,7 +7,7 @@ name = "inference-endpoint"
 version = "0.1.0"
 description = "High-performance LLM endpoint benchmarking system with 50k QPS capability"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 authors = [
     {name = "MLPerf Inference Endpoint Team"}
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
