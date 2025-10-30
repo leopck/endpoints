@@ -16,7 +16,6 @@
 """Tests for configuration schema."""
 
 from inference_endpoint.config.schema import (
-    Baseline,
     BenchmarkConfig,
     Dataset,
     DatasetType,
@@ -24,6 +23,7 @@ from inference_endpoint.config.schema import (
     ModelParams,
     OSLDistribution,
     OSLDistributionType,
+    SubmissionReference,
     TestType,
 )
 
@@ -118,8 +118,8 @@ class TestBenchmarkConfig:
             name="submission",
             version="1.0",
             type=TestType.SUBMISSION,
-            baseline=Baseline(
-                locked=True, model="llama-2-70b", ruleset="mlperf-inference-v6.0"
+            submission_ref=SubmissionReference(
+                model="llama-2-70b", ruleset="mlperf-inference-v6.0"
             ),
             datasets=[
                 {
@@ -137,9 +137,9 @@ class TestBenchmarkConfig:
                 },
             ],
         )
-        assert config.is_locked()
-        assert config.baseline.model == "llama-2-70b"
-        assert config.baseline.ruleset == "mlperf-inference-v6.0"
+        assert config.submission_ref is not None
+        assert config.submission_ref.model == "llama-2-70b"
+        assert config.submission_ref.ruleset == "mlperf-inference-v6.0"
         assert len(config.datasets) == 2
 
     def test_multiple_accuracy_datasets(self):

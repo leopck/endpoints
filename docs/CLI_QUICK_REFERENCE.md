@@ -5,24 +5,23 @@
 ### Performance Benchmarking
 
 ```bash
-# Offline (max throughput)
+# Offline (max throughput - CLI mode)
 inference-endpoint benchmark offline \
   --endpoint URL \
   --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl
 
-# Online (sustained QPS with latency focus)
+# Online (sustained QPS - CLI mode)
 inference-endpoint benchmark online \
   --endpoint URL \
   --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
   --qps 500
 
-# YAML-based (reproducible)
-inference-endpoint benchmark \
+# YAML-based (YAML mode - no CLI overrides)
+inference-endpoint benchmark from-config \
   --config test.yaml \
-  --endpoint URL \
-  --api-key KEY
+  --output results.json
 ```
 
 **Default Test Dataset:** Use `tests/datasets/dummy_1k.pkl` (1000 samples, ~133 KB) for local testing.
@@ -58,23 +57,27 @@ inference-endpoint info
 
 ## Common Options
 
-- `--endpoint, -e URL` - Endpoint URL (required for benchmarks and probe)
-- `--api-key KEY` - API authentication
-- `--model NAME` - Model name (e.g., llama-2-70b, gpt-3.5-turbo)
-- `--dataset, -d PATH` - Dataset file (pkl, jsonl, or HuggingFace directory)
-- `--config, -c PATH` - YAML configuration file
+- `--endpoint, -e URL` - Endpoint URL (required for CLI mode)
+- `--model NAME` - Model name (required for CLI mode, e.g., llama-2-70b)
+- `--dataset, -d PATH` - Dataset file (required for CLI mode)
+- `--config, -c PATH` - YAML config file (required for from-config mode)
 - `--output, -o PATH` - Save results to JSON
 - `--verbose, -v` - Increase verbosity (-vv for debug)
 
-## Benchmark Options
+## Benchmark Options (CLI Mode Only)
 
-- `--qps N` - Queries per second (usage varies by mode)
-- `--duration SEC` - Test duration in seconds
-- `--workers N` - Number of HTTP workers
-- `--concurrency N` - Max concurrent requests
-- `--min-tokens N` - Min output tokens (OSL control)
-- `--max-tokens N` - Max output tokens (OSL control)
+- `--api-key KEY` - API authentication
+- `--qps N` - Queries per second (default: 10.0)
+- `--duration SEC` - Test duration in seconds (default: 10)
+- `--workers N` - HTTP workers (default: 4)
 - `--mode MODE` - Test mode: `perf` (default), `acc`, or `both`
+- `--min-tokens N` - Min output tokens
+- `--max-tokens N` - Max output tokens
+
+## Online-Specific Options
+
+- `--load-pattern TYPE` - Load pattern: `poisson` (default), `concurrency`
+- `--concurrency N` - Max concurrent requests (default: -1 unlimited)
 
 ## Dataset Formats
 
@@ -158,22 +161,23 @@ inference-endpoint benchmark online \
 # 1. Generate template
 inference-endpoint init --template submission
 
-# 2. Edit submission_template.yaml (set model, datasets, ruleset)
+# 2. Edit submission_template.yaml (set model, datasets, ruleset, endpoint)
 
-# 3. Run
-inference-endpoint benchmark \
+# 3. Run (YAML mode - no CLI overrides)
+inference-endpoint benchmark from-config \
   --config submission_template.yaml \
-  --endpoint https://your-endpoint.com \
-  --api-key $API_KEY \
   --output official_results.json
 ```
 
 ### Validate First
 
 ```bash
+# Test connectivity
 inference-endpoint probe \
   --endpoint https://api.example.com \
-  --model gpt-3.5-turbo
+  --model llama-2-70b
+
+# Validate YAML config
 inference-endpoint validate --config submission.yaml
 ```
 
@@ -182,16 +186,14 @@ inference-endpoint validate --config submission.yaml
 ```yaml
 name: "test-name"
 type: "submission" # offline|online|eval|submission
+benchmark_mode: "offline" # Required for submission: offline or online
 
 baseline:
-  locked: true
   model: "llama-2-70b"
-  ruleset: "mlperf-inference-v6.0"
+  ruleset: "mlperf-inference-v5.1"
 
 model_params:
   temperature: 0.7
-  top_k: 50
-  top_p: 0.9
   max_new_tokens: 2048
 
 datasets:
@@ -204,19 +206,43 @@ datasets:
     eval_method: "exact_match"
 
 settings:
+  runtime:
+    min_duration_ms: 600000 # 10 minutes
+    random_seed: 42
   load_pattern:
     type: "max_throughput"
+    qps: 10.0
   client:
     workers: 4
-    max_concurrency: 50
+    max_concurrency: -1 # -1 = unlimited
 
-environment:
+metrics:
+  collect: ["throughput", "latency", "ttft", "tpot"]
+
+endpoint_config:
   endpoint: "http://localhost:8000"
+  api_key: null
 ```
+
+## CLI vs YAML Modes
+
+**CLI Mode** (`benchmark offline/online`):
+
+- All parameters from command line
+- Quick testing and iteration
+- Examples: `benchmark offline --endpoint URL --model NAME --dataset FILE`
+
+**YAML Mode** (`benchmark from-config`):
+
+- All configuration from YAML file
+- Reproducible, shareable configs
+- No CLI parameter mixing (only --output auxiliary allowed)
+- Example: `benchmark from-config --config file.yaml --output results.json`
 
 ## Tips
 
 - Use `--mode both` for combined perf + accuracy runs
 - Use `--min-tokens` and `--max-tokens` to control output length
-- Locked baselines in official configs prevent accidental changes
+- Default duration: 10 seconds (use --duration to override)
+- Default max_concurrency: -1 (unlimited)
 - Share YAML configs for reproducible results across systems

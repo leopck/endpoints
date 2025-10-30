@@ -32,7 +32,7 @@ from typing import Any
 
 import pytest
 from inference_endpoint import metrics
-from inference_endpoint.config.ruleset import RuntimeSettings
+from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.dataset_manager.dataloader import (
     DataLoader,
     DeepSeekR1ChatCompletionDataLoader,

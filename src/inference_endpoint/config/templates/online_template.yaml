@@ -1,7 +1,7 @@
-# Offline Throughput Benchmark
-name: "offline-benchmark"
+# Online Latency Benchmark
+name: "online-benchmark"
 version: "1.0"
-type: "offline"
+type: "online"
 
 model_params:
   temperature: 0.7
@@ -9,11 +9,11 @@ model_params:
   max_new_tokens: 1024
 
 datasets:
-  - name: "perf-test"
+  - name: "latency-test"
     type: "performance"
-    path: "datasets/openorca.pkl"
+    path: "datasets/queries.pkl"
     format: "pkl"
-    samples: 1000
+    samples: 500
 
 settings:
   runtime:
@@ -22,11 +22,12 @@ settings:
     random_seed: 42
 
   load_pattern:
-    type: "max_throughput"
+    type: "poisson"
+    qps: 10
 
   client:
     workers: 4
-    max_concurrency: 32
+    max_concurrency: -1 # -1 = unlimited
 
 metrics:
   collect:

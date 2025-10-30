@@ -17,7 +17,8 @@ import random
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
 
-from ..config.ruleset import RuntimeSettings
+from ..config.runtime_settings import RuntimeSettings
+from ..config.schema import LoadPatternType
 
 
 class SampleOrder(ABC):
@@ -102,7 +103,13 @@ def poisson_delay_fn(
 
 
 class Scheduler:
-    """Schedulers are responsible for building queries and determining when they should be issued to the SUT."""
+    """Schedulers are responsible for building queries and determining when they should be issued to the SUT.
+
+    Subclasses auto-register via __init_subclass__ by specifying load_pattern parameter.
+    """
+
+    # Registry for scheduler implementations (populated via __init_subclass__)
+    _IMPL_MAP: dict[LoadPatternType, type["Scheduler"]] = {}
 
     def __init__(
         self,
@@ -126,14 +133,60 @@ class Scheduler:
         for s_idx in self.sample_order:
             yield s_idx, self.delay_fn()
 
+    def __init_subclass__(cls, load_pattern: LoadPatternType | None = None, **kwargs):
+        """Auto-register scheduler implementations.
 
-class MaxThroughputScheduler(Scheduler):
+        Args:
+            load_pattern: LoadPatternType to bind this scheduler to
+
+        Raises:
+            ValueError: If load_pattern already registered
+        """
+        super().__init_subclass__(**kwargs)
+
+        if load_pattern is not None:
+            if load_pattern in Scheduler._IMPL_MAP:
+                raise ValueError(
+                    f"Cannot bind {cls.__name__} to {load_pattern} - "
+                    f"Already bound to {Scheduler._IMPL_MAP[load_pattern].__name__}"
+                )
+            Scheduler._IMPL_MAP[load_pattern] = cls
+
+    @classmethod
+    def get_implementation(cls, load_pattern: LoadPatternType) -> type["Scheduler"]:
+        """Get scheduler implementation for load pattern.
+
+        Args:
+            load_pattern: LoadPatternType enum
+
+        Returns:
+            Scheduler subclass
+
+        Raises:
+            NotImplementedError: If no implementation registered
+            KeyError: If load_pattern invalid
+        """
+        if load_pattern not in cls._IMPL_MAP:
+            available_str = ", ".join(p.value for p in cls._IMPL_MAP.keys())
+            raise KeyError(
+                f"No scheduler registered for '{load_pattern.value}'. "
+                f"Available: {available_str}"
+            )
+        return cls._IMPL_MAP[load_pattern]
+
+
+class MaxThroughputScheduler(Scheduler, load_pattern=LoadPatternType.MAX_THROUGHPUT):
+    """Offline max throughput scheduler (all queries at t=0).
+
+    Auto-registers for LoadPatternType.MAX_THROUGHPUT.
+    """
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.delay_fn = uniform_delay_fn(rng=self.runtime_settings.rng_sched)
 
 
-class PoissonDistributionScheduler(Scheduler):
+class PoissonDistributionScheduler(Scheduler, load_pattern=LoadPatternType.POISSON):
     """Poisson-distributed query scheduler for online benchmarking.
 
     Simulates realistic client-server network usage by using a Poisson process
@@ -141,6 +194,8 @@ class PoissonDistributionScheduler(Scheduler):
     distribution, centered around the expected latency based on target QPS.
 
     Use this scheduler for online latency testing with sustained QPS.
+
+    Auto-registers for LoadPatternType.POISSON.
     """
 
     def __init__(self, *args, **kwargs):

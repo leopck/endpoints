@@ -26,7 +26,7 @@ from pathlib import Path
 import orjson
 from transformers import AutoTokenizer
 
-from ..config.ruleset import RuntimeSettings
+from ..config.runtime_settings import RuntimeSettings
 from ..dataset_manager.dataloader import DataLoader
 from ..metrics.recorder import EventRecorder
 from ..metrics.reporter import MetricsReporter

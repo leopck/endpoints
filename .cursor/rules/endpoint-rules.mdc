@@ -107,3 +107,12 @@ All planning and tracking must be maintained in `.cursor_artifacts/` directory.
 
 ## Enforcement
 These rules are mandatory for all development work. Violations should be caught in pre-commit hooks, code review, or CI/CD pipeline. Any rule exceptions require explicit documentation and user approval.
+
+## Other user-defined rules
+- Always double-check the validity of the output, never hallucinate and lie about things that you don't know about.
+- Avoid refactoring the whole projects, and always ask for permission before doing a major refactor.
+- Look for clues and never be lazy about validating the facts.
+- Be diligent in checking if a component has already been implemented and can be reused. Avoid re-implementing wheels for parts that have already been built in the project. Double think if the reused components fit in the logic or not. If necessary, always use a single source of truth in the code repo (e.g. VERSION) instead of randomly hardcoding it everywhere in the code
+- If the logic is incomplete in the code, add comment about it. Don't just assume the user will dig and find it out.
+- Follow the best practice of whatever language you are writing in. For example in Python, don't put a lazy import unless carefully thought about.
+- When running pytest, make sure you pipe the output either to commandline or some file, so you don't need to run it repetitively to grep a failed test.

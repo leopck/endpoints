@@ -30,7 +30,7 @@ settings:
 
   client:
     workers: 4
-    max_concurrency: 32 # Should exceed/match target_concurrency
+    max_concurrency: -1 # -1 = unlimited # Should exceed/match target_concurrency
 
 metrics:
   collect:
