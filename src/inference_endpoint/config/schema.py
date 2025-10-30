@@ -13,11 +13,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Configuration schema definitions for YAML-based benchmark configs."""
+"""
+TODO: PoC only, subject to change!
+
+Configuration schema definitions for YAML-based benchmark configs."""
+
+from __future__ import annotations
 
 from enum import Enum
+from pathlib import Path
 
+import yaml
 from pydantic import BaseModel, Field
+
+from .. import metrics
+from .ruleset_base import BenchmarkSuiteRuleset
 
 
 class LoadPatternType(str, Enum):
@@ -33,9 +43,10 @@ class LoadPatternType(str, Enum):
 class OSLDistributionType(str, Enum):
     """Output Sequence Length distribution types."""
 
-    FIXED = "fixed"
-    UNIFORM = "uniform"
-    NORMAL = "normal"
+    ORIGINAL = "original"  # Use original distribution from dataset (default)
+    FIXED = "fixed"  # Fixed length for all outputs
+    UNIFORM = "uniform"  # Uniform distribution between min and max
+    NORMAL = "normal"  # Normal/Gaussian distribution
 
 
 class DatasetType(str, Enum):
@@ -82,13 +93,20 @@ class TestType(str, Enum):
 
 
 class OSLDistribution(BaseModel):
-    """Output Sequence Length distribution configuration."""
+    """Output Sequence Length distribution configuration.
 
-    type: OSLDistributionType = OSLDistributionType.FIXED
-    mean: int | None = None
-    std: int | None = None
-    min: int = 1
-    max: int = 2048
+    Distribution types:
+    - ORIGINAL: Use the natural distribution from the dataset (default)
+    - FIXED: All outputs have the same length (uses mean value)
+    - UNIFORM: Uniformly distributed between min and max
+    - NORMAL: Normal/Gaussian distribution with mean and std
+    """
+
+    type: OSLDistributionType = OSLDistributionType.ORIGINAL
+    mean: int | None = None  # Required for FIXED and NORMAL
+    std: int | None = None  # Required for NORMAL
+    min: int = 1  # Required for UNIFORM, bounds for all types
+    max: int = 2048  # Required for UNIFORM, bounds for all types
 
 
 class ModelParams(BaseModel):
@@ -101,18 +119,34 @@ class ModelParams(BaseModel):
     osl_distribution: OSLDistribution | None = None
 
 
-class Baseline(BaseModel):
-    """Locked baseline configuration for official submissions.
+class SubmissionReference(BaseModel):
+    """Reference configuration for official benchmark submissions.
 
-    TODO: This overlaps with BenchmarkSuiteRuleset concept.
-    Should integrate with actual ruleset classes instead of string references.
-    See architecture-refactoring-plan.md for integration plan.
+    Links a submission to a specific model and ruleset (competition rules).
+    The ruleset defines constraints like min duration, sample counts, and
+    performance targets that must be met for a valid submission.
+
+    Example:
+        submission_ref:
+          model: "llama-2-70b"
+          ruleset: "mlperf-inference-v5.1"
     """
 
-    locked: bool = False
     model: str  # Model identifier (e.g., "llama-2-70b")
-    ruleset: str  # Ruleset version (e.g., "mlperf-inference-v6.0")
-    # TODO: Change to: ruleset: BenchmarkSuiteRuleset | str | None
+    ruleset: str  # Ruleset name/version (e.g., "mlperf-inference-v5.1")
+
+    def get_ruleset_instance(self) -> BenchmarkSuiteRuleset:
+        """Get the actual ruleset instance from registry.
+
+        Returns:
+            BenchmarkSuiteRuleset instance
+
+        Raises:
+            KeyError: If ruleset not found in registry
+        """
+        from .ruleset_registry import get_ruleset
+
+        return get_ruleset(self.ruleset)
 
 
 class Dataset(BaseModel):
@@ -126,17 +160,21 @@ class Dataset(BaseModel):
     eval_method: EvalMethod | None = None
 
 
-class RuntimeSettings(BaseModel):
-    """Runtime configuration settings.
+class RuntimeConfig(BaseModel):
+    """Runtime configuration from YAML (user-facing).
 
-    TODO: This duplicates config/ruleset.py RuntimeSettings.
-    See architecture-refactoring-plan.md for unification plan.
-    Frontend (YAML) vs Backend (execution) - should be unified.
+    Note: This is the YAML schema for runtime configuration.
+    The actual execution uses config.runtime_settings.RuntimeSettings
+    (a frozen dataclass with more fields derived from this + ruleset).
+
+    This class represents user inputs, while RuntimeSettings represents
+    the fully-resolved execution configuration.
     """
 
     min_duration_ms: int = 600000  # 10 minutes
     max_duration_ms: int = 1800000  # 30 minutes
-    random_seed: int = 42
+    scheduler_random_seed: int = 42  # For Poisson/distribution sampling
+    dataloader_random_seed: int = 42  # For dataset shuffling
 
 
 class LoadPattern(BaseModel):
@@ -160,37 +198,67 @@ class ClientSettings(BaseModel):
 
     Only workers and max_concurrency are required to configure the client.
     Timeout is handled by the HTTP client internally.
+
+    Note: max_concurrency = -1 means unlimited (no semaphore limit).
     """
 
     workers: int = 4
-    max_concurrency: int = 32
+    max_concurrency: int = -1  # -1 = unlimited (default for CLI and YAML)
 
 
 class Settings(BaseModel):
     """Test settings (can be overridden by CLI)."""
 
-    runtime: RuntimeSettings = Field(default_factory=RuntimeSettings)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     load_pattern: LoadPattern = Field(default_factory=LoadPattern)
     client: ClientSettings = Field(default_factory=ClientSettings)
 
 
 def _default_metrics() -> list[str]:
-    """Default metrics to collect."""
+    """
+    TODO: PoC only, subject to change!
+    Default metrics to collect."""
     return ["throughput", "latency", "ttft", "tpot"]
 
 
 class Metrics(BaseModel):
     """Metrics collection configuration.
 
-    TODO: This uses string metrics while ruleset.py uses metrics.Metric types.
-    Should unify to use metrics.Metric throughout for type safety.
+    Note: Currently uses string-based metric names for YAML simplicity.
+    Use get_metric_types() to convert to actual Metric type classes.
     """
 
     collect: list[str] = Field(default_factory=_default_metrics)
 
+    def get_metric_types(self) -> list[type[metrics.Metric]]:
+        """Convert string metric names to Metric type classes.
+
+        Returns:
+            List of Metric type classes corresponding to collect list
+
+        Raises:
+            ValueError: If metric name is not recognized
+        """
+        metric_map = {
+            "throughput": metrics.Throughput,
+            "latency": metrics.QueryLatency,
+            "ttft": metrics.TTFT,
+            "tpot": metrics.TPOT,
+        }
+
+        result = []
+        for name in self.collect:
+            if name not in metric_map:
+                raise ValueError(
+                    f"Unknown metric name: {name}. Available: {list(metric_map.keys())}"
+                )
+            result.append(metric_map[name])
+
+        return result
+
 
 class EndpointConfig(BaseModel):
-    """Endpoint connection configuration (lowest priority in config merging).
+    """Endpoint connection configuration.
 
     Contains endpoint URL and authentication settings.
     """
@@ -200,12 +268,18 @@ class EndpointConfig(BaseModel):
 
 
 class BenchmarkConfig(BaseModel):
-    """Complete benchmark configuration from YAML."""
+    """Complete benchmark configuration from YAML.
+
+    This is the root configuration model. It's immutable (frozen) to prevent
+    accidental modifications during benchmark execution.
+    """
+
+    model_config = {"frozen": True}  # Pydantic v2 frozen config
 
     name: str
     version: str = "1.0"
     type: TestType
-    baseline: Baseline | None = None
+    submission_ref: SubmissionReference | None = None  # For SUBMISSION type configs
     benchmark_mode: TestType | None = None  # For SUBMISSION: specify offline or online
     model_params: ModelParams = Field(default_factory=ModelParams)
     datasets: list[Dataset]
@@ -213,9 +287,48 @@ class BenchmarkConfig(BaseModel):
     metrics: Metrics = Field(default_factory=Metrics)
     endpoint_config: EndpointConfig = Field(default_factory=EndpointConfig)
 
-    def is_locked(self) -> bool:
-        """Check if baseline is locked."""
-        return self.baseline is not None and self.baseline.locked
+    @classmethod
+    def from_yaml_file(cls, path: Path) -> BenchmarkConfig:
+        """Load BenchmarkConfig from YAML file.
+
+        Args:
+            path: Path to YAML file
+
+        Returns:
+            BenchmarkConfig instance
+
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            ValueError: If YAML is invalid or doesn't match schema
+        """
+
+        path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        with open(path) as f:
+            data = yaml.safe_load(f)
+
+        return cls(**data)
+
+    def to_yaml_file(self, path: Path, exclude_none: bool = True) -> None:
+        """Save BenchmarkConfig to YAML file.
+
+        Args:
+            path: Path to save YAML file
+            exclude_none: Whether to exclude None values (default: True)
+        """
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(path, "w") as f:
+            yaml.dump(
+                self.model_dump(exclude_none=exclude_none, mode="json"),
+                f,
+                default_flow_style=False,
+                sort_keys=False,
+            )
 
     def get_benchmark_mode(self) -> TestType | None:
         """Get the benchmark execution mode.
@@ -230,3 +343,149 @@ class BenchmarkConfig(BaseModel):
             return self.benchmark_mode  # Must be set for submissions
         else:
             return None
+
+    def get_single_dataset(self) -> Dataset | None:
+        """Get single dataset for benchmark execution.
+
+        CURRENT LIMITATION: Only single dataset execution is supported.
+        This method selects one dataset from the config:
+        - Prefers first performance dataset
+        - Falls back to first dataset of any type
+
+        Returns:
+            Single dataset to use, or None if no datasets configured
+
+        TODO: Multi-dataset support
+        Future enhancement should:
+        1. Support parallel dataset loading and indexing
+        2. Support dataset mixing strategies (e.g. random, sequential, weighted)
+        3. Support dataset-specific metrics (in the post processing eval)
+        """
+        if not self.datasets:
+            return None
+
+        # TODO: When multi-dataset is supported, this logic should move to DatasetSelector
+        # For now, just pick the first performance dataset
+        perf_datasets = [d for d in self.datasets if d.type == DatasetType.PERFORMANCE]
+        if perf_datasets:
+            return perf_datasets[0]
+
+        return self.datasets[0]
+
+    def validate_required_fields(self) -> None:
+        """Validate that required fields are populated.
+
+        Raises:
+            ValueError: If required fields are missing
+        """
+        if not self.endpoint_config.endpoint:
+            raise ValueError(
+                "Endpoint required: specify --endpoint URL or set in YAML config"
+            )
+
+        # Model is required for production benchmarks
+        # For submissions, baseline.model is checked
+        # For others, it could be in various places (TODO: unify model handling)
+        # For now, we'll warn but not enforce (gradual migration)
+
+    def validate_load_pattern(self, benchmark_mode: TestType) -> None:
+        """Validate load pattern is appropriate for benchmark mode.
+
+        Args:
+            benchmark_mode: The benchmark execution mode
+
+        Raises:
+            ValueError: If load pattern doesn't match benchmark mode
+        """
+        load_pattern_type = self.settings.load_pattern.type
+
+        if benchmark_mode == TestType.OFFLINE:
+            if load_pattern_type != LoadPatternType.MAX_THROUGHPUT:
+                raise ValueError(
+                    f"Offline benchmarks must use 'max_throughput' load pattern, got '{load_pattern_type}'"
+                )
+
+    def validate_client_settings(self) -> None:
+        """Validate client settings are reasonable.
+
+        Raises:
+            ValueError: If settings are invalid
+        """
+        if self.settings.client.workers < 1:
+            raise ValueError(
+                f"workers must be >= 1, got {self.settings.client.workers}"
+            )
+
+        # max_concurrency: -1 means unlimited, otherwise must be >= 1
+        if (
+            self.settings.client.max_concurrency < -1
+            or self.settings.client.max_concurrency == 0
+        ):
+            raise ValueError(
+                f"max_concurrency must be -1 (unlimited) or >= 1, got {self.settings.client.max_concurrency}"
+            )
+
+        # Ensure max_concurrency can handle target_concurrency if set
+        target_concurrency = self.settings.load_pattern.target_concurrency
+        max_concurrency = self.settings.client.max_concurrency
+
+        if (
+            target_concurrency is not None and max_concurrency > 0
+        ):  # Skip check if unlimited (-1)
+            if max_concurrency < target_concurrency:
+                raise ValueError(
+                    f"max_concurrency ({max_concurrency}) must be >= target_concurrency ({target_concurrency})"
+                )
+
+    def validate_runtime_settings(self) -> None:
+        """Validate runtime settings are reasonable.
+
+        Raises:
+            ValueError: If settings are invalid
+        """
+        if (
+            self.settings.runtime.max_duration_ms
+            < self.settings.runtime.min_duration_ms
+        ):
+            raise ValueError(
+                f"max_duration_ms ({self.settings.runtime.max_duration_ms}) must be >= "
+                f"min_duration_ms ({self.settings.runtime.min_duration_ms})"
+            )
+
+        if self.settings.runtime.min_duration_ms < 0:
+            raise ValueError(
+                f"min_duration_ms must be >= 0, got {self.settings.runtime.min_duration_ms}"
+            )
+
+    def validate_datasets(self) -> None:
+        """Validate dataset configuration.
+
+        Raises:
+            ValueError: If dataset configuration is invalid
+        """
+        if not self.datasets:
+            # Empty datasets is OK for CLI-based benchmarks
+            return
+
+        # Check for duplicate dataset names
+        names = [d.name for d in self.datasets]
+        duplicates = [name for name in set(names) if names.count(name) > 1]
+        if duplicates:
+            raise ValueError(f"Duplicate dataset names: {duplicates}")
+
+    def validate_all(self, benchmark_mode: TestType | None = None) -> None:
+        """Run all validation checks.
+
+        Args:
+            benchmark_mode: Optional benchmark mode for load pattern validation
+
+        Raises:
+            ValueError: If any validation fails
+        """
+        self.validate_required_fields()
+        self.validate_client_settings()
+        self.validate_runtime_settings()
+        self.validate_datasets()
+
+        if benchmark_mode:
+            self.validate_load_pattern(benchmark_mode)

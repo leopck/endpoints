@@ -18,7 +18,7 @@ from collections import defaultdict
 from unittest.mock import patch
 
 import inference_endpoint.metrics as metrics
-from inference_endpoint.config.ruleset import RuntimeSettings
+from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.core.types import QueryResult, StreamChunk
 from inference_endpoint.load_generator.events import SampleEvent
 from inference_endpoint.load_generator.load_generator import (

@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import inference_endpoint.metrics as metrics
 import pytest
-from inference_endpoint.config.ruleset import RuntimeSettings
+from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.load_generator.events import SampleEvent
 from inference_endpoint.load_generator.sample import Sample, SampleEventHandler
 from inference_endpoint.load_generator.scheduler import (

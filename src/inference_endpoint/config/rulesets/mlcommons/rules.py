@@ -23,9 +23,10 @@ import random
 from dataclasses import dataclass, field
 from enum import Enum
 
-from ... import metrics
-from ...config.ruleset import BenchmarkSuiteRuleset, RuntimeSettings
-from ...config.user_config import UserConfig
+from .... import metrics
+from ...ruleset_base import BenchmarkSuiteRuleset
+from ...runtime_settings import RuntimeSettings
+from ...user_config import UserConfig
 from . import models
 
 
@@ -104,11 +105,24 @@ class OptimizationPriority(Enum):
 
 @dataclass(frozen=True)
 class _RuntimeSettings(RuntimeSettings):
-    """Internal class for runtime settings derived from a UserConfig and Ruleset. This should *never* be instantiated by the user, and only by `UserConfig.for_ruleset`."""
+    """MLCommons-specific runtime settings extending base RuntimeSettings.
+
+    This class adds MLCommons-specific fields (model, optimization priority, rules)
+    to the base RuntimeSettings. It should never be instantiated by users directly,
+    only by RoundRuleset.apply_user_config().
+
+    Extends RuntimeSettings via inheritance to include all base fields plus
+    MLCommons-specific configuration.
+    """
 
     model: models._Model
+    """The model being benchmarked (e.g., Llama3_1_8b)"""
+
     optimization_priority: OptimizationPriority
+    """Optimization priority (THROUGHPUT or LOW_LATENCY_INTERACTIVE)"""
+
     rules: PerModelRuleset
+    """The specific per-model rules being applied"""
 
 
 @dataclass(frozen=True)

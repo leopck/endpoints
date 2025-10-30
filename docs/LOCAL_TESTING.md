@@ -68,21 +68,20 @@ Waiting for 5 responses...
 #### Offline Benchmark (Max Throughput)
 
 ```bash
-# Quick test - model is optional (defaults to gpt-3.5-turbo with warning)
+# Quick test (model is required)
 inference-endpoint -v benchmark offline \
   --endpoint http://localhost:8765 \
-  --dataset tests/datasets/dummy_1k.pkl \
-  --duration 5 \
-  --workers 2
+  --model llama-2-70b \
+  --dataset tests/datasets/dummy_1k.pkl
 
-# Production test with explicit model
+# Production test with custom params
 inference-endpoint -v benchmark offline \
   --endpoint http://localhost:8765 \
   --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
+  --qps 1000 \
   --duration 30 \
   --workers 4 \
-  --concurrency 50 \
   --output benchmark_results.json
 ```
 
@@ -91,14 +90,15 @@ inference-endpoint -v benchmark offline \
 ```
 Loading: dummy_1k.pkl
 Loaded 1000 samples
-Mode: perf, QPS: 10.0, Responses: False
-Scheduler: MaxThroughputScheduler (offline burst mode, all queries at t=0)
+Mode: TestMode.PERF, QPS: 1000.0, Responses: False
+Min Duration: 10.0s, Expected samples: 11000
+Scheduler: MaxThroughputScheduler (pattern: max_throughput)
 Connecting: http://localhost:8765
 Running...
-Completed in 0.4s
-Results: 1000/1000 successful
-QPS: 2257.9
-Saved: benchmark_results.json
+Completed in 2.7s
+Results: 11000/11000 successful
+QPS: 4050.3
+Cleaning up...
 ```
 
 #### Online Benchmark (Poisson Distribution)
@@ -107,11 +107,9 @@ Saved: benchmark_results.json
 # Test sustained QPS with latency focus
 inference-endpoint -v benchmark online \
   --endpoint http://localhost:8765 \
-  --model gpt-3.5-turbo \
+  --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 100 \
-  --duration 10 \
-  --workers 2
+  --qps 100
 ```
 
 **Expected Output:**
@@ -119,13 +117,15 @@ inference-endpoint -v benchmark online \
 ```
 Loading: dummy_1k.pkl
 Loaded 1000 samples
-Mode: perf, QPS: 100.0, Responses: False
-Scheduler: PoissonDistributionScheduler (online mode, 100.0 QPS target)
+Mode: TestMode.PERF, QPS: 100.0, Responses: False
+Min Duration: 10.0s, Expected samples: 1100
+Scheduler: PoissonDistributionScheduler (pattern: poisson)
 Connecting: http://localhost:8765
 Running...
 Completed in 10.7s
-Results: 1000/1000 successful
-QPS: 93.8
+Results: 1100/1100 successful
+QPS: 102.8
+Cleaning up...
 ```
 
 ### 5. Test Other Commands
@@ -249,10 +249,9 @@ inference-endpoint probe --endpoint http://localhost:8000 --requests 10
 # 4. Run benchmark
 inference-endpoint -v benchmark offline \
   --endpoint http://localhost:8000 \
+  --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
-  --duration 10 \
   --workers 4 \
-  --concurrency 50 \
   --output benchmark_results.json
 
 # 5. Check results
@@ -268,25 +267,29 @@ pkill -f echo_server
 # Offline (max throughput)
 inference-endpoint benchmark offline \
   --endpoint http://localhost:8765 \
+  --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
-  --workers 4
+  --qps 1000
 
 # Online (Poisson distribution)
 inference-endpoint benchmark online \
   --endpoint http://localhost:8765 \
+  --model llama-2-70b \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 500 \
-  --workers 4
+  --qps 500
 ```
 
 ## Tips
 
-- Use `-v` for INFO logging, `-vv` for DEBUG
+- Use `-v` for INFO logging (default), `-vv` for DEBUG
 - Echo server mirrors back the prompt as the response
 - Perfect for testing CLI without real LLM endpoint
 - Fast responses (no actual inference)
 - Press `Ctrl+C` to gracefully interrupt benchmarks
 - Probe shows progress indicators for large request counts
 - Default test dataset: `tests/datasets/dummy_1k.pkl` (1000 samples, ~133 KB)
-- Model name optional for testing (defaults to gpt-3.5-turbo with warning)
+- Model name is **required** for all benchmark and probe commands
+- Default duration: 10 seconds (quick testing)
+- Default max_concurrency: -1 (unlimited)
 - Dataset format auto-inferred from file extension (pkl, hf directory)
+- CLI and YAML modes are separate (no mixing allowed)

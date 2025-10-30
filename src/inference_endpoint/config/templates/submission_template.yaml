@@ -4,9 +4,8 @@ version: "1.0"
 type: "submission"
 benchmark_mode: "offline" # Required for submission: "offline" or "online"
 
-# Locked baseline
+# Baseline configuration (locking handled by ruleset)
 baseline:
-  locked: true
   model: "llama-2-70b"
   ruleset: "mlperf-inference-v6.0"
 
@@ -56,7 +55,7 @@ settings:
 
   client:
     workers: 4
-    max_concurrency: 32
+    max_concurrency: -1 # -1 = unlimited
 
 metrics:
   collect:

@@ -18,7 +18,7 @@ import random
 
 import pytest
 from inference_endpoint import metrics
-from inference_endpoint.config.ruleset import RuntimeSettings
+from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataloader import (
     DeepSeekR1ChatCompletionDataLoader,

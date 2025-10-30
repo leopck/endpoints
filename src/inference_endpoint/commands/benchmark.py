@@ -13,22 +13,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark command implementation."""
+"""
+TODO: PoC only, subject to change!
+
+Benchmark command implementation."""
 
 import argparse
 import json
 import logging
-import random
 import shutil
 import signal
 import tempfile
 import time
 from pathlib import Path
 
-from inference_endpoint import metrics
-from inference_endpoint.config.ruleset import RuntimeSettings
-from inference_endpoint.config.schema import TestMode, TestType
-from inference_endpoint.config.yaml_config import ConfigError, ConfigLoader
+from inference_endpoint.config.runtime_settings import RuntimeSettings
+from inference_endpoint.config.schema import (
+    BenchmarkConfig,
+    ClientSettings,
+    Dataset,
+    DatasetType,
+    EndpointConfig,
+    LoadPattern,
+    LoadPatternType,
+    Metrics,
+    ModelParams,
+    OSLDistribution,
+    RuntimeConfig,
+    Settings,
+    TestMode,
+    TestType,
+)
+from inference_endpoint.config.yaml_loader import ConfigError, ConfigLoader
 from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.factory import DataLoaderFactory
 from inference_endpoint.endpoint_client.configs import (
@@ -45,12 +61,11 @@ from inference_endpoint.exceptions import (
 )
 from inference_endpoint.load_generator import (
     BenchmarkSession,
-    MaxThroughputScheduler,
-    PoissonDistributionScheduler,
     SampleEvent,
     SampleEventHandler,
     WithoutReplacementSampleOrder,
 )
+from inference_endpoint.load_generator.scheduler import Scheduler
 
 logger = logging.getLogger(__name__)
 
@@ -79,88 +94,62 @@ async def run_benchmark_command(args: argparse.Namespace) -> None:
     # Determine benchmark mode
     benchmark_mode_str = getattr(
         args, "benchmark_mode", None
-    )  # "offline", "online", or None (YAML)
-    benchmark_mode = TestType(benchmark_mode_str) if benchmark_mode_str else None
-    config_path = getattr(args, "config", None)
+    )  # "offline", "online", "from-config", or None
 
-    # Extract CLI overrides once
-    cli_overrides = _extract_cli_overrides(args)
+    # Three subcommands:
+    # - benchmark offline: CLI mode
+    # - benchmark online: CLI mode
+    # - benchmark from-config: YAML mode
+    # Argparse enforces all arg validity per mode
 
-    # Load or create config
-    if config_path:
-        # YAML-based benchmark
+    if benchmark_mode_str == "from-config":
+        # ===== YAML MODE - Load from config file =====
+        config_path = args.config  # Required by argparse
         try:
-            yaml_config = ConfigLoader.load_yaml(Path(config_path))
-            effective_config = ConfigLoader.merge_with_cli_args(
-                yaml_config, cli_overrides
-            )
-            # Determine test mode
+            effective_config = ConfigLoader.load_yaml(Path(config_path))
+
+            # Only auxiliary params allowed (output)
             mode_str = getattr(args, "mode", None)
-            if mode_str:
-                test_mode = TestMode(mode_str)
-            else:
-                # Default: BOTH for submission, PERF otherwise
-                test_mode = (
+            test_mode = (
+                TestMode(mode_str)
+                if mode_str
+                else (
                     TestMode.BOTH
-                    if yaml_config.type == TestType.SUBMISSION
+                    if effective_config.type == TestType.SUBMISSION
                     else TestMode.PERF
                 )
-            # Use yaml type for validation if no explicit benchmark_mode
-            if not benchmark_mode:
-                # Get benchmark mode from config
-                benchmark_mode = yaml_config.get_benchmark_mode()
+            )
 
-                # For SUBMISSION without benchmark_mode set, error
-                if yaml_config.type == TestType.SUBMISSION and not benchmark_mode:
-                    raise InputValidationError(
-                        "SUBMISSION configs must specify 'benchmark_mode' (offline or online) "
-                        "to indicate whether to run offline or online performance benchmarks"
-                    )
+            # Get benchmark mode from config
+            benchmark_mode = effective_config.get_benchmark_mode()
+            if not benchmark_mode:
+                raise InputValidationError(
+                    "SUBMISSION configs must specify 'benchmark_mode' (offline or online)"
+                )
         except ConfigError as e:
             logger.error(f"Config error: {e}")
             raise InputValidationError(f"Config error: {e}") from e
+
+    elif benchmark_mode_str in ("offline", "online"):
+        # ===== CLI MODE - Build config from CLI params =====
+        benchmark_mode = TestType(benchmark_mode_str)  # TestType values are lowercase
+        effective_config = _build_config_from_cli(args, benchmark_mode_str)
+        test_mode = (
+            TestMode(args.mode) if getattr(args, "mode", None) else TestMode.PERF
+        )
+
     else:
-        # Quick benchmark (offline/online) - no YAML, no locking concerns
-        if not benchmark_mode:
-            logger.error("Specify benchmark mode: offline, online, or use --config")
-            raise InputValidationError(
-                "Benchmark mode required: offline, online, or --config PATH"
-            )
-
-        # Create default config and apply CLI overrides using helper
-        effective_config = ConfigLoader.create_default_config(benchmark_mode)
-        ConfigLoader.apply_cli_overrides_to_dict(effective_config, cli_overrides)
-
-        # Determine test mode
-        mode_str = getattr(args, "mode", None)
-        test_mode = TestMode(mode_str) if mode_str else TestMode.PERF
-
-    # Validate required fields FIRST (fail fast)
-    if not effective_config.get("endpoint"):
-        logger.error("Endpoint required: --endpoint URL or specify in YAML config")
+        # Shouldn't happen with current argparse structure
         raise InputValidationError(
-            "Endpoint required: --endpoint URL or specify in YAML config"
+            "Unknown benchmark mode. Use: offline, online, or from-config"
         )
 
-    # Model is required for actual endpoints (not strictly required for echo server testing)
-    model = effective_config.get("model") or (
-        effective_config.get("baseline", {}).get("model")
-        if effective_config.get("baseline")
-        else None
-    )
-    if not model:
-        logger.warning(
-            "No model specified. Using default 'gpt-3.5-turbo'. "
-            "Specify with --model or in YAML config for production use."
-        )
-        effective_config["model"] = "gpt-3.5-turbo"
-
-    # Validate configuration consistency
+    # Validate configuration (comprehensive validation with warnings)
     try:
         ConfigLoader.validate_config(effective_config, benchmark_mode)
     except ConfigError as e:
-        logger.error(f"Config validation error: {e}")
-        raise InputValidationError(f"Config validation failed: {e}") from e
+        logger.exception("Config validation error")
+        raise InputValidationError(str(e)) from e
 
     # Determine if we should collect responses
     collect_responses = test_mode in [TestMode.ACC, TestMode.BOTH]
@@ -169,35 +158,154 @@ async def run_benchmark_command(args: argparse.Namespace) -> None:
     _run_benchmark(args, effective_config, collect_responses, test_mode, benchmark_mode)
 
 
-def _extract_cli_overrides(args: argparse.Namespace) -> dict:
-    """Extract CLI arguments that can override YAML config.
+def _build_config_from_cli(
+    args: argparse.Namespace, benchmark_mode: str
+) -> BenchmarkConfig:
+    """Build BenchmarkConfig from CLI arguments (CLI mode only).
 
-    Returns only non-None values from CLI arguments.
+    Args:
+        args: Parsed CLI arguments
+        benchmark_mode: "online" or "offline"
+
+    Returns:
+        BenchmarkConfig built from CLI params
+
+    Raises:
+        InputValidationError: If required params missing
     """
-    # Define all possible override fields
-    override_fields = [
-        "endpoint",
-        "api_key",
-        "model",
-        "qps",
-        "concurrency",
-        "workers",
-        "duration",
-        "min_tokens",
-        "max_tokens",
-    ]
+    # Determine load pattern (CLI override or mode default)
+    load_pattern_arg = getattr(args, "load_pattern", None)
+    if load_pattern_arg:
+        load_pattern_type = LoadPatternType(load_pattern_arg)
+    else:
+        load_pattern_type = (
+            LoadPatternType.MAX_THROUGHPUT
+            if benchmark_mode == "offline"
+            else LoadPatternType.POISSON
+        )
 
-    # Extract non-None values - no mapping needed, use field names directly
-    return {
-        field: value
-        for field in override_fields
-        if (value := getattr(args, field, None)) is not None
-    }
+    # Build BenchmarkConfig from CLI params
+    return BenchmarkConfig(
+        name=f"cli_{benchmark_mode}",
+        version="1.0",
+        type=TestType.OFFLINE if benchmark_mode == "offline" else TestType.ONLINE,
+        datasets=[
+            Dataset(
+                name=args.dataset.stem,
+                type=DatasetType.PERFORMANCE,
+                path=str(args.dataset),
+                format="pkl",  # Will be inferred by DataLoaderFactory
+            )
+        ],
+        settings=Settings(
+            load_pattern=LoadPattern(
+                type=load_pattern_type, qps=args.qps if args.qps else 10.0
+            ),
+            runtime=RuntimeConfig(
+                min_duration_ms=args.duration * 1000
+                if args.duration
+                else 10000,  # Default: 10s for quick testing (TODO: Make configurable)
+                max_duration_ms=1800000,
+                scheduler_random_seed=42,
+                dataloader_random_seed=42,
+            ),
+            client=ClientSettings(
+                workers=args.workers if args.workers else 4,
+                max_concurrency=args.concurrency if args.concurrency else -1,
+            ),
+        ),
+        model_params=ModelParams(
+            temperature=0.7,
+            max_new_tokens=args.max_tokens if args.max_tokens else 1024,
+            osl_distribution=OSLDistribution(
+                min=args.min_tokens if args.min_tokens else 1,
+                max=args.max_tokens if args.max_tokens else 2048,
+            )
+            if (args.min_tokens or args.max_tokens)
+            else None,
+        ),
+        endpoint_config=EndpointConfig(endpoint=args.endpoint, api_key=args.api_key),
+        metrics=Metrics(),
+        baseline=None,  # CLI mode doesn't use baseline
+    )
+
+
+def _get_dataset_path(args: argparse.Namespace, config: BenchmarkConfig) -> Path:
+    """Get dataset path from CLI args or config.
+
+    CURRENT LIMITATION: Only supports single dataset execution.
+    Priority: CLI args > config datasets[0]
+
+    Args:
+        args: Command arguments
+        config: BenchmarkConfig
+
+    Returns:
+        Path to dataset file
+
+    Raises:
+        InputValidationError: If no dataset specified or file doesn't exist
+
+    TODO: Multi-dataset support
+    When implemented, this should:
+    1. Return list[Path] for multiple datasets
+    2. Validate all dataset paths exist
+    3. Support dataset interleaving strategies
+    """
+    # Priority: CLI args > config
+    if args.dataset:
+        dataset_path = Path(args.dataset)
+    else:
+        # TODO: Multi-dataset - currently just picks single dataset
+        single_dataset = config.get_single_dataset()
+        if single_dataset:
+            dataset_path = Path(single_dataset.path)
+        else:
+            logger.error("Dataset required: --dataset PATH or specify in config")
+            raise InputValidationError(
+                "Dataset required: --dataset PATH or specify in config"
+            )
+
+    # Validate file exists
+    if not dataset_path.exists():
+        logger.error(f"Dataset not found: {dataset_path}")
+        raise InputValidationError(f"Dataset not found: {dataset_path}")
+
+    return dataset_path
+
+
+def _get_dataset_format(config: BenchmarkConfig, dataset_path: Path) -> str:
+    """Get or infer dataset format.
+
+    CURRENT LIMITATION: Only supports single dataset.
+
+    Args:
+        config: BenchmarkConfig
+        dataset_path: Path to dataset file
+
+    Returns:
+        Dataset format string (e.g., "pkl", "hf")
+
+    TODO: Multi-dataset support
+    When implemented, this should:
+    1. Return dict[Path, str] mapping dataset paths to formats
+    2. Validate format compatibility across datasets
+    """
+    # Try to get format from config
+    # TODO: Multi-dataset - currently just uses single dataset format
+    single_dataset = config.get_single_dataset()
+    if single_dataset and single_dataset.format:
+        return single_dataset.format
+
+    # Infer from file extension
+    format_str = DataLoaderFactory.infer_format(dataset_path)
+    logger.info(f"Inferred dataset format: {format_str}")
+    return format_str
 
 
 def _run_benchmark(
     args: argparse.Namespace,
-    config: dict,
+    config: BenchmarkConfig,
     collect_responses: bool,
     test_mode: TestMode,
     benchmark_mode: TestType | None,
@@ -210,55 +318,30 @@ def _run_benchmark(
 
     Args:
         args: Command arguments
-        config: Merged configuration
+        config: Validated BenchmarkConfig (immutable Pydantic model)
         collect_responses: Whether to collect responses (for accuracy mode)
         test_mode: TestMode enum (PERF, ACC, or BOTH)
         benchmark_mode: TestType enum (OFFLINE or ONLINE)
     """
 
     # Get dataset - from CLI or from config
-    if hasattr(args, "dataset") and args.dataset:
-        dataset_path = args.dataset
-    elif "datasets" in config and config["datasets"]:
-        # Use first performance dataset from config
-        perf_datasets = [
-            d for d in config["datasets"] if d.get("type") == "performance"
-        ]
-        if perf_datasets:
-            dataset_path = Path(perf_datasets[0]["path"])
-        else:
-            dataset_path = Path(config["datasets"][0]["path"])
-    else:
-        logger.error("Dataset required: --dataset PATH or specify in config")
-        raise InputValidationError(
-            "Dataset required: --dataset PATH or specify in config"
-        )
-
-    if not dataset_path.exists():
-        logger.error(f"Dataset not found: {dataset_path}")
-        raise InputValidationError(f"Dataset not found: {dataset_path}")
+    # TODO: Dataset Logic is not yet fully implemented
+    dataset_path = _get_dataset_path(args, config)
 
     # Load dataset using factory
-    logger.info(f"Loading: {dataset_path.name}")
+    dataset_format = _get_dataset_format(config, dataset_path)
+    logger.info(f"Loading: {dataset_path.name} (format: {dataset_format})")
     try:
-        # Get dataset format from config or infer from file extension
-        if "datasets" in config and config["datasets"]:
-            # Get format from first dataset config
-            dataset_format = config["datasets"][0].get("format", None)
-        else:
-            dataset_format = None
-
-        # Infer format if not specified
-        if not dataset_format:
-            dataset_format = DataLoaderFactory.infer_format(dataset_path)
-            logger.info(f"Inferred dataset format: {dataset_format}")
-
         # Create loader using factory
         def parser(x):
+            # config is now BenchmarkConfig, not dict
+            model_name = (
+                config.submission_ref.model if config.submission_ref else "unset"
+            )
             return {
                 "prompt": x.text_input,
                 "output": x.ref_output,
-                "model": config.get("model", "gpt-3.5-turbo"),
+                "model": model_name,
             }
 
         dataloader = DataLoaderFactory.create_loader(
@@ -273,93 +356,28 @@ def _run_benchmark(
         logger.error("Dataset load failed")
         raise SetupError(f"Failed to load dataset: {e}") from e
 
-    # Setup runtime settings
-    runtime_config = config.get("runtime", {})
-    load_pattern_config = config.get("load_pattern", {})
-    qps = load_pattern_config["qps"]  # No fallback - schema ensures this exists
+    # Setup runtime settings using factory method
+    rt_settings = RuntimeSettings.from_config(config, dataloader.num_samples())
+    qps = config.settings.load_pattern.qps
+    load_pattern_type = config.settings.load_pattern.type
+
+    # Calculate and display expected sample count
+    total_samples = rt_settings.total_samples_to_issue()
+    duration_s = rt_settings.min_duration_ms / 1000
 
     logger.info(f"Mode: {test_mode}, QPS: {qps}, Responses: {collect_responses}")
+    logger.info(f"Min Duration: {duration_s:.1f}s, Expected samples: {total_samples}")
 
-    rt_settings = RuntimeSettings(
-        metrics.Throughput(qps),
-        [metrics.Throughput(qps)],
-        min_duration_ms=runtime_config.get("min_duration_ms", 600000),
-        max_duration_ms=runtime_config.get("max_duration_ms", 1800000),
-        n_samples_from_dataset=dataloader.num_samples(),
-        n_samples_to_issue=dataloader.num_samples(),
-        min_sample_count=1,
-        rng_sched=random.Random(runtime_config.get("random_seed", 42)),
-        rng_sample_index=random.Random(runtime_config.get("random_seed", 42)),
-    )
-
-    # Create scheduler based on load pattern type
-    # Validate that pattern matches benchmark mode
-    load_pattern_type = load_pattern_config.get("type", "max_throughput")
-
-    if load_pattern_type == "max_throughput":
-        # Offline mode: max throughput (all queries at t=0)
-        # Validate: should only be used with offline mode
-        if benchmark_mode == TestType.ONLINE:
-            logger.warning(
-                "Using max_throughput pattern in online mode - this is offline behavior"
-            )
-
-        scheduler = MaxThroughputScheduler(
-            rt_settings,
-            WithoutReplacementSampleOrder,
-        )
+    # Create scheduler using __init_subclass__ registry
+    try:
+        scheduler_class = Scheduler.get_implementation(load_pattern_type)
+        scheduler = scheduler_class(rt_settings, WithoutReplacementSampleOrder)
         logger.info(
-            "Scheduler: MaxThroughputScheduler (offline burst mode, all queries at t=0)"
+            f"Scheduler: {scheduler_class.__name__} (pattern: {load_pattern_type.value})"
         )
-
-    elif load_pattern_type == "poisson":
-        # Online mode: Poisson distribution - fixed QPS
-        # Validate: should only be used with online mode
-        if benchmark_mode == TestType.OFFLINE:
-            raise InputValidationError(
-                "Cannot use 'poisson' pattern with offline mode. "
-                "Offline must use 'max_throughput' pattern."
-            )
-
-        scheduler = PoissonDistributionScheduler(
-            rt_settings,
-            WithoutReplacementSampleOrder,
-        )
-        logger.info(
-            f"Scheduler: PoissonDistributionScheduler (online mode, {qps} QPS target)"
-        )
-
-    elif load_pattern_type == "concurrency":
-        # Online mode: Fixed concurrency - not yet implemented
-        # Validate: should only be used with online mode
-        if benchmark_mode == TestType.OFFLINE:
-            raise InputValidationError(
-                "Cannot use 'concurrency' pattern with offline mode. "
-                "Offline must use 'max_throughput' pattern."
-            )
-
-        # TODO: Implement ConcurrencyScheduler
-        # In this mode:
-        # - Maintain exactly N concurrent requests
-        # - Issue new request when one completes
-        # - QPS is not directly controlled (dominated by concurrency and latency)
-        # - Useful for measuring latency at specific concurrency levels
-        logger.error("Load pattern 'concurrency' not yet implemented")
-        logger.error(
-            "This mode would maintain fixed concurrent requests (N in-flight at all times)"
-        )
-        logger.error("TODO: Implement ConcurrencyScheduler")
-        raise NotImplementedError(
-            "Concurrency-based scheduler not yet implemented. "
-            "Use 'poisson' for fixed-QPS or 'max_throughput' for offline."
-        )
-
-    else:
-        # Unknown or unimplemented pattern
-        logger.error(f"Unknown/unimplemented load pattern: '{load_pattern_type}'")
-        logger.error("Available: max_throughput (offline), poisson (online fixed-QPS)")
-        logger.error("Not yet implemented: concurrency (online fixed-concurrency)")
-        raise InputValidationError(f"Load pattern '{load_pattern_type}' not supported")
+    except KeyError as e:
+        logger.exception("Scheduler not available")
+        raise SetupError(str(e)) from e
 
     # Setup response collector
     response_collector = ResponseCollector(collect_responses=collect_responses)
@@ -368,17 +386,19 @@ def _run_benchmark(
     )
 
     # Create endpoint client
-    endpoint = config["endpoint"]
+    endpoint = config.endpoint_config.endpoint
+    num_workers = config.settings.client.workers
+    max_concurrency = config.settings.client.max_concurrency
+
     logger.info(f"Connecting: {endpoint}")
 
-    client_config = config.get("client", {})
     tmp_dir = tempfile.mkdtemp(prefix="inference_endpoint_")
 
     try:
         http_config = HTTPClientConfig(
             endpoint_url=f"{endpoint}/v1/chat/completions",
-            num_workers=client_config.get("workers", 4),
-            max_concurrency=client_config.get("max_concurrency", 50),
+            num_workers=num_workers,
+            max_concurrency=max_concurrency,
         )
         aiohttp_config = AioHttpConfig()
         zmq_config = ZMQConfig(

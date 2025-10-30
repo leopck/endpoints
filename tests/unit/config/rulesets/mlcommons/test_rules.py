@@ -14,9 +14,12 @@
 # limitations under the License.
 
 from inference_endpoint import metrics
+from inference_endpoint.config.rulesets.mlcommons import models
+from inference_endpoint.config.rulesets.mlcommons.rules import (
+    CURRENT,
+    OptimizationPriority,
+)
 from inference_endpoint.config.user_config import UserConfig
-from inference_endpoint.rulesets.mlcommons import models
-from inference_endpoint.rulesets.mlcommons.rules import CURRENT, OptimizationPriority
 
 
 def test_apply_user_config():

@@ -14,6 +14,8 @@
 # limitations under the License.
 
 """
+TODO: PoC only, subject to change!
+
 Command Line Interface for the MLPerf Inference Endpoint Benchmarking System.
 
 This module provides CLI for performance benchmarking and accuracy evaluation.
@@ -41,6 +43,7 @@ from inference_endpoint.exceptions import (
     InputValidationError,
     SetupError,
 )
+from inference_endpoint.load_generator.scheduler import Scheduler
 from inference_endpoint.utils.logging import setup_logging
 
 logger = logging.getLogger(__name__)
@@ -71,34 +74,40 @@ def create_parser() -> argparse.ArgumentParser:
     # benchmark offline
     offline_parser = benchmark_subparsers.add_parser(
         "offline",
-        help="Max throughput test (all queries at t=0)",
-        description="Offline mode: Issues all queries at once (max throughput burst). "
-        "QPS is used only to calculate total queries based on duration.",
+        help="Offline benchmark (max throughput)",
+        description="Offline mode: Issues all queries at t=0 for max throughput. "
+        "QPS is used to calculate total queries (QPS × duration).",
     )
-    _add_benchmark_args(offline_parser)
+    _add_shared_benchmark_args(offline_parser)
+    _add_auxiliary_args(offline_parser)
 
     # benchmark online
     online_parser = benchmark_subparsers.add_parser(
         "online",
-        help="Online latency test (Poisson distribution)",
-        description="Online mode: Issues queries following Poisson distribution at target QPS. "
-        "For fixed-concurrency mode, use YAML config with load_pattern.type='concurrency' (not yet implemented).",
+        help="Online benchmark (sustained QPS)",
+        description="Online mode: Issues queries at target QPS using Poisson distribution.",
     )
-    _add_benchmark_args(online_parser)
-    online_parser.add_argument(
-        "--qps",
-        type=float,
-        help="Target QPS (queries per second) for Poisson distribution",
-    )
+    _add_shared_benchmark_args(online_parser)
+    _add_online_specific_args(online_parser)
+    _add_auxiliary_args(online_parser)
 
-    # benchmark (generic with config)
-    _add_benchmark_args(benchmark_parser)
-    benchmark_parser.add_argument(
-        "--mode", choices=["perf", "acc", "both"], help="Test mode"
+    # benchmark from-config (YAML mode)
+    # Clean solution: Third subcommand for YAML mode
+    # Now offline/online don't see --config at all (can't be accidentally set)
+    from_config_parser = benchmark_subparsers.add_parser(
+        "from-config",
+        help="Run benchmark from YAML config",
+        description="YAML mode: Load all configuration from YAML file.",
     )
+    from_config_parser.add_argument(
+        "--config", "-c", type=Path, required=True, help="YAML config file"
+    )
+    _add_auxiliary_args(from_config_parser)
 
     # ===== Eval command =====
-    eval_parser = subparsers.add_parser("eval", help="Run accuracy evaluation")
+    eval_parser = subparsers.add_parser(
+        "eval", help="Run accuracy evaluation (CLI-only)"
+    )
     eval_parser.add_argument(
         "--dataset", type=str, help="Dataset name(s) or path (comma-separated)"
     )
@@ -106,7 +115,7 @@ def create_parser() -> argparse.ArgumentParser:
         "--endpoint", "-e", type=str, required=True, help="Endpoint URL"
     )
     eval_parser.add_argument("--api-key", type=str, help="API key")
-    eval_parser.add_argument("--config", "-c", type=Path, help="Custom eval config")
+    # Note: --config removed - eval is CLI-only for simplicity
     eval_parser.add_argument("--output", "-o", type=Path, help="Output file")
     eval_parser.add_argument("--judge", type=str, help="Judge model (future)")
 
@@ -117,7 +126,7 @@ def create_parser() -> argparse.ArgumentParser:
     )
     probe_parser.add_argument("--api-key", type=str, help="API key")
     probe_parser.add_argument(
-        "--model", type=str, help="Model name (default: test-model)"
+        "--model", type=str, required=True, help="Model name (e.g., llama-2-70b)"
     )
     probe_parser.add_argument(
         "--requests", type=int, default=10, help="Number of test requests"
@@ -149,19 +158,52 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _add_benchmark_args(parser: argparse.ArgumentParser) -> None:
-    """Add common benchmark arguments to parser."""
-    parser.add_argument("--config", "-c", type=Path, help="YAML config file")
-    parser.add_argument("--endpoint", "-e", type=str, help="Endpoint URL")
+def _add_shared_benchmark_args(parser):
+    """Add shared benchmark arguments (used by both offline and online)."""
+    parser.add_argument(
+        "--endpoint", "-e", type=str, required=True, help="Endpoint URL"
+    )
+    parser.add_argument(
+        "--model", type=str, required=True, help="Model name (e.g., llama-2-70b)"
+    )
+    parser.add_argument(
+        "--dataset", "-d", type=Path, required=True, help="Dataset file"
+    )
     parser.add_argument("--api-key", type=str, help="API key")
-    parser.add_argument("--model", type=str, help="Model name (e.g., llama-2-70b)")
-    parser.add_argument("--dataset", "-d", type=Path, help="Dataset file")
-    parser.add_argument("--concurrency", type=int, help="Max concurrent requests")
-    parser.add_argument("--workers", type=int, help="Number of workers")
-    parser.add_argument("--duration", type=int, help="Duration in seconds")
+    parser.add_argument("--qps", type=float, help="Target QPS (default: 10.0)")
+    parser.add_argument("--workers", type=int, help="HTTP workers (default: 4)")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        help="Max concurrent requests (default: -1 unlimited)",
+    )
+    parser.add_argument(
+        "--duration", type=int, help="Duration in seconds (default: 10)"
+    )
+    parser.add_argument(
+        "--mode", choices=["perf", "acc", "both"], help="Test mode (default: perf)"
+    )
     parser.add_argument("--min-tokens", type=int, help="Min output tokens")
     parser.add_argument("--max-tokens", type=int, help="Max output tokens")
+
+
+def _add_online_specific_args(parser):
+    """Add online-specific arguments."""
+    # Derive choices from Scheduler._IMPL_MAP (single source of truth via __init_subclass__)
+    available_patterns = [p.value for p in Scheduler._IMPL_MAP.keys()]
+    parser.add_argument(
+        "--load-pattern",
+        choices=available_patterns,
+        help=f"Load pattern (default: poisson, available: {', '.join(available_patterns)})",
+    )
+
+
+def _add_auxiliary_args(parser):
+    """Add auxiliary arguments (output-related, no benchmark impact)."""
     parser.add_argument("--output", "-o", type=Path, help="Results output file")
+
+
+# Argparse structure enforces arg validity - no manual validation needed
 
 
 async def main() -> None:
@@ -170,12 +212,13 @@ async def main() -> None:
     args = parser.parse_args()
 
     # Setup logging based on verbosity
+    # Default to INFO so users see important execution info (duration, samples, results)
     if args.verbose >= 2:
         log_level = logging.DEBUG
     elif args.verbose == 1:
         log_level = logging.INFO
     else:
-        log_level = logging.WARNING
+        log_level = logging.INFO  # Default: INFO (not WARNING) for user-facing info
 
     setup_logging()
     logging.getLogger().setLevel(log_level)

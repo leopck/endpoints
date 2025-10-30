@@ -25,13 +25,13 @@ from pathlib import Path
 from pydantic import ValidationError as PydanticValidationError
 
 from .. import __version__
-from ..config.yaml_config import ConfigError, ConfigLoader
+from ..config.yaml_loader import ConfigError, ConfigLoader
 from ..exceptions import InputValidationError, SetupError
 
 logger = logging.getLogger(__name__)
 
 # Path to template files
-TEMPLATES_DIR = Path(__file__).parent.parent / "config" / "defaults"
+TEMPLATES_DIR = Path(__file__).parent.parent / "config" / "templates"
 
 # Template mapping
 TEMPLATE_FILES = {
@@ -79,8 +79,10 @@ async def run_validate_command(args: argparse.Namespace) -> None:
         logger.info(f"  Type: {config.type}")
         logger.info(f"  Datasets: {len(config.datasets)}")
 
-        if config.is_locked():
-            logger.info(f"  Baseline: locked ({config.baseline.model})")
+        if config.submission_ref:
+            logger.info(
+                f"  Submission: model={config.submission_ref.model}, ruleset={config.submission_ref.ruleset}"
+            )
 
         if args.verbose:
             logger.info(
