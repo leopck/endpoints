@@ -24,8 +24,8 @@ from pathlib import Path
 
 from .dataloader import (
     DataLoader,
-    DeepSeekR1ChatCompletionDataLoader,
     HFDataLoader,
+    PickleReader,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,7 +73,7 @@ class DataLoaderFactory:
                 parser = default_parser
 
             logger.info(f"Creating pickle dataset loader for {dataset_path}")
-            return DeepSeekR1ChatCompletionDataLoader(dataset_path, parser=parser)
+            return PickleReader(dataset_path, parser=parser)
 
         elif format == "jsonl" or format == "json":
             # JSON Lines format

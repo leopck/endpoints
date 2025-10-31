@@ -233,13 +233,18 @@ def _add_online_specific_args(parser):
 def _add_auxiliary_args(parser):
     """Add auxiliary arguments that don't affect benchmark execution.
 
-    These arguments control non-benchmark output:
-    - output: Path to save additional output data (not benchmark report)
-
     Args:
         parser: The argument parser to add arguments to.
     """
-    parser.add_argument("--output", "-o", type=Path, help="Non-benchmark output file")
+    parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        help="Path to save additional output data (not benchmark report)",
+    )
+    parser.add_argument(
+        "--timeout", type=float, help="Timeout in seconds (default: 300)", default=300
+    )
 
 
 # Argparse structure enforces arg validity - no manual validation needed

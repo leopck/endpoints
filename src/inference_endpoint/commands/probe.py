@@ -21,6 +21,7 @@ import logging
 import shutil
 import tempfile
 import time
+from urllib.parse import urljoin
 
 from inference_endpoint.core.types import Query
 from inference_endpoint.endpoint_client.configs import (
@@ -68,7 +69,7 @@ async def run_probe_command(args: argparse.Namespace) -> None:
     try:
         # Setup HTTP client with futures support
         http_config = HTTPClientConfig(
-            endpoint_url=f"{endpoint}/v1/chat/completions",
+            endpoint_url=urljoin(endpoint, "/v1/chat/completions"),
             num_workers=1,
             max_concurrency=num_requests,
         )

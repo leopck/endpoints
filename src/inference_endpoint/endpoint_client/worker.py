@@ -276,6 +276,9 @@ class Worker:
         )
 
         # Issue the request
+        logging.debug(
+            f"Making HTTP request to {url} with payload: {payload} and headers: {headers}"
+        )
         async with self._session.post(url, json=payload, headers=headers) as response:
             if response.status != 200:
                 error_text = await response.text()
