@@ -24,61 +24,131 @@ from datasets import load_dataset, load_from_disk
 
 
 class DataLoader(ABC):
-    """Implementation for loading a dataset into memory and handling memory management for the dataset.
+    """Abstract base class for loading and managing benchmark datasets.
 
-    For large datasets that cannot entirely fit into memory, the dataloader should implement some strategy for loading and unloading
-    required samples into memory as needed.
+    DataLoaders handle:
+    - Loading datasets from various formats (pickle, HuggingFace, CSV, etc.)
+    - Memory management for large datasets
+    - Random-access sample retrieval by index
+    - Optional memory-constrained caching/unloading
 
-    For any given sample index, the sample can be required to be in memory any number of times during the lifetime of a benchmark run.
+    The DataLoader is responsible for raw data loading only. Parsing and
+    transformation (e.g., converting to request format) is handled separately
+    by parser functions.
+
+    Attributes:
+        max_memory_usage_bytes: Optional memory limit. If None, no artificial limit.
     """
 
     def __init__(self, max_memory_usage_bytes: int | None = None):
-        """
-        Initializes the dataloader.
+        """Initialize the dataloader with optional memory constraints.
 
         Args:
-            max_memory_usage_bytes (int | None): The maximum memory usage in bytes. If None, the dataloader will not limit memory usage artificially.
+            max_memory_usage_bytes: Maximum memory to use for dataset caching.
+                                   If None, loads entire dataset into memory.
         """
         self.max_memory_usage_bytes = max_memory_usage_bytes
 
+    def load(self, force: bool = False):  # noqa: B027
+        """Load the dataset into memory for eager loading.
+
+        Optional method for implementations that support eager loading.
+        This enables converting/loading the entire dataset upfront for
+        workloads that benefit from pre-processing.
+
+        Not all implementations need this - implementations that stream
+        from disk or use lazy loading can skip this method.
+
+        Args:
+            force: If True, reloads even if already loaded (for refreshing data).
+
+        Raises:
+            IOError: If dataset cannot be loaded.
+        """
+        pass
+
     @abstractmethod
     def load_sample(self, index: int) -> Any:
-        """
-        Loads a sample from the dataset.
+        """Load a single sample from the dataset by index.
+
+        This method must support random access and may be called multiple times
+        for the same index. Implementations should cache samples in memory when
+        possible for performance.
+
+        Args:
+            index: Sample index (0 to num_samples()-1).
+
+        Returns:
+            Sample data in format specific to the dataset type.
+            Typically a dict, dataclass, or custom object.
+
+        Raises:
+            IndexError: If index is out of range.
+            IOError: If data cannot be loaded from disk.
         """
         raise NotImplementedError
 
     def mark_unneeded(self, index: int):  # noqa: B027
-        """
-        Marks a sample as no longer needed. The DataLoader implementation should implement some strategy for unloading this sample from memory
-        as necessary (i.e. when the memory limit is reached and load_sample is called).
+        """Mark a sample as no longer needed for eviction.
 
-        It is not necessary to implement this method if the DataLoader implementation requires or assumes the entire dataset can fit in memory.
+        Implementations with memory constraints can use this as a hint to
+        unload samples from memory. The benchmark system calls this after
+        a sample has been issued and is unlikely to be needed again soon.
+
+        Optional implementation - not needed if entire dataset fits in memory.
+
+        Args:
+            index: Sample index that can be evicted.
         """
         pass
 
     @abstractmethod
     def num_samples(self) -> int:
-        """
-        Returns the number of samples in the dataset.
+        """Get the total number of samples in the dataset.
+
+        Returns:
+            Total sample count (positive integer).
         """
         raise NotImplementedError
 
 
 class PickleReader(DataLoader):
+    """DataLoader implementation for pickle (.pkl) format datasets.
+
+    Loads Python pickle files containing lists or arrays of samples.
+    Supports optional parsing functions to transform raw data into
+    the format needed by the benchmark system.
+
+    The default parser extracts the 'text_input' attribute from each row,
+    which is compatible with common benchmark dataset formats.
+
+    Usage:
+        >>> reader = PickleReader("dataset.pkl", parser=lambda x: x.text_input)
+        >>> reader.load()
+        >>> sample = reader.load_sample(0)
+
+    Attributes:
+        file_path: Path to the pickle file.
+        parser: Function to transform raw rows into usable format.
+        data: Loaded dataset (empty until load() is called).
+        loaded: Whether the dataset has been loaded into memory.
+    """
+
     def __init__(
         self,
         file_path,
         parser: Callable[[Any], Any] = None,
         max_memory_usage_bytes: int | None = None,
     ):
-        """
-        Initializes the PickleReader.
-        This does not load the data from the pickle file. Call load() to load the data.
+        """Initialize PickleReader for a pickle dataset file.
+
+        Note: This does not load the data immediately. Call load() to load.
 
         Args:
-            file_path (str): The path to the pickle file.
-            parser (Callable[[Any], Any]): A function to extract the data from the row.
+            file_path: Path to the pickle file containing the dataset.
+            parser: Optional function to extract/transform data from each row.
+                   If None, uses default parser that extracts 'text_input' attribute.
+            max_memory_usage_bytes: Optional memory limit (currently unused).
         """
         super().__init__(max_memory_usage_bytes)
         self.file_path = file_path
@@ -95,9 +165,17 @@ class PickleReader(DataLoader):
             self.parser = extract_text_input
 
     def load(self, force: bool = False):
-        """
-        Loads the data from the pickle file.
-        If force is True, it will reload the data even if it is already loaded.
+        """Load the dataset from the pickle file into memory.
+
+        This method reads the entire pickle file and stores it in memory.
+        Subsequent load_sample() calls will be served from memory.
+
+        Args:
+            force: If True, reloads even if already loaded (for refreshing data).
+
+        Raises:
+            FileNotFoundError: If pickle file doesn't exist.
+            pickle.UnpicklingError: If file is corrupted or not a valid pickle.
         """
         if self.loaded and not force:
             return

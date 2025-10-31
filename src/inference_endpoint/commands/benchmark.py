@@ -77,16 +77,49 @@ logger = logging.getLogger(__name__)
 
 
 class ResponseCollector:
-    """Collects responses for accuracy evaluation."""
+    """Collects query responses and errors for accuracy evaluation and reporting.
+
+    TODO (to be deprecated): This is a temporary testing/validation feature. Once the full
+    reporter functionality is implemented, this class will be deprecated in
+    favor of the comprehensive reporting system.
+
+    This collector acts as a callback handler for completed queries, tracking:
+    - Total count of completed queries
+    - Response outputs (when collect_responses is True)
+    - Error messages from failed queries
+
+    Used primarily in accuracy evaluation mode (TestMode.ACC/BOTH) where
+    responses need to be stored for later comparison against ground truth.
+
+    Attributes:
+        collect_responses: Whether to store full response text (memory intensive).
+        responses: Map of query_id -> response_output for successful queries.
+        errors: List of error messages from failed queries.
+        count: Total number of completed queries (success + failure).
+    """
 
     def __init__(self, collect_responses: bool = False):
+        """Initialize response collector.
+
+        Args:
+            collect_responses: If True, stores full response text for each query.
+                              If False, only tracks counts and errors (saves memory).
+        """
         self.collect_responses = collect_responses
         self.responses: dict[str, str] = {}
         self.errors: list[str] = []
         self.count = 0
 
     def on_complete_hook(self, result: QueryResult):
-        """Hook called when a sample completes."""
+        """Callback invoked when a query completes (success or failure).
+
+        This method is registered with SampleEventHandler and called automatically
+        when a COMPLETE event fires. It updates internal counters and optionally
+        stores the response text.
+
+        Args:
+            result: QueryResult containing response data or error information.
+        """
         self.count += 1
         if result.error:
             self.errors.append(f"Sample {result.id}: {result.error}")
@@ -95,7 +128,36 @@ class ResponseCollector:
 
 
 async def run_benchmark_command(args: argparse.Namespace) -> None:
-    """Run benchmark (offline, online, or YAML-configured)."""
+    """Run performance benchmark in offline, online, or YAML-configured mode.
+
+    This is the main entry point for the benchmark command. It:
+    1. Determines benchmark mode (offline/online/from-config)
+    2. Builds or loads configuration (CLI args vs YAML)
+    3. Validates configuration comprehensively
+    4. Determines response collection strategy based on test mode
+    5. Delegates to _run_benchmark() for execution
+
+    Benchmark modes:
+    - offline: Max throughput test (all queries at t=0)
+    - online: Sustained QPS test (Poisson/concurrency-based scheduling)
+    - from-config: Load all settings from YAML file
+
+    Test modes (--mode):
+    - perf: Performance metrics only (no response storage)
+    - acc: Accuracy evaluation (collect responses)
+    - both: Both performance and accuracy
+
+    Args:
+        args: Parsed command line arguments from argparse.
+              Expected attributes vary by benchmark_mode:
+              - offline/online: endpoint, model, dataset, qps, workers, etc.
+              - from-config: config (YAML path)
+
+    Raises:
+        InputValidationError: If configuration is invalid or args are missing.
+        SetupError: If initialization fails (dataset loading, connection, etc.).
+        ExecutionError: If benchmark execution fails after successful setup.
+    """
 
     # Determine benchmark mode
     benchmark_mode_str = getattr(
@@ -316,18 +378,44 @@ def _run_benchmark(
     test_mode: TestMode,
     benchmark_mode: TestType | None,
 ) -> None:
-    """Execute the actual benchmark.
+    """Execute the actual benchmark with full lifecycle management.
 
-    Note: This function uses sync methods (http_client.start(), sess.wait_for_test_end())
-    because HTTPEndpointClient manages its own event loop in a separate thread.
-    It should NOT be async since it performs blocking operations.
+    This function orchestrates the complete benchmark execution:
+    1. Load tokenizer for the target model
+    2. Load and validate dataset using DataLoaderFactory
+    3. Setup runtime settings and scheduler
+    4. Create HTTP endpoint client with multiprocessing workers
+    5. Run benchmark session with signal handling
+    6. Collect and report results
+    7. Clean up resources (always, even on error)
+
+    Architecture notes:
+    - This is a SYNCHRONOUS function (not async) because HTTPEndpointClient
+      manages its own event loop in a separate thread
+    - Uses blocking operations: http_client.start(), sess.wait_for_test_end()
+    - Signal handling: SIGINT (Ctrl+C) gracefully stops benchmark
+    - Cleanup: Always executes via finally block
+
+    Streaming behavior:
+    - Enabled automatically for online mode (for TTFT metrics)
+    - Disabled for offline mode (max throughput focus)
 
     Args:
-        args: Command arguments
-        config: Validated BenchmarkConfig (immutable Pydantic model)
-        collect_responses: Whether to collect responses (for accuracy mode)
-        test_mode: TestMode enum (PERF, ACC, or BOTH)
-        benchmark_mode: TestType enum (OFFLINE or ONLINE)
+        args: Command arguments containing output paths, verbosity, etc.
+        config: Validated BenchmarkConfig (immutable Pydantic model).
+               Contains all benchmark parameters from CLI or YAML.
+        collect_responses: Whether to store full response text.
+                          True for accuracy modes (TestMode.ACC/BOTH).
+        test_mode: What to collect - PERF (metrics only), ACC (responses),
+                  or BOTH (metrics + responses).
+        benchmark_mode: Execution mode - OFFLINE (max throughput) or
+                       ONLINE (sustained QPS). Affects streaming and scheduling.
+
+    Raises:
+        InputValidationError: If model/dataset cannot be loaded or validated.
+        SetupError: If connection to endpoint fails or resources unavailable.
+        ExecutionError: If benchmark execution fails after successful setup.
+        KeyboardInterrupt: If user interrupts with Ctrl+C (re-raised for CLI handler).
     """
 
     # Load tokenizer if model name is provided

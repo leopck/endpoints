@@ -87,7 +87,7 @@ endpoint_config:
 
     def test_create_default_offline_config(self):
         """Test creating default offline config."""
-        config = ConfigLoader.create_default_config(TestType.OFFLINE)
+        config = BenchmarkConfig.create_default_config(TestType.OFFLINE)
         assert isinstance(config, BenchmarkConfig)
         assert config.settings.load_pattern.type == LoadPatternType.MAX_THROUGHPUT
         assert config.settings.runtime.min_duration_ms == 600000
@@ -95,7 +95,7 @@ endpoint_config:
 
     def test_create_default_online_config(self):
         """Test creating default online config."""
-        config = ConfigLoader.create_default_config(TestType.ONLINE)
+        config = BenchmarkConfig.create_default_config(TestType.ONLINE)
         assert isinstance(config, BenchmarkConfig)
         assert config.settings.load_pattern.type == LoadPatternType.POISSON
         assert config.settings.load_pattern.qps == 10.0
@@ -104,7 +104,7 @@ endpoint_config:
     def test_serialize_deserialize_roundtrip(self, tmp_path):
         """Test BenchmarkConfig.to_yaml_file() and from_yaml_file() roundtrip."""
         # Create a config
-        original = ConfigLoader.create_default_config(TestType.OFFLINE)
+        original = BenchmarkConfig.create_default_config(TestType.OFFLINE)
 
         # Save to YAML
         yaml_file = tmp_path / "test_config.yaml"
@@ -122,7 +122,7 @@ endpoint_config:
 
     def test_to_yaml_file_creates_directory(self, tmp_path):
         """Test that to_yaml_file creates parent directories."""
-        config = ConfigLoader.create_default_config(TestType.ONLINE)
+        config = BenchmarkConfig.create_default_config(TestType.ONLINE)
 
         # Save to nested path that doesn't exist
         nested_path = tmp_path / "subdir" / "nested" / "config.yaml"
