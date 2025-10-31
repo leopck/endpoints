@@ -36,20 +36,6 @@ class CharTokenizer:
         return list(text)
 
 
-@pytest.fixture
-def cleanup_connections():
-    to_cleanup = {
-        "close": [],
-        "delete": [],
-    }
-    yield to_cleanup
-
-    for obj in to_cleanup["close"]:
-        obj.close()
-    for obj in to_cleanup["delete"]:
-        Path(obj).unlink()
-
-
 class TimingLog:
     def __init__(self, log_file: Path | str | None = None):
         if log_file is None:
@@ -147,6 +133,7 @@ def test_many_chunk_performance(
     with get_EventRecorder() as rec:
         conn_name = rec.connection_name
         cleanup_connections["delete"].append(conn_name)
+        cleanup_connections["delete"].append(rec.outputs_path)
 
         start_time = time.monotonic_ns()
         for sample_uuid in range(n_samples):
@@ -237,6 +224,7 @@ def test_2_chunk_per_query_performance(
     with get_EventRecorder() as rec:
         conn_name = rec.connection_name
         cleanup_connections["delete"].append(conn_name)
+        cleanup_connections["delete"].append(rec.outputs_path)
 
         start_time = time.monotonic_ns()
         for sample_uuid in range(n_queries):

@@ -15,6 +15,7 @@
 
 """Performance test fixtures and configuration."""
 
+import logging
 import sys
 from pathlib import Path
 
@@ -92,3 +93,23 @@ def http_client(perf_http_echo_server, tmp_path):
         raise RuntimeError(f"HttpEndpointClient Error: {e}") from e
     finally:
         client.shutdown()
+
+
+@pytest.fixture(scope="function")
+def cleanup_connections():
+    to_cleanup = {
+        "close": [],
+        "delete": [],
+    }
+    yield to_cleanup
+
+    for obj in to_cleanup["close"]:
+        try:
+            obj.close()
+        except Exception as e:
+            logging.error(f"Error closing object: {e}")
+    for obj in to_cleanup["delete"]:
+        try:
+            Path(obj).unlink(missing_ok=True)
+        except Exception as e:
+            logging.error(f"Error deleting object: {e}")

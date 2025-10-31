@@ -153,8 +153,8 @@ def test_percentile():
 
 def test_rollup_summarize(events_db):
     with MetricsReporter(events_db) as reporter:
-        tpot_rows = reporter.derive_sample_latency()
-    summary = tpot_rows.summarize()
+        latencies = reporter.derive_sample_latency()
+    summary = latencies.summarize()
     values = [10211 - 10000, 10219 - 10003]
     assert summary["total"] == sum(values)
     assert summary["min"] == min(values)
@@ -173,7 +173,7 @@ def test_rollup_summarize(events_db):
     for percentile in [99.9, 99, 95, 90, 80, 75, 50, 25, 10, 5, 1]:
         s = str(percentile)
         assert s in summary["percentiles"]
-        assert summary["percentiles"][s] == tpot_rows.percentile(percentile)
+        assert summary["percentiles"][s] == latencies.percentile(percentile)
 
 
 def test_reporter_create_report(events_db_reporter_with_fake_outputs):
