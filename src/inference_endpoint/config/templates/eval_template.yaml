@@ -17,7 +17,8 @@ datasets:
 
 settings:
   runtime:
-    random_seed: 42
+    scheduler_random_seed: 42 # For Poisson/distribution sampling
+    dataloader_random_seed: 42 # For dataset shuffling
 
   load_pattern:
     type: "max_throughput"

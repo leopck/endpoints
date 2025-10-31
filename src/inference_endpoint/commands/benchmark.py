@@ -213,7 +213,7 @@ async def run_benchmark_command(args: argparse.Namespace) -> None:
             "Unknown benchmark mode. Use: offline, online, or from-config"
         )
 
-    # Validate configuration (comprehensive validation with warnings)
+    # Validate configuration
     try:
         ConfigLoader.validate_config(effective_config, benchmark_mode)
     except ConfigError as e:
@@ -268,13 +268,17 @@ def _build_config_from_cli(
         ],
         settings=Settings(
             load_pattern=LoadPattern(
-                type=load_pattern_type, qps=args.qps if args.qps else 10.0
+                type=load_pattern_type,
+                target_qps=args.target_qps if args.target_qps else None,
             ),
             runtime=RuntimeConfig(
                 min_duration_ms=args.duration * 1000
                 if args.duration
-                else 10000,  # Default: 10s for quick testing (TODO: Make configurable)
+                else 0,  # Default: 0 (sample count determined by n_samples_to_issue or dataset size)
                 max_duration_ms=1800000,
+                n_samples_to_issue=getattr(
+                    args, "num_samples", None
+                ),  # Map --num-samples to config
                 scheduler_random_seed=42,
                 dataloader_random_seed=42,
             ),
@@ -285,12 +289,12 @@ def _build_config_from_cli(
         ),
         model_params=ModelParams(
             temperature=0.7,
-            max_new_tokens=args.max_tokens if args.max_tokens else 1024,
+            max_new_tokens=args.max_output_tokens if args.max_output_tokens else 1024,
             osl_distribution=OSLDistribution(
-                min=args.min_tokens if args.min_tokens else 1,
-                max=args.max_tokens if args.max_tokens else 2048,
+                min=args.min_output_tokens if args.min_output_tokens else 1,
+                max=args.max_output_tokens if args.max_output_tokens else 2048,
             )
-            if (args.min_tokens or args.max_tokens)
+            if (args.min_output_tokens or args.max_output_tokens)
             else None,
         ),
         endpoint_config=EndpointConfig(endpoint=args.endpoint, api_key=args.api_key),
@@ -453,10 +457,21 @@ def _run_benchmark(
     dataset_format = _get_dataset_format(config, dataset_path)
     logger.info(f"Loading: {dataset_path.name} (format: {dataset_format})")
 
-    # Determine if streaming should be enabled (only for online mode)
-    enable_streaming = benchmark_mode == TestType.ONLINE
-    if enable_streaming:
-        logger.info("Streaming enabled for TTFT metrics (online mode)")
+    # Determine if streaming should be enabled based on --streaming flag (tristate: auto/on/off)
+    # TODO: This should a model-level parameter, to be refactored later.
+    streaming_arg = getattr(args, "streaming", "auto")
+    if streaming_arg == "on":
+        enable_streaming = True
+        logger.info("Streaming: enabled (forced via --streaming=on)")
+    elif streaming_arg == "off":
+        enable_streaming = False
+        logger.info("Streaming: disabled (forced via --streaming=off)")
+    else:  # auto
+        enable_streaming = benchmark_mode == TestType.ONLINE
+        if enable_streaming:
+            logger.info("Streaming: enabled (auto, online mode)")
+        else:
+            logger.info("Streaming: disabled (auto, offline mode)")
 
     try:
         # Create loader using factory
@@ -482,14 +497,16 @@ def _run_benchmark(
 
     # Setup runtime settings using factory method
     rt_settings = RuntimeSettings.from_config(config, dataloader.num_samples())
-    qps = config.settings.load_pattern.qps
+    target_qps = config.settings.load_pattern.target_qps
     load_pattern_type = config.settings.load_pattern.type
 
     # Calculate and display expected sample count
     total_samples = rt_settings.total_samples_to_issue()
     duration_s = rt_settings.min_duration_ms / 1000
 
-    logger.info(f"Mode: {test_mode}, QPS: {qps}, Responses: {collect_responses}")
+    logger.info(
+        f"Mode: {test_mode}, Target QPS: {target_qps}, Responses: {collect_responses}"
+    )
     logger.info(f"Min Duration: {duration_s:.1f}s, Expected samples: {total_samples}")
 
     # Create scheduler using __init_subclass__ registry
@@ -601,7 +618,7 @@ def _run_benchmark(
                     "config": {
                         "endpoint": endpoint,
                         "mode": test_mode,
-                        "qps": qps,
+                        "target_qps": target_qps,
                     },
                     "results": {
                         "total": scheduler.total_samples_to_issue,

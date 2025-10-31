@@ -20,7 +20,8 @@ settings:
   runtime:
     min_duration_ms: 600000 # 10 minutes
     max_duration_ms: 1800000 # 30 minutes
-    random_seed: 42
+    scheduler_random_seed: 42 # For Poisson/distribution sampling
+    dataloader_random_seed: 42 # For dataset shuffling
 
   load_pattern:
     type: "concurrency" # NOT YET IMPLEMENTED

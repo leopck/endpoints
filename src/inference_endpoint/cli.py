@@ -189,21 +189,39 @@ def _add_shared_benchmark_args(parser):
         "--dataset", "-d", type=Path, required=True, help="Dataset file"
     )
     parser.add_argument("--api-key", type=str, help="API key")
-    parser.add_argument("--qps", type=float, help="Target QPS (default: 10.0)")
+    parser.add_argument(
+        "--target-qps",
+        type=float,
+        help="Target queries per second (required for online mode with poisson pattern)",
+    )
     parser.add_argument("--workers", type=int, help="HTTP workers (default: 4)")
     parser.add_argument(
         "--concurrency",
         type=int,
-        help="Max concurrent requests (default: -1 unlimited)",
+        help="Max concurrent requests (required when using concurrency load pattern, default: -1 unlimited for other patterns)",
     )
     parser.add_argument(
-        "--duration", type=int, help="Duration in seconds (default: 10)"
+        "--duration",
+        type=int,
+        help="Test duration in seconds (default: 0 - run until dataset exhausted or max_duration reached)",
+    )
+    parser.add_argument(
+        "--num-samples",
+        type=int,
+        help="Number of samples to issue (overrides other duration and sample count calculation methods)",
+    )
+    parser.add_argument(
+        "--streaming",
+        type=str,
+        choices=["auto", "on", "off"],
+        default="auto",
+        help="Enable streaming for TTFT metrics (default: auto - enabled for online, disabled for offline)",
     )
     parser.add_argument(
         "--mode", choices=["perf", "acc", "both"], help="Test mode (default: perf)"
     )
-    parser.add_argument("--min-tokens", type=int, help="Min output tokens")
-    parser.add_argument("--max-tokens", type=int, help="Max output tokens")
+    parser.add_argument("--min-output-tokens", type=int, help="Min output tokens")
+    parser.add_argument("--max-output-tokens", type=int, help="Max output tokens")
     parser.add_argument(
         "--report-path", type=Path, help="Path to save detailed benchmark report"
     )

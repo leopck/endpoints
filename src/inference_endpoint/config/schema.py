@@ -179,10 +179,18 @@ class RuntimeConfig(BaseModel):
 
     This class represents user inputs, while RuntimeSettings represents
     the fully-resolved execution configuration.
+
+    Sample count priority (in RuntimeSettings.total_samples_to_issue()):
+    1. n_samples_to_issue (if specified) - explicit override
+    2. All dataset samples (if min_duration_ms=0) - default CLI behavior
+    3. Calculated from QPS * duration (if min_duration_ms>0) - duration-based
     """
 
     min_duration_ms: int = 600000  # 10 minutes
     max_duration_ms: int = 1800000  # 30 minutes
+    n_samples_to_issue: int | None = (
+        None  # Explicit sample count override (None = auto-calculate)
+    )
     scheduler_random_seed: int = 42  # For Poisson/distribution sampling
     dataloader_random_seed: int = 42  # For dataset shuffling
 
@@ -190,15 +198,15 @@ class RuntimeConfig(BaseModel):
 class LoadPattern(BaseModel):
     """Load pattern configuration.
 
-    Different patterns use QPS differently:
-    - max_throughput: QPS used for calculating total queries (offline)
-    - poisson: QPS sets scheduler rate (online, rate-limited)
-    - concurrency: QPS not used, concurrency limit dominates (TODO)
+    Different patterns use target_qps differently:
+    - max_throughput: target_qps used for calculating total queries (offline, optional with default)
+    - poisson: target_qps sets scheduler rate (online, required - validated)
+    - concurrency: target_qps not used, concurrency limit dominates (TODO)
     """
 
     type: LoadPatternType = LoadPatternType.MAX_THROUGHPUT
-    qps: float = (
-        10.0  # Default QPS - queries per second (usage depends on pattern type)
+    target_qps: float | None = (
+        None  # Target QPS - required for poisson pattern, optional otherwise
     )
     target_concurrency: int | None = None  # For concurrency mode (TODO)
 
@@ -405,15 +413,34 @@ class BenchmarkConfig(BaseModel):
             benchmark_mode: The benchmark execution mode
 
         Raises:
-            ValueError: If load pattern doesn't match benchmark mode
+            ValueError: If load pattern doesn't match benchmark mode or required parameters are missing
         """
         load_pattern_type = self.settings.load_pattern.type
+        target_qps = self.settings.load_pattern.target_qps
+        max_concurrency = self.settings.client.max_concurrency
 
         if benchmark_mode == TestType.OFFLINE:
             if load_pattern_type != LoadPatternType.MAX_THROUGHPUT:
                 raise ValueError(
                     f"Offline benchmarks must use 'max_throughput' load pattern, got '{load_pattern_type}'"
                 )
+
+        elif benchmark_mode == TestType.ONLINE:
+            # Online mode validation
+            if load_pattern_type == LoadPatternType.POISSON:
+                # Poisson pattern requires target_qps to be specified
+                if target_qps is None or target_qps <= 0:
+                    raise ValueError(
+                        "Online mode with poisson pattern requires positive target_qps. "
+                        "Specify target queries per second (e.g., target_qps: 100 in YAML or --target-qps 100 in CLI)"
+                    )
+            elif load_pattern_type == LoadPatternType.CONCURRENCY:
+                # Concurrency pattern requires max_concurrency > 0
+                if not max_concurrency or max_concurrency <= 0:
+                    raise ValueError(
+                        "Concurrency load pattern requires max_concurrency > 0. "
+                        "Specify number of concurrent requests (e.g., max_concurrency: 10 in YAML or --concurrency 10 in CLI)"
+                    )
 
     def validate_client_settings(self) -> None:
         """Validate client settings are reasonable.
@@ -527,7 +554,7 @@ class BenchmarkConfig(BaseModel):
                 datasets=[],
                 settings=Settings(
                     load_pattern=LoadPattern(
-                        type=LoadPatternType.MAX_THROUGHPUT, qps=10.0
+                        type=LoadPatternType.MAX_THROUGHPUT, target_qps=None
                     ),
                     runtime=RuntimeConfig(
                         min_duration_ms=600000,
@@ -548,7 +575,9 @@ class BenchmarkConfig(BaseModel):
                 type=TestType.ONLINE,
                 datasets=[],
                 settings=Settings(
-                    load_pattern=LoadPattern(type=LoadPatternType.POISSON, qps=10.0),
+                    load_pattern=LoadPattern(
+                        type=LoadPatternType.POISSON, target_qps=10.0
+                    ),
                     runtime=RuntimeConfig(
                         min_duration_ms=600000,
                         max_duration_ms=1800000,

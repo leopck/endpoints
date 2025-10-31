@@ -25,12 +25,15 @@ This is the single source of truth for runtime configuration.
 
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .. import metrics
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .ruleset_base import BenchmarkSuiteRuleset
@@ -133,14 +136,22 @@ class RuntimeSettings:
         runtime_cfg = config.settings.runtime
         load_pattern_cfg = config.settings.load_pattern
 
+        # TODO: The default target_qps should be None in Offline mode, but we use 10.0 for now.
+        # This is a temporary solution to avoid breaking changes.
+        effective_qps = (
+            load_pattern_cfg.target_qps
+            if load_pattern_cfg.target_qps is not None
+            else 10.0
+        )
+
         # Build kwargs from Pydantic models
         kwargs = {
-            "metric_target": metrics.Throughput(load_pattern_cfg.qps),
-            "reported_metrics": [metrics.Throughput(load_pattern_cfg.qps)],
+            "metric_target": metrics.Throughput(effective_qps),
+            "reported_metrics": [metrics.Throughput(effective_qps)],
             "min_duration_ms": runtime_cfg.min_duration_ms,
             "max_duration_ms": runtime_cfg.max_duration_ms,
             "n_samples_from_dataset": dataloader_num_samples,
-            "n_samples_to_issue": None,  # Let total_samples_to_issue() calculate it
+            "n_samples_to_issue": runtime_cfg.n_samples_to_issue,  # From config (CLI --num-samples or YAML)
             "min_sample_count": 1,
             "rng_sched": random.Random(runtime_cfg.scheduler_random_seed),
             "rng_sample_index": random.Random(runtime_cfg.dataloader_random_seed),
@@ -154,8 +165,10 @@ class RuntimeSettings:
     def total_samples_to_issue(self, padding_factor: float = 1.1) -> int:
         """Calculate the total number of samples to issue to the SUT throughout the course of the test run.
 
-        If `n_samples_to_issue` is set, then it is returned.
-        If it is not set, then it is calculated based on the metric target and minimum test duration.
+        Priority:
+        1. If `n_samples_to_issue` is set, return it (explicit override)
+        2. If min_duration_ms=0, return all dataset samples (new CLI default)
+        3. Otherwise, calculate from metric target * duration
 
         Args:
             padding_factor (float): Factor to multiply the expected number of samples by to account for variance.
@@ -164,9 +177,22 @@ class RuntimeSettings:
         Returns:
             int: The total number of samples to issue to the SUT throughout the course of the test run.
         """
+        # min_sample is not in effect here (CLI dominated), it will be used in the ruleset.
         if self.n_samples_to_issue is not None:
+            logger.debug(
+                f"Sample count: {self.n_samples_to_issue} (explicit override via --num-samples or YAML n_samples_to_issue)"
+            )
             return self.n_samples_to_issue
 
+        # If min_duration is 0, use all dataset samples (new CLI default behavior)
+        if self.min_duration_ms == 0:
+            result = max(self.min_sample_count, self.n_samples_from_dataset)
+            logger.debug(
+                f"Sample count: {result} (using all dataset samples, duration=0)"
+            )
+            return result
+
+        # Calculate from duration and metric target
         if isinstance(self.metric_target, metrics.Throughput):
             expected_sps = self.metric_target.target
             expected_samples = expected_sps * (self.min_duration_ms / 1000)
@@ -176,4 +202,11 @@ class RuntimeSettings:
             raise NotImplementedError(
                 f"Cannot infer n_samples_to_issue from metric target type: {type(self.metric_target)}"
             )
-        return max(self.min_sample_count, math.ceil(expected_samples * padding_factor))
+
+        result = max(
+            self.min_sample_count, math.ceil(expected_samples * padding_factor)
+        )
+        logger.debug(
+            f"Sample count: {result} (calculated from duration={self.min_duration_ms}ms × target_qps={self.metric_target.target} × padding={padding_factor})"
+        )
+        return result
