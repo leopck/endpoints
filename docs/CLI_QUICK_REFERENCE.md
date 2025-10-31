@@ -11,12 +11,12 @@ inference-endpoint benchmark offline \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl
 
-# Online (sustained QPS - CLI mode)
+# Online (sustained QPS - CLI mode - requires --target-qps)
 inference-endpoint benchmark online \
   --endpoint URL \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 500
+  --target-qps 100
 
 # With detailed report generation
 inference-endpoint benchmark offline \
@@ -75,17 +75,19 @@ inference-endpoint info
 ## Benchmark Options (CLI Mode Only)
 
 - `--api-key KEY` - API authentication
-- `--qps N` - Queries per second (default: 10.0)
-- `--duration SEC` - Test duration in seconds (default: 10)
+- `--target-qps N` - Target queries per second (required for online mode with poisson pattern)
+- `--duration SEC` - Test duration in seconds (default: 0 - run until dataset exhausted)
+- `--num-samples N` - Number of samples to issue (overrides dataset size and duration calculation)
+- `--streaming MODE` - Streaming control: `auto` (default), `on`, or `off`. Streaming will enable token streaming in response.
 - `--workers N` - HTTP workers (default: 4)
 - `--mode MODE` - Test mode: `perf` (default), `acc`, or `both`
-- `--min-tokens N` - Min output tokens
-- `--max-tokens N` - Max output tokens
+- `--min-output-tokens N` - Min output tokens
+- `--max-output-tokens N` - Max output tokens
 
 ## Online-Specific Options
 
 - `--load-pattern TYPE` - Load pattern: `poisson` (default), `concurrency`
-- `--concurrency N` - Max concurrent requests (default: -1 unlimited)
+- `--concurrency N` - Max concurrent requests (required when using concurrency load pattern, default: -1 unlimited for other patterns)
 
 ## Dataset Formats
 
@@ -130,7 +132,7 @@ inference-endpoint info
 
 - Queries follow Poisson distribution
 - Sustains target QPS
-- Use with `benchmark online --qps N`
+- Use with `benchmark online --target-qps N`
 
 **concurrency** - Online mode (fixed concurrency) - NOT YET IMPLEMENTED
 
@@ -152,11 +154,24 @@ inference-endpoint benchmark offline \
 ### Production Benchmark
 
 ```bash
+# With explicit sample count
 inference-endpoint benchmark online \
   --endpoint https://api.production.com \
   --model Qwen/Qwen3-8B \
   --dataset prod_queries.pkl \
-  --qps 100 \
+  --target-qps 100 \
+  --num-samples 10000 \
+  --workers 16 \
+  --output results.json \
+  --report-path production_report \
+  -v
+
+# Or with duration (calculates samples from target_qps * duration)
+inference-endpoint benchmark online \
+  --endpoint https://api.production.com \
+  --model Qwen/Qwen3-8B \
+  --dataset prod_queries.pkl \
+  --target-qps 100 \
   --duration 300 \
   --workers 16 \
   --output results.json \
@@ -217,10 +232,12 @@ datasets:
 settings:
   runtime:
     min_duration_ms: 600000 # 10 minutes
-    random_seed: 42
+    n_samples_to_issue: null # Optional: explicit sample count (null = auto-calculate)
+    scheduler_random_seed: 42 # For Poisson/distribution sampling
+    dataloader_random_seed: 42 # For dataset shuffling
   load_pattern:
     type: "max_throughput"
-    qps: 10.0
+    target_qps: 10.0
   client:
     workers: 4
     max_concurrency: -1 # -1 = unlimited
@@ -250,11 +267,20 @@ endpoint_config:
 
 ## Tips
 
+**Sample Count Control:**
+
+- Sample priority: `--num-samples` > dataset size (duration=0) > calculated (target_qps × duration)
+- Default duration: 0 (runs until dataset exhausted or max_duration reached)
+
+**Mode Requirements:**
+
+- Online mode requires `--target-qps` (poisson) or `--concurrency` (concurrency pattern)
 - Use `--mode both` for combined perf + accuracy runs
-- Use `--min-tokens` and `--max-tokens` to control output length
-- Default duration: 10 seconds (use --duration to override)
-- Default max_concurrency: -1 (unlimited)
+- Streaming: auto (default) enables streaming responses for online, disables for offline
+
+**Best Practices:**
+
 - Share YAML configs for reproducible results across systems
-- Use `--report-path` to generate detailed metrics reports with TTFT, TPOT, and token-based analysis
-- Set `HF_TOKEN` environment variable for non-public models (e.g., `export HF_TOKEN=your_token`)
-- Model name is used to load tokenizer automatically for token-based metrics in reports
+- Use `--report-path` for detailed metrics with TTFT, TPOT, and token analysis
+- Set `HF_TOKEN` environment variable for non-public models
+- Use `--min-output-tokens` and `--max-output-tokens` to control output length

@@ -41,6 +41,43 @@ from inference_endpoint.commands.benchmark import (
 from inference_endpoint.exceptions import InputValidationError
 
 
+def _create_mock_args(**overrides):
+    """Helper to create mock args with default values.
+
+    Args:
+        **overrides: Any fields to override from defaults
+
+    Returns:
+        MagicMock configured with all required benchmark args
+    """
+    defaults = {
+        "benchmark_mode": "offline",
+        "config": None,
+        "endpoint": "http://test.com",
+        "dataset": Path("test.pkl"),
+        "model": "llama-2-70b",
+        "api_key": None,
+        "load_pattern": None,
+        "target_qps": None,
+        "concurrency": None,
+        "workers": None,
+        "duration": None,
+        "num_samples": None,
+        "streaming": "auto",
+        "min_output_tokens": None,
+        "max_output_tokens": None,
+        "mode": "perf",
+        "output": None,
+        "verbose": 0,
+    }
+    defaults.update(overrides)
+
+    mock = MagicMock()
+    for key, value in defaults.items():
+        setattr(mock, key, value)
+    return mock
+
+
 class TestBuildConfigFromCLI:
     """Test building BenchmarkConfig from CLI arguments.
 
@@ -56,12 +93,12 @@ class TestBuildConfigFromCLI:
             dataset=Path("test.pkl"),
             model="llama-2-70b",  # Required
             api_key=None,
-            qps=None,
+            target_qps=None,
             concurrency=None,  # Now in shared args
             workers=None,
             duration=None,
-            min_tokens=None,
-            max_tokens=None,
+            min_output_tokens=None,
+            max_output_tokens=None,
         )
 
         config = _build_config_from_cli(args, "offline")
@@ -70,10 +107,13 @@ class TestBuildConfigFromCLI:
         assert config.endpoint_config.endpoint == "http://test:8000"
         assert config.datasets[0].path == "test.pkl"
         assert config.settings.load_pattern.type.value == "max_throughput"
-        assert config.settings.load_pattern.qps == 10.0  # Default
+        assert config.settings.load_pattern.target_qps is None
         assert config.settings.client.workers == 4  # Default
         assert config.settings.client.max_concurrency == -1  # Default: unlimited
-        assert config.settings.runtime.min_duration_ms == 10000  # Default: 10s
+        assert (
+            config.settings.runtime.min_duration_ms == 0
+        )  # Default: 0 - use dataset samples
+        assert config.settings.runtime.n_samples_to_issue is None  # Default: None
 
     def test_build_config_online_with_params(self):
         """Test building config with custom online params."""
@@ -83,20 +123,20 @@ class TestBuildConfigFromCLI:
             dataset=Path("dataset.pkl"),
             model="gpt-4",  # Required
             api_key="key123",
-            qps=100.0,
+            target_qps=100.0,
             workers=8,
             concurrency=64,  # Online-specific
             load_pattern="poisson",  # Online-specific
             duration=600,
-            min_tokens=None,
-            max_tokens=None,
+            min_output_tokens=None,
+            max_output_tokens=None,
         )
 
         config = _build_config_from_cli(args, "online")
 
         assert config.name == "cli_online"
         assert config.settings.load_pattern.type.value == "poisson"
-        assert config.settings.load_pattern.qps == 100.0
+        assert config.settings.load_pattern.target_qps == 100.0
         assert config.settings.client.workers == 8
         assert config.settings.client.max_concurrency == 64
         assert config.settings.runtime.min_duration_ms == 600000
@@ -104,6 +144,25 @@ class TestBuildConfigFromCLI:
     # Note: Tests for missing endpoint/dataset/model removed
     # These are enforced by argparse (required=True), not by _build_config_from_cli
     # Argparse errors before our code runs, so no need to test here
+
+    def test_build_config_with_num_samples(self):
+        """Test that num_samples parameter is mapped to config."""
+        args = argparse.Namespace(
+            endpoint="http://test:8000",
+            dataset=Path("test.pkl"),
+            model="llama-2-70b",
+            api_key=None,
+            target_qps=None,
+            concurrency=None,
+            workers=None,
+            duration=None,
+            num_samples=100,  # This should be mapped to config
+            min_output_tokens=None,
+            max_output_tokens=None,
+        )
+
+        config = _build_config_from_cli(args, "offline")
+        assert config.settings.runtime.n_samples_to_issue == 100
 
 
 class TestRunBenchmarkCommand:
@@ -175,23 +234,32 @@ endpoint_config:
     @pytest.mark.asyncio
     async def test_nonexistent_dataset_file(self):
         """Test error when dataset file doesn't exist."""
-        args = MagicMock()
-        args.benchmark_mode = "offline"
-        args.config = None
-        args.endpoint = "http://test.com"
-        args.dataset = Path("/nonexistent/data.pkl")
-        args.api_key = None
-        args.load_pattern = None
-        args.qps = None
-        args.concurrency = None
-        args.workers = None
-        args.duration = None
-        args.min_tokens = None
-        args.max_tokens = None
-        args.mode = "perf"
-        args.verbose = 0
+        args = _create_mock_args(dataset=Path("/nonexistent/data.pkl"))
 
         with pytest.raises(InputValidationError, match="not found"):
+            await run_benchmark_command(args)
+
+    @pytest.mark.asyncio
+    async def test_online_mode_requires_qps(self):
+        """Test that online mode with poisson pattern requires --target-qps."""
+        args = _create_mock_args(
+            benchmark_mode="online",
+            # target_qps=None (default) - should raise error from config validation
+        )
+
+        with pytest.raises(InputValidationError, match="requires positive target_qps"):
+            await run_benchmark_command(args)
+
+    @pytest.mark.asyncio
+    async def test_concurrency_pattern_requires_concurrency(self):
+        """Test that concurrency load pattern requires --concurrency."""
+        args = _create_mock_args(
+            benchmark_mode="online",
+            load_pattern="concurrency",
+            # concurrency=None (default) - should raise error from config validation
+        )
+
+        with pytest.raises(InputValidationError, match="requires max_concurrency"):
             await run_benchmark_command(args)
 
     # Note: Testing unsupported load patterns requires full integration

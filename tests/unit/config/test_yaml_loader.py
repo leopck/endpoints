@@ -98,7 +98,7 @@ endpoint_config:
         config = BenchmarkConfig.create_default_config(TestType.ONLINE)
         assert isinstance(config, BenchmarkConfig)
         assert config.settings.load_pattern.type == LoadPatternType.POISSON
-        assert config.settings.load_pattern.qps == 10.0
+        assert config.settings.load_pattern.target_qps == 10.0
         assert config.settings.runtime.min_duration_ms == 600000
 
     def test_serialize_deserialize_roundtrip(self, tmp_path):
@@ -143,7 +143,9 @@ endpoint_config:
             endpoint_config=EndpointConfig(endpoint="http://test:8000"),
             settings=Settings(
                 load_pattern=LoadPattern(
-                    type=LoadPatternType.CONCURRENCY, qps=10.0, target_concurrency=64
+                    type=LoadPatternType.CONCURRENCY,
+                    target_qps=None,
+                    target_concurrency=64,
                 ),
                 client=ClientSettings(workers=4, max_concurrency=32),  # Too small
             ),
@@ -166,7 +168,7 @@ endpoint_config:
             endpoint_config=EndpointConfig(endpoint="http://test:8000"),
             settings=Settings(
                 load_pattern=LoadPattern(
-                    type=LoadPatternType.POISSON, qps=10.0, target_concurrency=32
+                    type=LoadPatternType.POISSON, target_qps=10.0, target_concurrency=32
                 ),
                 client=ClientSettings(workers=4, max_concurrency=64),  # OK
             ),

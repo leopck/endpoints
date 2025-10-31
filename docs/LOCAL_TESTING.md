@@ -79,8 +79,7 @@ inference-endpoint -v benchmark offline \
   --endpoint http://localhost:8765 \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 1000 \
-  --duration 30 \
+  --num-samples 5000 \
   --workers 4 \
   --output benchmark_results.json \
   --report-path benchmark_report
@@ -94,14 +93,15 @@ inference-endpoint -v benchmark offline \
 ```
 Loading: dummy_1k.pkl
 Loaded 1000 samples
-Mode: TestMode.PERF, QPS: 1000.0, Responses: False
-Min Duration: 10.0s, Expected samples: 11000
+Mode: TestMode.PERF, QPS: 10.0, Responses: False
+Streaming: disabled (auto, offline mode)
+Min Duration: 0.0s, Expected samples: 1000
 Scheduler: MaxThroughputScheduler (pattern: max_throughput)
 Connecting: http://localhost:8765
 Running...
-Completed in 2.7s
-Results: 11000/11000 successful
-QPS: 4050.3
+Completed in 0.5s
+Results: 1000/1000 successful
+Estimated QPS: 2000.0
 Cleaning up...
 ```
 
@@ -113,7 +113,7 @@ inference-endpoint -v benchmark online \
   --endpoint http://localhost:8765 \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 100 \
+  --target-qps 100 \
   --report-path online_benchmark_report
 ```
 
@@ -123,13 +123,14 @@ inference-endpoint -v benchmark online \
 Loading: dummy_1k.pkl
 Loaded 1000 samples
 Mode: TestMode.PERF, QPS: 100.0, Responses: False
-Min Duration: 10.0s, Expected samples: 1100
+Streaming: enabled (auto, online mode)
+Min Duration: 0.0s, Expected samples: 1000
 Scheduler: PoissonDistributionScheduler (pattern: poisson)
 Connecting: http://localhost:8765
 Running...
-Completed in 10.7s
-Results: 1100/1100 successful
-QPS: 102.8
+Completed in 10.0s
+Results: 1000/1000 successful
+Estimated QPS: 100.0
 Cleaning up...
 ```
 
@@ -148,8 +149,8 @@ inference-endpoint validate --config offline_template.yaml
 # Test with existing dataset
 inference-endpoint benchmark offline \
   --endpoint http://localhost:8765 \
+  --model Qwen/Qwen3-8B \
   --dataset tests/datasets/ds_samples.pkl \
-  --duration 5 \
   -v
 ```
 
@@ -278,7 +279,6 @@ inference-endpoint benchmark offline \
   --endpoint http://localhost:8765 \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 1000 \
   --report-path offline_report
 
 # Online (Poisson distribution)
@@ -286,25 +286,46 @@ inference-endpoint benchmark online \
   --endpoint http://localhost:8765 \
   --model Qwen/Qwen3-8B \
   --dataset tests/datasets/dummy_1k.pkl \
-  --qps 500 \
+  --target-qps 500 \
   --report-path online_report
+
+# With explicit sample count
+inference-endpoint benchmark offline \
+  --endpoint http://localhost:8765 \
+  --model Qwen/Qwen3-8B \
+  --dataset tests/datasets/dummy_1k.pkl \
+  --num-samples 500
+
+# Force streaming on for offline mode (to test TTFT metrics)
+inference-endpoint benchmark offline \
+  --endpoint http://localhost:8765 \
+  --model Qwen/Qwen3-8B \
+  --dataset tests/datasets/dummy_1k.pkl \
+  --streaming on
 ```
 
 ## Tips
 
-- Use `-v` for INFO logging (default), `-vv` for DEBUG
-- Echo server mirrors back the prompt as the response
-- Perfect for testing CLI without real LLM endpoint
-- Fast responses (no actual inference)
-- Press `Ctrl+C` to gracefully interrupt benchmarks
-- Probe shows progress indicators for large request counts
-- Default test dataset: `tests/datasets/dummy_1k.pkl` (1000 samples, ~133 KB)
+**Key Requirements:**
+
 - Model name is **required** for all benchmark and probe commands
-- Default duration: 10 seconds (quick testing)
-- Default max_concurrency: -1 (unlimited)
-- Dataset format auto-inferred from file extension (pkl, hf directory)
-- CLI and YAML modes are separate (no mixing allowed)
-- Use `--report-path` to generate detailed metrics reports with TTFT, TPOT, and token-based analysis
-- Model name is used to automatically load tokenizer for token-based metrics
-- Set `HF_TOKEN` environment variable for non-public models: `export HF_TOKEN=your_token`
-- Public models like `Qwen/Qwen3-8B` don't require HF_TOKEN
+- Online mode requires `--target-qps` (poisson) or `--concurrency` (concurrency pattern)
+- Set `HF_TOKEN` environment variable for non-public models (public models like Qwen/Qwen3-8B don't need it)
+
+**Sample Count Control:**
+
+- Sample priority: `--num-samples` > dataset size (duration=0) > calculated (target_qps × duration)
+- Default duration: 0 (runs until dataset exhausted or max_duration reached)
+
+**Testing & Debugging:**
+
+- Use `-v` for INFO logging, `-vv` for DEBUG
+- Echo server mirrors prompts back - perfect for quick testing without real inference
+- Press `Ctrl+C` to gracefully interrupt benchmarks
+- Default test dataset: `tests/datasets/dummy_1k.pkl` (1000 samples, ~133 KB)
+
+**Advanced:**
+
+- Streaming: auto (default), on, or off - auto enables for online, disables for offline
+- Use `--report-path` for detailed metrics reports with TTFT, TPOT, and token analysis
+- Dataset format auto-inferred from file extension
