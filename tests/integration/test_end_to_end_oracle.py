@@ -15,6 +15,7 @@
 
 import logging
 import random
+from urllib.parse import urljoin
 
 import pytest
 from inference_endpoint import metrics
@@ -44,7 +45,7 @@ from tests.test_helpers import get_test_socket_path
 class DeepSeekR1SampleIssuer(HttpClientSampleIssuer):
     def __init__(self, tmp_path: str, url: str):
         self.http_config = HTTPClientConfig(
-            endpoint_url=f"{url}/v1/chat/completions",
+            endpoint_url=urljoin(url, "/v1/chat/completions"),
             num_workers=16,
             max_concurrency=10,
         )

@@ -26,6 +26,7 @@ import signal
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 
 from transformers import AutoTokenizer
 from transformers.utils import logging as transformers_logging
@@ -519,7 +520,7 @@ def _run_benchmark(
 
     try:
         http_config = HTTPClientConfig(
-            endpoint_url=f"{endpoint}/v1/chat/completions",
+            endpoint_url=urljoin(endpoint, "/v1/chat/completions"),
             num_workers=num_workers,
             max_concurrency=max_concurrency,
         )
@@ -555,6 +556,7 @@ def _run_benchmark(
             stop_sample_issuer_on_test_end=False,
             report_path=report_path,
             tokenizer_override=tokenizer,
+            max_shutdown_timeout_s=args.timeout if args.timeout else None,
         )
 
         # Wait for test end with ability to interrupt
