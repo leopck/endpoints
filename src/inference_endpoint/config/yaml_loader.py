@@ -26,14 +26,7 @@ from pydantic import ValidationError
 
 from .schema import (
     BenchmarkConfig,
-    ClientSettings,
-    EndpointConfig,
-    LoadPattern,
     LoadPatternType,
-    Metrics,
-    ModelParams,
-    RuntimeConfig,
-    Settings,
     TestType,
 )
 
@@ -113,57 +106,3 @@ class ConfigLoader:
             logger.info(
                 "Concurrency-based pattern selected (will maintain fixed concurrent requests)"
             )
-
-    @staticmethod
-    def create_default_config(test_type: TestType) -> BenchmarkConfig:
-        """Create default BenchmarkConfig for testing.
-
-        Args:
-            test_type: TestType enum (OFFLINE or ONLINE)
-
-        Returns:
-            Default BenchmarkConfig (immutable Pydantic model)
-
-        Raises:
-            ConfigError: If test_type is unsupported
-
-        Note: This is primarily for testing. Production code uses _build_config_from_cli().
-        """
-        if test_type == TestType.OFFLINE:
-            return BenchmarkConfig(
-                name="default_offline",
-                version="1.0",
-                type=TestType.OFFLINE,
-                datasets=[],
-                settings=Settings(
-                    load_pattern=LoadPattern(
-                        type=LoadPatternType.MAX_THROUGHPUT, qps=10.0
-                    ),
-                    runtime=RuntimeConfig(
-                        min_duration_ms=600000, max_duration_ms=1800000, random_seed=42
-                    ),
-                    client=ClientSettings(workers=4, max_concurrency=32),
-                ),
-                model_params=ModelParams(temperature=0.7, max_new_tokens=1024),
-                metrics=Metrics(),
-                endpoint_config=EndpointConfig(),
-            )
-        elif test_type == TestType.ONLINE:
-            return BenchmarkConfig(
-                name="default_online",
-                version="1.0",
-                type=TestType.ONLINE,
-                datasets=[],
-                settings=Settings(
-                    load_pattern=LoadPattern(type=LoadPatternType.POISSON, qps=10.0),
-                    runtime=RuntimeConfig(
-                        min_duration_ms=600000, max_duration_ms=1800000, random_seed=42
-                    ),
-                    client=ClientSettings(workers=4, max_concurrency=32),
-                ),
-                model_params=ModelParams(temperature=0.7, max_new_tokens=1024),
-                metrics=Metrics(),
-                endpoint_config=EndpointConfig(),
-            )
-        else:
-            raise ConfigError(f"Unknown test type: {test_type}")

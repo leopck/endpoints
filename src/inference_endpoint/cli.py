@@ -50,7 +50,19 @@ logger = logging.getLogger(__name__)
 
 
 def create_parser() -> argparse.ArgumentParser:
-    """Create the command line argument parser."""
+    """Create the command line argument parser with all subcommands and options.
+
+    Creates the main argument parser with the following command structure:
+    - benchmark: offline, online, from-config (performance testing)
+    - eval: accuracy evaluation (stub)
+    - probe: endpoint health checking
+    - info: system information
+    - validate: YAML config validation
+    - init: generate config templates
+
+    Returns:
+        argparse.ArgumentParser: Configured parser with all commands and options.
+    """
     parser = argparse.ArgumentParser(
         description="Inference Endpoint Benchmarking Tool",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -159,7 +171,14 @@ def create_parser() -> argparse.ArgumentParser:
 
 
 def _add_shared_benchmark_args(parser):
-    """Add shared benchmark arguments (used by both offline and online)."""
+    """Add shared benchmark arguments used by both offline and online modes.
+
+    Adds common benchmark configuration arguments. See individual argument
+    help strings for descriptions.
+
+    Args:
+        parser: The argument parser to add arguments to.
+    """
     parser.add_argument(
         "--endpoint", "-e", type=str, required=True, help="Endpoint URL"
     )
@@ -185,10 +204,23 @@ def _add_shared_benchmark_args(parser):
     )
     parser.add_argument("--min-tokens", type=int, help="Min output tokens")
     parser.add_argument("--max-tokens", type=int, help="Max output tokens")
+    parser.add_argument(
+        "--report-path", type=Path, help="Path to save detailed benchmark report"
+    )
 
 
 def _add_online_specific_args(parser):
-    """Add online-specific arguments."""
+    """Add online-specific arguments.
+
+    Currently adds:
+    - load-pattern: Scheduler type (poisson, etc.)
+
+    Load pattern choices are dynamically derived from registered Scheduler
+    implementations to maintain a single source of truth.
+
+    Args:
+        parser: The argument parser to add arguments to.
+    """
     # Derive choices from Scheduler._IMPL_MAP (single source of truth via __init_subclass__)
     available_patterns = [p.value for p in Scheduler._IMPL_MAP.keys()]
     parser.add_argument(
@@ -199,18 +231,40 @@ def _add_online_specific_args(parser):
 
 
 def _add_auxiliary_args(parser):
-    """Add auxiliary arguments (output-related, no benchmark impact)."""
-    parser.add_argument("--output", "-o", type=Path, help="Results output file")
-    parser.add_argument(
-        "--report-path", type=Path, help="Path to save detailed benchmark report"
-    )
+    """Add auxiliary arguments that don't affect benchmark execution.
+
+    These arguments control non-benchmark output:
+    - output: Path to save additional output data (not benchmark report)
+
+    Args:
+        parser: The argument parser to add arguments to.
+    """
+    parser.add_argument("--output", "-o", type=Path, help="Non-benchmark output file")
 
 
 # Argparse structure enforces arg validity - no manual validation needed
 
 
 async def main() -> None:
-    """Main CLI entry point."""
+    """Main CLI entry point.
+
+    This is the async entry point for the CLI. It:
+    1. Parses command line arguments
+    2. Sets up logging based on verbosity
+    3. Dispatches to appropriate command handlers
+    4. Handles exceptions and converts them to exit codes
+    5. Provides user-friendly error messages
+
+    Exception handling strategy:
+    - InputValidationError: User input errors (exit 1, no stack trace)
+    - SetupError: Setup/initialization errors (exit 1, stack trace if -vv)
+    - ExecutionError: Runtime errors (exit 1, stack trace if -vv)
+    - KeyboardInterrupt: Graceful shutdown (exit 0)
+    - Other exceptions: Unexpected errors (exit 1, always show stack trace)
+
+    Raises:
+        SystemExit: Always exits with appropriate code after command execution.
+    """
     parser = create_parser()
     args = parser.parse_args()
 

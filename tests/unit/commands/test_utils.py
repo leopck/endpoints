@@ -47,7 +47,7 @@ class TestRunInfoCommand:
 
     @pytest.mark.asyncio
     async def test_info_basic(self, caplog):
-        """Test basic info command shows version and status."""
+        """Test basic info command shows version and system information."""
         args = MagicMock()
         args.verbose = 0
 
@@ -57,11 +57,12 @@ class TestRunInfoCommand:
         log_text = caplog.text
         # Use single source of truth for version
         assert __version__ in log_text
-        assert "Operational" in log_text
+        assert "System Information" in log_text
+        assert "Python Environment" in log_text
 
     @pytest.mark.asyncio
     async def test_info_verbose(self, caplog):
-        """Test info command with verbose mode shows additional details."""
+        """Test info command shows detailed system information."""
         args = MagicMock()
         args.verbose = 1
 
@@ -71,8 +72,10 @@ class TestRunInfoCommand:
         log_text = caplog.text
         # Should show version
         assert __version__ in log_text
-        # Should show architecture/capabilities in verbose mode
-        assert "Architecture:" in log_text or "Capabilities:" in log_text
+        # Should show system details
+        assert "Operating System:" in log_text
+        assert "CPU:" in log_text
+        assert "Memory:" in log_text
 
 
 class TestRunValidateCommand:

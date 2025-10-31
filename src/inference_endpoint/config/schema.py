@@ -92,6 +92,16 @@ class TestType(str, Enum):
     SUBMISSION = "submission"
 
 
+# Mapping from template type strings to TestType enums
+# Single source of truth for template type conversion
+TEMPLATE_TYPE_MAP = {
+    "offline": TestType.OFFLINE,
+    "online": TestType.ONLINE,
+    "eval": TestType.EVAL,
+    "submission": TestType.SUBMISSION,
+}
+
+
 class OSLDistribution(BaseModel):
     """Output Sequence Length distribution configuration.
 
@@ -489,3 +499,77 @@ class BenchmarkConfig(BaseModel):
 
         if benchmark_mode:
             self.validate_load_pattern(benchmark_mode)
+
+    @classmethod
+    def create_default_config(cls, test_type: TestType) -> BenchmarkConfig:
+        """Create default BenchmarkConfig for a given test type.
+
+        This is the source of truth for default configurations. Used by:
+        - Template generation (init command)
+        - Testing and examples
+        - CLI fallbacks
+
+        Args:
+            test_type: TestType enum (OFFLINE, ONLINE, EVAL, or SUBMISSION)
+
+        Returns:
+            Default BenchmarkConfig instance
+
+        Raises:
+            NotImplementedError: If test_type is EVAL or SUBMISSION (not yet implemented)
+            ValueError: If test_type is invalid
+        """
+        if test_type == TestType.OFFLINE:
+            return cls(
+                name="default_offline",
+                version="1.0",
+                type=TestType.OFFLINE,
+                datasets=[],
+                settings=Settings(
+                    load_pattern=LoadPattern(
+                        type=LoadPatternType.MAX_THROUGHPUT, qps=10.0
+                    ),
+                    runtime=RuntimeConfig(
+                        min_duration_ms=600000,
+                        max_duration_ms=1800000,
+                        scheduler_random_seed=42,
+                        dataloader_random_seed=42,
+                    ),
+                    client=ClientSettings(workers=4, max_concurrency=-1),
+                ),
+                model_params=ModelParams(temperature=0.7, max_new_tokens=1024),
+                metrics=Metrics(),
+                endpoint_config=EndpointConfig(),
+            )
+        elif test_type == TestType.ONLINE:
+            return cls(
+                name="default_online",
+                version="1.0",
+                type=TestType.ONLINE,
+                datasets=[],
+                settings=Settings(
+                    load_pattern=LoadPattern(type=LoadPatternType.POISSON, qps=10.0),
+                    runtime=RuntimeConfig(
+                        min_duration_ms=600000,
+                        max_duration_ms=1800000,
+                        scheduler_random_seed=42,
+                        dataloader_random_seed=42,
+                    ),
+                    client=ClientSettings(workers=4, max_concurrency=-1),
+                ),
+                model_params=ModelParams(temperature=0.7, max_new_tokens=1024),
+                metrics=Metrics(),
+                endpoint_config=EndpointConfig(),
+            )
+        elif test_type == TestType.EVAL:
+            raise NotImplementedError(
+                "Default EVAL config not yet implemented. "
+                "EVAL templates will be added in future release."
+            )
+        elif test_type == TestType.SUBMISSION:
+            raise NotImplementedError(
+                "Default SUBMISSION config not yet implemented. "
+                "SUBMISSION templates will be added in future release."
+            )
+        else:
+            raise ValueError(f"Unknown test type: {test_type}")

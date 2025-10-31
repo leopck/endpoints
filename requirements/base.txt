@@ -4,6 +4,9 @@
 # Core Python dependencies
 typing-extensions>=4.0.0
 
+# System utilities
+psutil==6.1.1
+
 # Note: asyncio is part of Python 3.11+ standard library
 # Additional dependencies will be added as components are implemented
 aiohttp==3.12.15

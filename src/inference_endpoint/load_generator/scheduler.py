@@ -22,13 +22,31 @@ from ..config.schema import LoadPatternType
 
 
 class SampleOrder(ABC):
+    """Abstract base class for sample ordering strategies.
+
+    SampleOrder determines which dataset sample to use next when issuing queries.
+    Different strategies enable different testing scenarios:
+
+    The SampleOrder is an iterator that yields sample indices from the dataset.
+    It handles wrapping around when total_samples_to_issue > dataset size.
+
+    Attributes:
+        total_samples_to_issue: Total number of samples to issue during benchmark.
+        n_samples_in_dataset: Number of unique samples available in dataset.
+        rng: Random number generator for reproducible randomness.
+        _issued_samples: Counter of samples issued so far.
+    """
+
     def __init__(
         self, total_samples_to_issue: int, n_samples_in_dataset: int, rng=random
     ):
-        """
+        """Initialize sample ordering strategy.
+
         Args:
-            total_samples_to_issue (int): The total number of samples to issue.
-            max_sample_index (int): The maximum sample index.
+            total_samples_to_issue: The total number of samples to issue.
+                                   May be larger than n_samples_in_dataset.
+            n_samples_in_dataset: The number of unique samples in the dataset.
+            rng: Random number generator (for reproducibility via seeding).
         """
         self.total_samples_to_issue = total_samples_to_issue
         self.n_samples_in_dataset = n_samples_in_dataset
@@ -37,19 +55,58 @@ class SampleOrder(ABC):
         self._issued_samples = 0
 
     def __iter__(self) -> Iterator[int]:
+        """Iterate over sample indices to issue.
+
+        Yields sample indices until total_samples_to_issue is reached.
+
+        Yields:
+            Sample index (0 to n_samples_in_dataset-1).
+        """
         while self._issued_samples < self.total_samples_to_issue:
             yield self.next_sample_index()
             self._issued_samples += 1
 
     @abstractmethod
     def next_sample_index(self) -> int:
+        """Get the next sample index to issue.
+
+        Returns:
+            Sample index (0 to n_samples_in_dataset-1).
+        """
         raise NotImplementedError
 
 
 class WithoutReplacementSampleOrder(SampleOrder):
-    """Sample order where a sample index cannot repeat until all samples in a dataset have been issued."""
+    """Sample ordering without replacement - shuffle dataset, use all samples before repeating.
+
+    This strategy ensures balanced coverage of the dataset:
+    1. Shuffles all dataset indices randomly
+    2. Issues them one by one until exhausted
+    3. Reshuffles and repeats if more samples needed
+
+    Use this for:
+    - Fair benchmarking (all samples used equally)
+    - Avoiding bias from repeated samples
+    - Deterministic results with seed control
+
+    Example with 3-sample dataset, 7 samples to issue:
+    - Shuffle: [2, 0, 1]
+    - Issue: 2, 0, 1 (first pass)
+    - Reshuffle: [1, 2, 0]
+    - Issue: 1, 2, 0, 1 (second pass, partial)
+
+    Attributes:
+        index_order: Current shuffled order of indices.
+        _curr_idx: Position in current shuffle (resets after each complete pass).
+    """
 
     def __init__(self, *args, **kwargs):
+        """Initialize without-replacement sample ordering.
+
+        Args:
+            *args: Forwarded to SampleOrder.__init__.
+            **kwargs: Forwarded to SampleOrder.__init__.
+        """
         super().__init__(*args, **kwargs)
         self.index_order = list(range(self.n_samples_in_dataset))
         self._curr_idx = (
@@ -57,10 +114,16 @@ class WithoutReplacementSampleOrder(SampleOrder):
         )  # Ensure we start at an invalid index to force shuffle
 
     def _reset(self):
+        """Shuffle indices and reset position for next pass."""
         self.rng.shuffle(self.index_order)
         self._curr_idx = 0
 
     def next_sample_index(self) -> int:
+        """Get next sample index from current shuffle, reshuffling if needed.
+
+        Returns:
+            Sample index from dataset.
+        """
         if self._curr_idx >= len(self.index_order):
             self._reset()
         retval = self.index_order[self._curr_idx]
@@ -69,18 +132,57 @@ class WithoutReplacementSampleOrder(SampleOrder):
 
 
 class WithReplacementSampleOrder(SampleOrder):
-    """Sample order where a sample index can repeat, even if the dataset has not been exhausted, i.e. sampling with replacement."""
+    """Sample ordering with replacement - truly random sampling from dataset.
+
+    Each sample is chosen uniformly at random from the entire dataset,
+    independent of previous choices. The same sample can (and will) appear
+    multiple times, even consecutively.
+
+    Use this for:
+    - Stress testing with realistic randomness
+    - Simulating unpredictable user behavior
+    - When dataset coverage balance is not important
+
+    Example with 3-sample dataset, 7 samples to issue:
+    - Might produce: [1, 1, 0, 2, 1, 0, 0]
+    - Note repeated samples even without exhausting dataset
+    """
 
     def __init__(self, *args, **kwargs):
+        """Initialize with-replacement sample ordering.
+
+        Args:
+            *args: Forwarded to SampleOrder.__init__.
+            **kwargs: Forwarded to SampleOrder.__init__.
+        """
         super().__init__(*args, **kwargs)
 
     def next_sample_index(self) -> int:
+        """Get random sample index from dataset.
+
+        Returns:
+            Random sample index (uniform distribution over dataset).
+        """
         return self.rng.randint(0, self.n_samples_in_dataset - 1)
 
 
 def uniform_delay_fn(
     max_delay_ns: int = 0, rng: random.Random = random
 ) -> Callable[[], float]:
+    """Create a uniform delay function for schedulers.
+
+    Returns a function that generates delays uniformly distributed between
+    0 and max_delay_ns. Used for max throughput (max_delay_ns=0) or uniform
+    load distribution.
+
+    Args:
+        max_delay_ns: Maximum delay in nanoseconds. If 0, always returns 0 (no delay).
+        rng: Random number generator for reproducibility.
+
+    Returns:
+        Function that returns delay in nanoseconds (float).
+    """
+
     def _fn():
         if max_delay_ns == 0:
             return 0
@@ -92,6 +194,23 @@ def uniform_delay_fn(
 def poisson_delay_fn(
     expected_queries_per_second: float, rng: random.Random = random
 ) -> Callable[[], float]:
+    """Create a Poisson-distributed delay function for realistic online benchmarking.
+
+    Returns a function that generates delays following an exponential distribution
+    (inter-arrival times of a Poisson process). This models realistic user/client
+    behavior where requests arrive independently at a target rate.
+
+    The exponential distribution has the property that:
+    - Mean inter-arrival time = 1 / expected_qps
+    - Variance = mean^2 (high variability, realistic for network traffic)
+
+    Args:
+        expected_queries_per_second: Target QPS (queries per second).
+        rng: Random number generator for reproducibility.
+
+    Returns:
+        Function that returns delay in nanoseconds (float).
+    """
     queries_per_ns = expected_queries_per_second / 1e9
 
     def _fn():
@@ -103,9 +222,32 @@ def poisson_delay_fn(
 
 
 class Scheduler:
-    """Schedulers are responsible for building queries and determining when they should be issued to the SUT.
+    """Base class for query scheduling strategies that control benchmark load patterns.
 
-    Subclasses auto-register via __init_subclass__ by specifying load_pattern parameter.
+    Schedulers determine:
+    1. Sample ordering (which sample to use next)
+    2. Timing delays (when to issue the next query)
+
+    They combine a SampleOrder (what to issue) with a delay function (when to issue)
+    to produce a stream of (sample_index, delay_ns) pairs.
+
+    Scheduler implementations auto-register via __init_subclass__ by specifying
+    the load_pattern parameter. This enables runtime selection of schedulers:
+
+        scheduler_cls = Scheduler.get_implementation(LoadPatternType.POISSON)
+        scheduler = scheduler_cls(runtime_settings, sample_order_cls)
+
+    Built-in schedulers:
+    - MaxThroughputScheduler: Issues all queries immediately (offline mode)
+    - PoissonDistributionScheduler: Poisson-distributed delays (online mode)
+
+    Attributes:
+        _IMPL_MAP: Class-level registry mapping LoadPatternType to Scheduler classes.
+        runtime_settings: Runtime configuration (QPS, duration, seeds, etc.).
+        total_samples_to_issue: Total queries to issue during benchmark.
+        n_unique_samples: Number of unique samples in dataset.
+        sample_order: Iterator over sample indices to use.
+        delay_fn: Function returning delay before next query (nanoseconds).
     """
 
     # Registry for scheduler implementations (populated via __init_subclass__)
@@ -116,6 +258,12 @@ class Scheduler:
         runtime_settings: RuntimeSettings,
         sample_order_cls: type[SampleOrder],
     ):
+        """Initialize scheduler with runtime settings and sample ordering strategy.
+
+        Args:
+            runtime_settings: Runtime configuration containing QPS, duration, seeds.
+            sample_order_cls: SampleOrder class to use for sample selection.
+        """
         self.runtime_settings = runtime_settings
 
         self.total_samples_to_issue = runtime_settings.total_samples_to_issue()
@@ -130,6 +278,13 @@ class Scheduler:
         self.delay_fn = None  # Subclasses must set this
 
     def __iter__(self):
+        """Iterate over (sample_index, delay_ns) pairs.
+
+        Yields:
+            Tuple of (sample_index, delay_ns):
+            - sample_index: Index of sample to issue next
+            - delay_ns: Nanoseconds to wait before issuing
+        """
         for s_idx in self.sample_order:
             yield s_idx, self.delay_fn()
 
