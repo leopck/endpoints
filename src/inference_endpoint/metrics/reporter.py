@@ -20,6 +20,7 @@ import functools
 import importlib
 import logging
 import numbers
+import os
 import sqlite3
 from collections import defaultdict
 from collections.abc import Callable, Iterable
@@ -33,9 +34,19 @@ from ..load_generator.events import SampleEvent, SessionEvent
 from ..profiling import profile
 
 if TYPE_CHECKING:
-    import os
-
     from transformers import Tokenizer
+
+
+def get_tpot_reporting_mode() -> str:
+    # TODO: Refactor into an option
+    tpot_reporting_mode = os.environ.get(
+        "TPOT_REPORTING_MODE", "request_weighted"
+    ).lower()
+    if tpot_reporting_mode not in ["request_weighted", "token_weighted"]:
+        raise ValueError(
+            f"Invalid TPOT reporting mode: {tpot_reporting_mode}, must be one of 'request_weighted' or 'token_weighted'"
+        )
+    return tpot_reporting_mode
 
 
 class SampleUUIDNotFoundError(Exception):
@@ -60,21 +71,53 @@ class RollupQueryTable:
     """
 
     metric_type: str
+    """A string describing the metric being computed and rolled up."""
+
     from_query: str
+    """If provided, the query that was used to generate the table."""
+
     rows: list[tuple[Any, ...]]
+    """The rows of the table, each a tuple of values."""
+
+    # TODO: verify the datatype hint is correct
+    repeats: list[float] | None = None
+    """If provided, this means the rows are condensed by consecutive duplicates. `repeats`
+    represents the number of times each row should be repeated."""
+
     _sorted_vals: np.ndarray = dataclasses.field(init=False)
     _by_uuid: dict[str, list[int]] = dataclasses.field(init=False)
 
     def __post_init__(self):
+        if self.repeats is not None:
+            if len(self.repeats) != len(self.rows):
+                raise IndexError(
+                    f"Length of repeats {len(self.repeats)} does not match length of rows {len(self.rows)}"
+                )
+            if not isinstance(self.repeats, np.ndarray):
+                object.__setattr__(
+                    self, "repeats", np.array(self.repeats, dtype=np.int64)
+                )
+            else:
+                object.__setattr__(self, "repeats", self.repeats.astype(np.int64))
+
         # Metrics are always differences between integer nanosecond timestamps
         # Some might be 32-bit and 64 bit, so we force np.int64 here
-        sorted_vals = np.array([row[1] for row in self.rows], dtype=np.int64)
-        sorted_vals.sort()
+        if self.repeats is None:
+            sorted_vals = np.array([row[1] for row in self.rows], dtype=np.int64)
+            sorted_vals.sort()
+        else:
+            arr = np.array(
+                [(self.rows[i][1], self.repeats[i]) for i in range(len(self.rows))],
+                dtype=np.int64,
+            )
+            sorted_vals = arr[arr[:, 0].argsort()]
         object.__setattr__(self, "_sorted_vals", sorted_vals)
 
         # Pre-compute a dictionary to map sample UUIDs to values
         by_uuid = defaultdict(list)
-        for s_uuid, value in self.rows:
+        for i, (s_uuid, value) in enumerate(self.rows):
+            if self.repeats is not None:
+                value = (value, self.repeats[i])
             by_uuid[s_uuid].append(value)
         object.__setattr__(self, "_by_uuid", by_uuid)
 
@@ -84,12 +127,31 @@ class RollupQueryTable:
         Returns:
             MetricRow: The MetricRow at the given index / row number in the table.
         """
-        if index >= len(self.rows):
+        length = len(self)
+        if index >= length:
             raise IndexError(f"Index {index} out of range for {self.metric_type}")
-        return MetricRow(self.rows[index][0], self.metric_type, self.rows[index][1])
+
+        while index < 0:
+            index += length
+
+        if self.repeats is None:
+            return MetricRow(self.rows[index][0], self.metric_type, self.rows[index][1])
+        else:
+            passed = 0
+            for i, repeat in enumerate(self.repeats):
+                next_row_start = passed + repeat
+                if index < next_row_start:
+                    return MetricRow(self.rows[i][0], self.metric_type, self.rows[i][1])
+                else:
+                    passed = next_row_start
+            # This should never happen if our index validation is correct
+            raise IndexError(f"Index {index} out of range for {self.metric_type}")
 
     def __len__(self) -> int:
-        return len(self.rows)
+        if self.repeats is None:
+            return len(self.rows)
+        else:
+            return int(self.repeats.sum())
 
     def filter_uuid(self, uuid: str, only_first: bool = False) -> Any:
         """Returns the values for the given sample UUID.
@@ -103,6 +165,17 @@ class RollupQueryTable:
             case None is returned.
         """
         values = self._by_uuid[uuid]
+
+        # Expand values if there are counts
+        if self.repeats is not None:
+            if only_first:  # If we only want the first value, we don't need to expand
+                return values[0][0]
+
+            expanded_values = []
+            for value, count in values:
+                expanded_values.extend([value] * count)
+            values = expanded_values
+
         if only_first:
             if len(values) == 0:
                 return None
@@ -134,13 +207,32 @@ class RollupQueryTable:
         else:
             # Note values are sorted, we can avoid using np.max and np.min
             # Need to convert to default Python types since orjson doesn't support numpy dtypes
+            if self.repeats is None:
+                values = self._sorted_vals
+                counts = np.ones(self._sorted_vals.shape, dtype=self._sorted_vals.dtype)
+            else:
+                values = self._sorted_vals[:, 0]
+                counts = self._sorted_vals[:, 1]
+
+            total = int((values * counts).sum())
+            minimum = int(values[0])
+            maximum = int(values[-1])
+            median = self.percentile(50)
+            avg = float(np.average(values, weights=counts))
+            if self.repeats is None:
+                std_dev = float(np.std(values))
+            else:
+                deviations_squared = (values - avg) ** 2
+                std_dev = float(
+                    np.sqrt(np.sum(deviations_squared * counts) / counts.sum())
+                )
             summary = {
-                "total": int(self._sorted_vals.sum()),
-                "min": int(self._sorted_vals[0]),
-                "max": int(self._sorted_vals[-1]),
-                "median": float(np.median(self._sorted_vals)),
-                "avg": float(np.mean(self._sorted_vals)),
-                "std_dev": float(np.std(self._sorted_vals)),
+                "total": total,
+                "min": minimum,
+                "max": maximum,
+                "median": median,
+                "avg": avg,
+                "std_dev": std_dev,
                 "percentiles": {
                     str(p): v for p, v in self.percentile(percentiles).items()
                 },
@@ -174,7 +266,17 @@ class RollupQueryTable:
             A tuple of lists, the first list is the buckets, the second list is the counts.
             If convert_to_native_types is False, returns a numpy arrays instead.
         """
-        counts, bounds = np.histogram(self._sorted_vals, bins=n_buckets)
+        if self.repeats is None:
+            values = self._sorted_vals
+            repeats = None
+        else:
+            values = self._sorted_vals[:, 0]
+            repeats = self._sorted_vals[:, 1]
+
+        # Derive bins from values
+        bounds = np.histogram_bin_edges(values, bins=n_buckets)
+
+        counts, _ = np.histogram(values, bins=bounds, weights=repeats)
         if not convert_to_native_types:
             buckets = np.zeros((len(bounds) - 1, 2), dtype=bounds.dtype)
             buckets[:, 0] = bounds[:-1]
@@ -218,12 +320,24 @@ class RollupQueryTable:
                     f"percentile must be an iterable of numbers, got Iterable[{type(percentile[0])}]"
                 )
 
-        perc_values = np.percentile(
-            self._sorted_vals,
-            percentile,
-            overwrite_input=False,
-            method=interpolate_strategy,
-        )
+        if self.repeats is None:
+            perc_values = np.percentile(
+                self._sorted_vals,
+                percentile,
+                overwrite_input=False,
+                method=interpolate_strategy,
+            )
+        else:
+            values = self._sorted_vals[:, 0]
+            counts = self._sorted_vals[:, 1]
+            perc_values = np.percentile(
+                values,
+                percentile,
+                weights=counts,
+                overwrite_input=False,
+                method="inverted_cdf",
+            )
+
         if isinstance(percentile, numbers.Number):
             return float(perc_values)
         else:
@@ -369,9 +483,10 @@ class Report:
                 "WARNING: Non-streaming-based Issuer used. TTFT metrics cannot be calculated"
             )
 
+        tpot_reporting_mode = get_tpot_reporting_mode()
         for section_name, metric_dict, unit, scale_factor in [
             ("TTFT", self.ttft, "ms", 1e-6),
-            ("TPOT", self.tpot, "ms", 1e-6),
+            (f"TPOT ({tpot_reporting_mode.capitalize()})", self.tpot, "ms", 1e-6),
             ("Latency", self.latency, "ms", 1e-6),
             ("Output sequence lengths", self.output_sequence_lengths, "tokens", 1.0),
         ]:
@@ -578,6 +693,7 @@ class MetricsReporter:
         tokenizer: Tokenizer,
         ttft_rollup: RollupQueryTable | None = None,
         sample_latency_rollup: RollupQueryTable | None = None,
+        condense_table: bool = True,
     ) -> RollupQueryTable | None:
         """Derives the TPOT metric from the text outputs, ttft, and sample latencies.
 
@@ -591,6 +707,14 @@ class MetricsReporter:
         the client does not have direct visibility into the endpoint / server-under-test, we have to estimate it,
         assuming that in an ideal scenario, each token outputed in the output text took the same amount of
         time.
+
+        Args:
+            tokenizer: A Tokenizer object from HuggingFace, used to calculate the number of tokens in a sequence
+            ttft_rollup: Precomputed TTFT RollupQueryTable. If not provided, will be derived via self.derive_TTFT()
+            sample_latency_rollup: Precomputed sample latency RollupQueryTable. If not provided, will be derived via self.derive_sample_latency()
+            condense_table: Whether to condense the table by not storing individual token times, but rather just keeping the average time per token
+                            and number of tokens per sample UUID. This is only supported if the environment variable `TPOT_REPORTING_MODE` is set to
+                            "token_weighted". If it is set to "request_weighted", each sample only contributes one entry to the table. (Default: True)
         """
         if not self.outputs_path.exists():
             return None
@@ -600,7 +724,13 @@ class MetricsReporter:
         if sample_latency_rollup is None:
             sample_latency_rollup = self.derive_sample_latency()
 
+        tpot_reporting_mode = get_tpot_reporting_mode()
         rows = []
+        if condense_table and tpot_reporting_mode == "token_weighted":
+            repeats = []
+        else:
+            repeats = None
+
         with self.outputs_path.open("r") as outputs:
             for line in outputs:
                 data = orjson.loads(line)
@@ -626,9 +756,19 @@ class MetricsReporter:
 
                 avg_tpot = (latency - ttft) / n_non_first_tokens
 
-                # Entries are tuples, and are such immutable. We can use list multiplication for performance
-                rows.extend([(sample_uuid, avg_tpot)] * n_non_first_tokens)
-        return RollupQueryTable("tpot", None, rows)
+                if condense_table:
+                    rows.append((sample_uuid, avg_tpot))
+                    if tpot_reporting_mode == "token_weighted":
+                        repeats.append(n_non_first_tokens)
+                else:
+                    # Entries are tuples, and are such immutable. We can use list multiplication for performance
+                    repeat_fac = (
+                        1
+                        if tpot_reporting_mode == "request_weighted"
+                        else n_non_first_tokens
+                    )
+                    rows.extend([(sample_uuid, avg_tpot)] * repeat_fac)
+        return RollupQueryTable("tpot", None, rows, repeats=repeats)
 
     def close(self):
         if self.is_closed:
