@@ -163,7 +163,7 @@ class PickleReader(DataLoader):
         if parser is None:
             # TODO : remove this default implementation
             def extract_text_input(row):
-                return row.text_input
+                return {"prompt": row["text_input"]} | (self.metadata or {})
 
             self.parser = extract_text_input
 
@@ -187,12 +187,16 @@ class PickleReader(DataLoader):
             self.logger.debug(
                 f"Loading data from {self.file_path} with columns: {self.data.columns}"
             )
-            assert "text_input" in self.data.columns
-            self.text_inputs = [None] * len(self.data)
-            # this preloads the  data in source
-            # for idx, data in self.data.iterrows():
-            #     # idx is not passed to the parser since it should _not_ be used in the parser
-            #     self.text_inputs[idx] = self.parser(data)
+
+            self.text_inputs = []
+            # this preloads the data in source
+            # convert the dataframe to list of dictionaries
+            for data in self.data.to_dict(orient="records"):
+                # idx is not passed to the parser since it should _not_ be used in the parser
+                # note that while we are appending, which is slower, the data may not be sequential and may
+                # have gaps
+                self.text_inputs.append(self.parser(data))
+            self.text_inputs = np.ascontiguousarray(self.text_inputs)
         self.loaded = True
 
     def num_samples(self):
@@ -231,8 +235,8 @@ class PickleReader(DataLoader):
         Loads a sample from the data.
         """
         assert self.loaded, "Data is not loaded. Call load() to load the data."
-        x = self.parser(self.data.iloc[index])
-        self.logger.debug(f"Loaded sample from pickle file at {index} with keys: {x}")
+        x = self.text_inputs[index]
+        self.logger.debug(f"Loaded sample from pickle file at {index} with result: {x}")
         return x
 
     def get_column_names(self):
@@ -270,9 +274,12 @@ class HFDataLoader(DataLoader):
         else:
             # huggingface uses a different method to load local arrow datasets
             self.data = load_from_disk(self.dataset_name)
+        self.text_inputs = []  # reset the text inputs
+        for d in self.data[self.split]:
+            self.text_inputs.append(self.parser(d))
 
     def load_sample(self, index: int) -> Any:
-        return self.parser(self.data[self.split][index])
+        return self.text_inputs[index]
 
     def num_samples(self):
         """
