@@ -603,6 +603,21 @@ class MetricsReporter:
             "ttft",
         )
 
+    def dump_all_to_csv(self, csv_path: Path):
+        logging.debug(f"Dumping to CSV at {csv_path}")
+        with csv_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            query = """
+            SELECT
+                sample_uuid,
+                timestamp_ns,
+                event_type
+            FROM events
+            """
+            rows = self.cur_.execute(query).fetchall()
+            writer.writerows(rows)
+            logging.debug(f"Written rows {len(rows)} to {csv_path}")
+
     def derive_duration(self) -> float:
         """Calculates the total test duration as the difference between TEST_ENDED and TEST_STARTED events.
 
