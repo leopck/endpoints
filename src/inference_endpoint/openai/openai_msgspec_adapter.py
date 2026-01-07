@@ -86,15 +86,25 @@ class OpenAIMsgspecAdapter(HttpRequestAdapter):
         if "prompt" not in query.data:
             raise ValueError("prompt not found in query.data")
 
+        messages = [
+            ChatMessage(
+                role="user",
+                content=query.data["prompt"],
+                name=query.data.get("name"),
+            ),
+        ]
+        if "system" in query.data:
+            messages.insert(
+                0,
+                ChatMessage(
+                    role="system",
+                    content=query.data["system"],
+                ),
+            )
+
         return ChatCompletionRequest(
             model=query.data.get("model", "no-model-name"),
-            messages=[
-                ChatMessage(
-                    role="user",
-                    content=query.data["prompt"],
-                    name=query.data.get("name"),
-                ),
-            ],
+            messages=messages,
             stream=query.data.get("stream"),
             max_completion_tokens=query.data.get("max_completion_tokens"),
             temperature=query.data.get("temperature"),
