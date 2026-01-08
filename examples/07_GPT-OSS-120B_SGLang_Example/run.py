@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -30,6 +30,8 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import shutil
+import tempfile
 from pathlib import Path
 
 from inference_endpoint import metrics
@@ -184,10 +186,10 @@ def run_benchmark_session(
 def run_main(args):
     """Main function to run the example."""
     # Setup paths
-    tmp_dir = Path("/tmp/sglang_manual_example")
-    tmp_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = Path(tempfile.mkdtemp(prefix="sglang_manual_example_"))
     num_repeats = args.num_repeats
 
+    client = None
     try:
         # Always generate GPQA diamond dataset
         logging.info("Generating GPQA diamond dataset...")
@@ -212,8 +214,9 @@ def run_main(args):
 
     finally:
         # Cleanup
-        if "client" in locals():
+        if client is not None:
             client.shutdown()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def main():
