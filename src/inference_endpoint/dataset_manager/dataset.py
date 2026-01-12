@@ -147,7 +147,8 @@ class ParquetLoader(DatafileLoader, format=DatasetFormat.PARQUET):
         self.parquet_path = Path(file_path)
 
     def read(self) -> None:
-        self.dataframe = pd.read_parquet(self.parquet_path)
+        # Note we need the dtype_backend="pyarrow" to avoid issues with numpy arrays in the dataframe
+        self.dataframe = pd.read_parquet(self.parquet_path, dtype_backend="pyarrow")
 
 
 class HuggingFaceLoader(DatafileLoader, format=DatasetFormat.HF):
@@ -425,7 +426,11 @@ class Dataset:
         df = self.dataframe
         if self.transforms is not None:
             df = apply_transforms(df, self.transforms)
-        self.data = np.ascontiguousarray(df.to_dict(orient="records"))
+        # Convert numpy arrays to lists because msgspec does not support numpy arrays
+        for col in df.columns:
+            if isinstance(df[col].iloc[0], np.ndarray):
+                df[col] = df[col].map(np.ndarray.tolist)
+        self.data = df.to_dict(orient="records")
 
     def load_sample(self, index: int) -> Any:
         """Load a single sample from the dataset by index.

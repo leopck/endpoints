@@ -194,11 +194,29 @@ class Dataset(BaseModel):
 
     name: str
     type: DatasetType
-    path: str
+    path: str | None = None
     format: str | None = None
     samples: int | None = None
     eval_method: EvalMethod | None = None
     parser: dict | None = None
+    accuracy_config: AccuracyConfig | None = None
+
+
+class AccuracyConfig(BaseModel):
+    """Accuracy configuration.
+    The eval_method is the method to use to evaluate the accuracy of the model. Currently only "pass_at_1" is supported.
+    The ground_truth is the column in the dataset that contains the ground truth. Defaults to "ground_truth" if not specified.
+    The extractor is the extractor to use to extract the ground truth from the output. Currently "boxed_math_extractor" and "abcd_extractor" are supported.
+    Example:
+        accuracy_config:
+          eval_method: "pass_at_1"
+          ground_truth: "answer"
+          extractor: "boxed_math_extractor"
+    """
+
+    eval_method: str | None = None
+    ground_truth: str = "ground_truth"
+    extractor: str | None = None
 
 
 class RuntimeConfig(BaseModel):
