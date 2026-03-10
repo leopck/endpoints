@@ -179,6 +179,9 @@ filterwarnings = [
 
 [tool.coverage.run]
 source = ["src"]
+concurrency = ["multiprocessing", "thread"]
+parallel = true
+sigterm = true
 omit = [
     "*/tests/*",
     "*/test_*",
