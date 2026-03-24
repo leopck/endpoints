@@ -299,6 +299,22 @@ class ClientSettings(BaseModel):
     # -1 = unlimited (bound by system ephemeral port limit)
     max_connections: int = -1
 
+    # Seconds to wait for workers to initialize (spawn, connect, signal ready).
+    # Increase for slow systems or when workers load heavy dependencies.
+    worker_initialization_timeout: float = 40.0
+
+    # ZMQ IPC socket buffer sizes (bytes). Increase for large multimodal requests.
+    zmq_recv_buffer_bytes: int = Field(
+        default=4 * 1024 * 1024,
+        ge=1,
+        description="ZMQ receive buffer size in bytes (default 4MB).",
+    )
+    zmq_send_buffer_bytes: int = Field(
+        default=4 * 1024 * 1024,
+        ge=1,
+        description="ZMQ send buffer size in bytes (default 4MB).",
+    )
+
 
 class Settings(BaseModel):
     """Test settings (can be overridden by CLI)."""

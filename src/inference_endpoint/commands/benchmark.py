@@ -64,7 +64,9 @@ from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataset import Dataset
 from inference_endpoint.dataset_manager.factory import DataLoaderFactory
 from inference_endpoint.endpoint_client.config import HTTPClientConfig
-from inference_endpoint.endpoint_client.cpu_affinity import pin_loadgen
+from inference_endpoint.endpoint_client.cpu_affinity import (
+    pin_loadgen,
+)
 from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.endpoint_client.http_sample_issuer import HttpClientSampleIssuer
 from inference_endpoint.evaluation import Extractor
@@ -292,6 +294,16 @@ def _build_config_from_cli(
     timeout = getattr(args, "timeout", None)
     verbose_level = getattr(args, "verbose", 0)
     api_type = APIType(getattr(args, "api_type", "openai"))
+    client_kwargs: dict[str, Any] = {
+        "workers": args.workers if args.workers else -1,
+        "log_level": "DEBUG" if verbose_level >= 2 else "INFO",
+        "warmup_connections": getattr(args, "warmup_connections", -1),
+        "max_connections": getattr(args, "max_connections", None) or -1,
+    }
+    if hasattr(args, "zmq_recv_buffer_bytes"):
+        client_kwargs["zmq_recv_buffer_bytes"] = args.zmq_recv_buffer_bytes
+    if hasattr(args, "zmq_send_buffer_bytes"):
+        client_kwargs["zmq_send_buffer_bytes"] = args.zmq_send_buffer_bytes
     # Build BenchmarkConfig from CLI params
     return BenchmarkConfig(
         name=f"cli_{benchmark_mode}",
@@ -322,12 +334,7 @@ def _build_config_from_cli(
                 scheduler_random_seed=42,
                 dataloader_random_seed=42,
             ),
-            client=ClientSettings(
-                workers=args.workers if args.workers else -1,
-                log_level="DEBUG" if verbose_level >= 2 else "INFO",
-                warmup_connections=getattr(args, "warmup_connections", -1),
-                max_connections=getattr(args, "max_connections", None) or -1,
-            ),
+            client=ClientSettings(**client_kwargs),
         ),
         model_params=ModelParams(
             name=args.model,
@@ -580,6 +587,13 @@ def _run_benchmark(
         try:
             api_type: APIType = config.endpoint_config.api_type
             assert api_type is not None
+            warmup = config.settings.client.warmup_connections
+            max_conn = config.settings.client.max_connections
+            init_timeout = config.settings.client.worker_initialization_timeout
+            logger.info(
+                f"HTTP client: workers={num_workers}, warmup_connections={warmup}, "
+                f"max_connections={max_conn}, worker_init_timeout={init_timeout}s"
+            )
             http_config = HTTPClientConfig(
                 endpoint_urls=[urljoin(e, api_type.default_route()) for e in endpoints],
                 api_type=api_type,
@@ -588,9 +602,12 @@ def _run_benchmark(
                 event_logs_dir=report_dir,
                 log_level=config.settings.client.log_level,
                 cpu_affinity=affinity_plan,
-                warmup_connections=config.settings.client.warmup_connections,
-                max_connections=config.settings.client.max_connections,
+                warmup_connections=warmup,
+                max_connections=max_conn,
+                worker_initialization_timeout=init_timeout,
                 api_key=config.endpoint_config.api_key,
+                zmq_recv_buffer_bytes=config.settings.client.zmq_recv_buffer_bytes,
+                zmq_send_buffer_bytes=config.settings.client.zmq_send_buffer_bytes,
             )
             http_client = HTTPEndpointClient(http_config, zmq_context=zmq_ctx)
             sample_issuer = HttpClientSampleIssuer(http_client)
