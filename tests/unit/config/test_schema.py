@@ -229,6 +229,17 @@ class TestBenchmarkConfig:
             )
 
     @pytest.mark.unit
+    def test_max_duration_below_zero_rejected(self):
+        with pytest.raises(ValueError, match="greater than or equal to 0"):
+            BenchmarkConfig(
+                type=TestType.OFFLINE,
+                model_params={"name": "M"},
+                endpoint_config={"endpoints": ["http://x"]},
+                datasets=[{"path": "D"}],
+                settings={"runtime": {"max_duration_ms": -1}},
+            )
+
+    @pytest.mark.unit
     def test_submission_bad_benchmark_mode(self):
         with pytest.raises(ValueError, match="benchmark_mode"):
             BenchmarkConfig(
@@ -342,6 +353,20 @@ class TestBenchmarkConfigMethods:
         assert out.exists()
         loaded = BenchmarkConfig.from_yaml_file(out)
         assert loaded.model_params.name == "M"
+
+    @pytest.mark.unit
+    def test_max_duration_zero_converts_to_none_in_runtime_settings(self):
+        from inference_endpoint.config.runtime_settings import RuntimeSettings
+
+        config = BenchmarkConfig(
+            type=TestType.OFFLINE,
+            model_params={"name": "M"},
+            endpoint_config={"endpoints": ["http://x"]},
+            datasets=[{"path": "D"}],
+            settings={"runtime": {"max_duration_ms": 0}},
+        )
+        rt = RuntimeSettings.from_config(config, dataloader_num_samples=100)
+        assert rt.max_duration_ms is None
 
     @pytest.mark.unit
     def test_from_yaml_file_not_found(self):
