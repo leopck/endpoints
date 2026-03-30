@@ -46,6 +46,7 @@ from inference_endpoint.config.schema import (
     OnlineBenchmarkConfig as OnlineConfig,
 )
 from inference_endpoint.core.types import QueryResult
+from inference_endpoint.endpoint_client.config import HTTPClientConfig
 from inference_endpoint.exceptions import InputValidationError
 from pydantic import ValidationError
 
@@ -199,6 +200,11 @@ class TestCommandHandlers:
                 OfflineConfig(
                     endpoint_config={"endpoints": ["http://x"]},
                     model_params={"name": "M"},
+                    settings=OfflineSettings(
+                        client=HTTPClientConfig(
+                            num_workers=1, warmup_connections=0, max_connections=10
+                        ),
+                    ),
                 ),
                 ["data.pkl"],
                 TestMode.PERF,
@@ -210,7 +216,14 @@ class TestCommandHandlers:
                 OnlineConfig(
                     endpoint_config={"endpoints": ["http://x"]},
                     model_params={"name": "M"},
-                    settings={"load_pattern": {"type": "poisson", "target_qps": 10}},
+                    settings=OnlineSettings(
+                        load_pattern=LoadPattern(
+                            type=LoadPatternType.POISSON, target_qps=10
+                        ),
+                        client=HTTPClientConfig(
+                            num_workers=1, warmup_connections=0, max_connections=10
+                        ),
+                    ),
                 ),
                 ["acc:eval.pkl"],
                 TestMode.ACC,
@@ -326,8 +339,8 @@ endpoint_config:
                 "requires --concurrency",
             ),
             (
-                {"type": TestType.OFFLINE, "settings": {"client": {"workers": 0}}},
-                "workers must be",
+                {"type": TestType.OFFLINE, "settings": {"client": {"num_workers": 0}}},
+                "num_workers must be",
             ),
             (
                 {

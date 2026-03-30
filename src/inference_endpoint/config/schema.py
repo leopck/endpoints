@@ -31,6 +31,7 @@ import cyclopts
 import yaml
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Discriminator,
     Field,
     Tag,
@@ -40,6 +41,9 @@ from pydantic import (
 )
 
 from .. import metrics
+from ..core.types import APIType
+from ..endpoint_client.config import HTTPClientConfig
+from ..utils import WithUpdatesMixin
 from .ruleset_base import BenchmarkSuiteRuleset
 from .utils import parse_dataset_string, resolve_env_vars
 
@@ -47,20 +51,6 @@ from .utils import parse_dataset_string, resolve_env_vars
 class SystemDefaults(BaseModel):
     DEFAULT_TIMEOUT: ClassVar[float] = 300.0
     DEFAULT_METRIC: ClassVar[metrics.Metric] = metrics.Throughput(0.0)
-
-
-class APIType(str, Enum):
-    OPENAI = "openai"
-    SGLANG = "sglang"
-
-    def default_route(self) -> str:
-        match self:
-            case APIType.OPENAI:
-                return "/v1/chat/completions"
-            case APIType.SGLANG:
-                return "/generate"
-            case _:
-                raise ValueError(f"Invalid API type: {self}")
 
 
 class LoadPatternType(str, Enum):
@@ -158,7 +148,7 @@ class OSLDistribution(BaseModel):
     - NORMAL: Normal/Gaussian distribution with mean and std
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: OSLDistributionType = Field(
         OSLDistributionType.ORIGINAL, description="Distribution type"
@@ -175,7 +165,7 @@ class OSLDistribution(BaseModel):
 class ModelParams(BaseModel):
     """Model generation parameters."""
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     name: Annotated[
         str,
@@ -210,7 +200,7 @@ class SubmissionReference(BaseModel):
           ruleset: "mlperf-inference-v5.1"
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     model: str  # Model identifier (e.g., "llama-2-70b")
     ruleset: str  # Ruleset name/version (e.g., "mlperf-inference-v5.1")
@@ -239,7 +229,7 @@ class Dataset(BaseModel):
     ``[perf|acc:]<path>[,key=value...]``
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     name: str = Field("", description="Dataset name (auto-derived from path if empty)")
     type: DatasetType = Field(
@@ -249,7 +239,7 @@ class Dataset(BaseModel):
         str | None, cyclopts.Parameter(alias="--dataset", help="Dataset file path")
     ] = None
     format: str | None = Field(None, description="Dataset format (auto-detected)")
-    samples: int | None = Field(None, description="Number of samples to use")
+    samples: int | None = Field(None, gt=0, description="Number of samples to use")
     eval_method: EvalMethod | None = Field(
         None, description="Accuracy evaluation method"
     )
@@ -286,12 +276,12 @@ class AccuracyConfig(BaseModel):
           num_repeats: 5
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     eval_method: str | None = None
     ground_truth: str | None = None
     extractor: str | None = None
-    num_repeats: int = 1
+    num_repeats: int = Field(1, ge=1)
 
 
 class RuntimeConfig(BaseModel):
@@ -303,7 +293,7 @@ class RuntimeConfig(BaseModel):
     3. All dataset samples — fallback when duration is 0
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     min_duration_ms: Annotated[
         int,
@@ -334,7 +324,7 @@ class RuntimeConfig(BaseModel):
     n_samples_to_issue: Annotated[
         int | None,
         cyclopts.Parameter(alias="--num-samples", help="Sample count override"),
-    ] = None
+    ] = Field(None, gt=0)
     scheduler_random_seed: int = Field(42, description="Scheduler RNG seed")
     dataloader_random_seed: int = Field(42, description="Dataloader RNG seed")
 
@@ -357,7 +347,7 @@ class LoadPattern(BaseModel):
     - concurrency: issue at fixed target_concurrency (online, required - validated)
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     type: Annotated[
         LoadPatternType,
@@ -365,11 +355,11 @@ class LoadPattern(BaseModel):
     ] = LoadPatternType.MAX_THROUGHPUT
     target_qps: Annotated[
         float | None, cyclopts.Parameter(alias="--target-qps", help="Target QPS")
-    ] = None
+    ] = Field(None, gt=0)
     target_concurrency: Annotated[
         int | None,
         cyclopts.Parameter(alias="--concurrency", help="Concurrent requests"),
-    ] = None
+    ] = Field(None, gt=0)
 
     @model_validator(mode="after")
     def _validate_completeness(self) -> Self:
@@ -386,60 +376,15 @@ class LoadPattern(BaseModel):
         return self
 
 
-class ClientSettings(BaseModel):
-    """HTTP client configuration — user-facing subset of HTTPClientConfig."""
-
-    model_config = {"extra": "forbid"}
-
-    workers: Annotated[
-        int, cyclopts.Parameter(alias="--workers", help="Worker processes (-1=auto)")
-    ] = Field(-1, ge=-1)
-    record_worker_events: bool = Field(False, description="Record per-worker events")
-
-    @field_validator("workers")
-    @classmethod
-    def _workers_not_zero(cls, v: int) -> int:
-        if v == 0:
-            raise ValueError("workers must be -1 (auto) or >= 1, got 0")
-        return v
-
-    log_level: str = Field("INFO", description="Worker log level")
-    warmup_connections: int = Field(
-        -1, description="Pre-establish TCP connections (-1=auto, 0=disabled)"
-    )
-    max_connections: Annotated[
-        int,
-        cyclopts.Parameter(
-            alias="--max-connections", help="Max TCP connections (-1=unlimited)"
-        ),
-    ] = -1
-
-    # Seconds to wait for workers to initialize (spawn, connect, signal ready).
-    # Increase for slow systems or when workers load heavy dependencies.
-    worker_initialization_timeout: float = 40.0
-
-    # ZMQ IPC socket buffer sizes (bytes). Increase for large multimodal requests.
-    zmq_recv_buffer_bytes: int = Field(
-        default=4 * 1024 * 1024,
-        ge=1,
-        description="ZMQ receive buffer size in bytes (default 4MB).",
-    )
-    zmq_send_buffer_bytes: int = Field(
-        default=4 * 1024 * 1024,
-        ge=1,
-        description="ZMQ send buffer size in bytes (default 4MB).",
-    )
-
-
 @cyclopts.Parameter(name="*")
 class Settings(BaseModel):
     """Test settings."""
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     load_pattern: LoadPattern = Field(default_factory=LoadPattern)
-    client: ClientSettings = Field(default_factory=ClientSettings)
+    client: HTTPClientConfig = Field(default_factory=HTTPClientConfig)
 
 
 class OfflineSettings(Settings):
@@ -470,7 +415,7 @@ class Metrics(BaseModel):
     Use get_metric_types() to convert to actual Metric type classes.
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
     collect: list[str] = Field(default_factory=_default_metrics)
 
@@ -509,7 +454,7 @@ class EndpointConfig(BaseModel):
     The Default API type is APIType.OPENAI, which refers to the the /v1/chat/completions route.
     """
 
-    model_config = {"extra": "forbid"}
+    model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
     endpoints: Annotated[
         list[str],
@@ -524,7 +469,7 @@ class EndpointConfig(BaseModel):
     ] = APIType.OPENAI
 
 
-class BenchmarkConfig(BaseModel):
+class BenchmarkConfig(WithUpdatesMixin, BaseModel):
     """Benchmark configuration — single source of truth for YAML and CLI.
 
     Immutable (frozen) to prevent accidental modifications during execution.
@@ -532,7 +477,7 @@ class BenchmarkConfig(BaseModel):
     on Annotated fields to declare flat shorthand aliases.
     """
 
-    model_config = {"frozen": True, "extra": "forbid"}
+    model_config = ConfigDict(frozen=True, extra="forbid", str_strip_whitespace=True)
 
     name: Annotated[str, cyclopts.Parameter(show=False)] = Field(
         "", description="Benchmark name (auto-derived from type if empty)"
@@ -800,10 +745,6 @@ class BenchmarkConfig(BaseModel):
             )
         raise ValueError(f"Unknown test type: {test_type}")
 
-    def with_updates(self, **updates: object) -> Self:
-        """Reconstruct with updates, re-running all validators."""
-        return type(self).model_validate(self.model_dump() | updates)
-
 
 @cyclopts.Parameter(name="*")
 class OfflineBenchmarkConfig(BenchmarkConfig):
@@ -812,7 +753,7 @@ class OfflineBenchmarkConfig(BenchmarkConfig):
     type: Annotated[Literal[TestType.OFFLINE], cyclopts.Parameter(show=False)] = (
         TestType.OFFLINE
     )  # type: ignore[assignment]
-    settings: OfflineSettings = Field(default_factory=OfflineSettings)
+    settings: OfflineSettings = Field(default_factory=OfflineSettings)  # type: ignore[reportIncompatibleVariableOverride]
 
 
 @cyclopts.Parameter(name="*")
@@ -822,7 +763,7 @@ class OnlineBenchmarkConfig(BenchmarkConfig):
     type: Annotated[Literal[TestType.ONLINE], cyclopts.Parameter(show=False)] = (
         TestType.ONLINE
     )  # type: ignore[assignment]
-    settings: OnlineSettings = Field(default_factory=OnlineSettings)
+    settings: OnlineSettings = Field(default_factory=OnlineSettings)  # type: ignore[reportIncompatibleVariableOverride]
 
 
 def _config_discriminator(v: Any) -> str:

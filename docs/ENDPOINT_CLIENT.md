@@ -143,31 +143,31 @@ Each **worker process** runs its own async event loop in a separate OS process (
 The client can be used directly:
 
 ```python
-from inference_endpoint.endpoint_client import HTTPEndpointClient, HTTPClientConfig
-from inference_endpoint.async_utils.transport.zmq.context import ManagedZMQContext
+from inference_endpoint.endpoint_client.config import HTTPClientConfig
+from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.core.types import Query, QueryResult, StreamChunk
 
 config = HTTPClientConfig(endpoint_urls=["http://localhost:8000"])
 
-with ManagedZMQContext.scoped() as zmq_ctx:
-    client = HTTPEndpointClient(config, zmq_context=zmq_ctx)
+# Transport context is managed internally — no external context needed
+client = HTTPEndpointClient(config)
 
-    # Issue a query
-    client.issue(Query(data={
-        "prompt": "What is machine learning?",
-        "model": "Qwen/Qwen3-8B",
-        "max_completion_tokens": 100,
-        "stream": True,
-    }))
+# Issue a query
+client.issue(Query(data={
+    "prompt": "What is machine learning?",
+    "model": "Qwen/Qwen3-8B",
+    "max_completion_tokens": 100,
+    "stream": True,
+}))
 
-    # Collect responses (sync — for callers on a non-async thread)
-    response = client.poll()              # Non-blocking: StreamChunk | QueryResult | None
-    responses = client.drain()            # Non-blocking: returns all available responses
+# Collect responses (sync — for callers on a non-async thread)
+response = client.poll()              # Non-blocking: StreamChunk | QueryResult | None
+responses = client.drain()            # Non-blocking: returns all available responses
 
-    # Collect responses (async — for callers already on an event loop)
-    # response = await client.recv()      # Blocking: waits for next response; None when closed
+# Collect responses (async — for callers already on an event loop)
+# response = await client.recv()      # Blocking: waits for next response; None when closed
 
-    client.shutdown()
+client.shutdown()
 ```
 
 ### 2.2 Inference-Endpoints Integration
@@ -175,7 +175,8 @@ with ManagedZMQContext.scoped() as zmq_ctx:
 In benchmarking mode, the `HttpClientSampleIssuer` bridges the LoadGen thread and the async client. `HttpClientSampleIssuer` implements the `SampleIssuer` interface from the `inference-endpoints` LoadGen framework, converting `Sample` objects to `Query` and routing responses back to `SampleEventHandler` callbacks.
 
 ```python
-from inference_endpoint.endpoint_client import HTTPEndpointClient, HttpClientSampleIssuer
+from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
+from inference_endpoint.endpoint_client.http_sample_issuer import HttpClientSampleIssuer
 
 client = HTTPEndpointClient(config)
 issuer = HttpClientSampleIssuer(client)
@@ -226,7 +227,7 @@ class QueryStatus(Enum):
 
 ## 4. HTTPClientConfig
 
-`HTTPClientConfig` (`config.py`) is a `@dataclass` that configures the client, worker pool, and connection management. Several fields support auto-detection via sentinel defaults (`-1`), resolved in `__post_init__`.
+`HTTPClientConfig` (`config.py`) is a Pydantic `BaseModel` that configures the client, worker pool, and connection management. Several fields support auto-detection via sentinel defaults (`-1`), resolved in the `_resolve_defaults` model validator.
 
 **Classes:**
 
@@ -239,8 +240,7 @@ class APIType(str, Enum):
     OPENAI = "openai"
     SGLANG = "sglang"
 
-@dataclass
-class HTTPClientConfig:
+class HTTPClientConfig(BaseModel):
     # Target endpoint URLs; workers assigned round-robin at spawn time
     endpoint_urls: list[str]
     # Selects adapter + accumulator pair (see §9)
@@ -264,7 +264,7 @@ class HTTPClientConfig:
     cpu_affinity: AffinityPlan | None = None
 
     # Worker lifecycle timeouts (seconds)
-    worker_initialization_timeout: float = 40.0
+    worker_initialization_timeout: float = 60.0
     worker_graceful_shutdown_wait: float = 0.5
     worker_force_kill_timeout: float = 0.5
 
@@ -289,13 +289,15 @@ class HTTPClientConfig:
     # "disabled" = GC off; "relaxed" = 100x higher threshold; "system" = defaults
     worker_gc_mode: Literal["disabled", "relaxed", "system"] = "relaxed"
 
-    # Pluggable components (None = auto-resolved from api_type in __post_init__)
-    adapter: type[HttpRequestAdapter] = None       # type: ignore[assignment]
-    accumulator: type[SSEAccumulatorProtocol] = None  # type: ignore[assignment]
-    worker_pool_transport: type[WorkerPoolTransport] = None  # type: ignore[assignment]
+    # Transport config — owns transport class, context, and socket options
+    transport: ZMQTransportConfig | None = None
+
+    # Pluggable components (None = auto-resolved from api_type in model_validator)
+    adapter: Annotated[Any, cyclopts.Parameter(parse=False)] = None
+    accumulator: Annotated[Any, cyclopts.Parameter(parse=False)] = None
 ```
 
-#### Auto-configuration (`__post_init__`)
+#### Auto-configuration (`_resolve_defaults` model validator)
 
 Three fields resolve `-1` sentinels by probing the host at construction time:
 
@@ -489,15 +491,15 @@ The transport layer handles all IPC between the main process and worker processe
 
 **Public API — `WorkerConnector`:**
 
-| Method                            | Async   | Description                                                                                                                   |
-| --------------------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| `connect(worker_id, zmq_context)` | **Yes** | Async context manager yielding `(ReceiverTransport, SenderTransport)` pair for a worker; signals readiness, cleans up on exit |
+| Method               | Async   | Description                                                                                                                   |
+| -------------------- | ------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| `connect(worker_id)` | **Yes** | Async context manager yielding `(ReceiverTransport, SenderTransport)` pair for a worker; signals readiness, cleans up on exit |
 
 **Public API — `WorkerPoolTransport`:**
 
 | Method / Property                        | Async   | Description                                                                             |
 | ---------------------------------------- | ------- | --------------------------------------------------------------------------------------- |
-| `create(loop, num_workers, **overrides)` | No      | Factory classmethod — creates configured pool transport bound to the given event loop   |
+| `create(loop, num_workers, config=None)` | No      | Factory classmethod — creates configured pool transport bound to the given event loop   |
 | `worker_connector`                       | No      | Property returning the picklable `WorkerConnector` to pass to spawned worker processes  |
 | `send(worker_id, query)`                 | No      | Fan-out: dispatch a `Query` to a specific worker by ID                                  |
 | `poll()`                                 | No      | Fan-in: non-blocking poll for a `QueryResult` or `StreamChunk` from any worker          |
@@ -509,7 +511,7 @@ The transport layer handles all IPC between the main process and worker processe
 
 ```python
 # Create pool transport bound to the event loop
-pool = WorkerPoolTransport.create(loop, num_workers=4)
+pool = ZmqWorkerPoolTransport.create(loop, num_workers=4)
 # Spawn worker processes, passing the picklable connector
 for i in range(4):
     Process(target=worker_main, args=(i, pool.worker_connector, config)).start()
@@ -544,14 +546,14 @@ The ZMQ implementation (`ZmqWorkerPoolTransport`) uses direct event loop integra
 
 **Classes:**
 
-| Class                    | Source                                   | Description                                                                                                        |
-| ------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `ZmqWorkerPoolTransport` | `async_utils/transport/zmq/transport.py` | Concrete ZMQ pool transport                                                                                        |
-| `_ZmqReceiverTransport`  | `async_utils/transport/zmq/transport.py` | ZMQ PULL receiver with edge-triggered FD handling                                                                  |
-| `_ZmqSenderTransport`    | `async_utils/transport/zmq/transport.py` | ZMQ PUSH sender with buffered writes                                                                               |
-| `_ZmqWorkerConnector`    | `async_utils/transport/zmq/transport.py` | Picklable ZMQ connector (`@dataclass`, `slots=True`)                                                               |
-| `_ZMQSocketConfig`       | `async_utils/transport/zmq/transport.py` | ZMQ socket tuning (HWM, buffer sizes, I/O threads)                                                                 |
-| `ManagedZMQContext`      | `async_utils/transport/zmq/context.py`   | Singleton ZMQ context wrapper with `scoped()` lifetime management (temporary — TODO: fold into transport protocol) |
+| Class                    | Source                                   | Description                                                                          |
+| ------------------------ | ---------------------------------------- | ------------------------------------------------------------------------------------ |
+| `ZmqWorkerPoolTransport` | `async_utils/transport/zmq/transport.py` | Concrete ZMQ pool transport                                                          |
+| `_ZmqReceiverTransport`  | `async_utils/transport/zmq/transport.py` | ZMQ PULL receiver with edge-triggered FD handling                                    |
+| `_ZmqSenderTransport`    | `async_utils/transport/zmq/transport.py` | ZMQ PUSH sender with buffered writes                                                 |
+| `_ZmqWorkerConnector`    | `async_utils/transport/zmq/transport.py` | Picklable ZMQ connector (`@dataclass`, `slots=True`)                                 |
+| `ZMQTransportConfig`     | `async_utils/transport/zmq/transport.py` | ZMQ transport config (Pydantic) — socket tuning, transport class, context management |
+| `ManagedZMQContext`      | `async_utils/transport/zmq/context.py`   | Singleton ZMQ context wrapper — lifecycle managed by transport implementation        |
 
 #### 7.1.1 Serialization
 

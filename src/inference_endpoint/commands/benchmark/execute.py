@@ -38,7 +38,6 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 from transformers.utils import logging as transformers_logging
 
-from inference_endpoint.async_utils.transport.zmq.context import ManagedZMQContext
 from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.config.schema import (
     APIType,
@@ -52,7 +51,6 @@ from inference_endpoint.config.schema import (
 from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataset import Dataset
 from inference_endpoint.dataset_manager.factory import DataLoaderFactory
-from inference_endpoint.endpoint_client.config import HTTPClientConfig
 from inference_endpoint.endpoint_client.cpu_affinity import AffinityPlan, pin_loadgen
 from inference_endpoint.endpoint_client.http_client import HTTPEndpointClient
 from inference_endpoint.endpoint_client.http_sample_issuer import HttpClientSampleIssuer
@@ -251,7 +249,7 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
     """Load tokenizer, dataset, create scheduler, setup report dir."""
     # CPU affinity
     affinity_plan = (
-        pin_loadgen(config.settings.client.workers)
+        pin_loadgen(config.settings.client.num_workers)
         if config.enable_cpu_affinity
         else None
     )
@@ -324,83 +322,73 @@ def run_benchmark_threaded(ctx: BenchmarkContext) -> tuple[Any, ResponseCollecto
     # Create endpoint client
     endpoints = config.endpoint_config.endpoints
     logger.info(f"Connecting: {endpoints}")
-    # Scope ZMQ context so transport and sockets are cleaned up when the block exits.
-    with (
-        ManagedZMQContext.scoped() as zmq_ctx,
-        tempfile.TemporaryDirectory(prefix="inference_endpoint_") as _tmp_dir,
-    ):
+    try:
+        api_type: APIType = config.endpoint_config.api_type
+        http_config = config.settings.client.with_updates(
+            endpoint_urls=[urljoin(e, api_type.default_route()) for e in endpoints],
+            api_type=api_type,
+            api_key=config.endpoint_config.api_key,
+            event_logs_dir=ctx.report_dir,
+            cpu_affinity=ctx.affinity_plan,
+        )
+        http_client = HTTPEndpointClient(http_config)
+        sample_issuer = HttpClientSampleIssuer(http_client)
+    except Exception as e:
+        raise SetupError(f"Failed to connect to endpoint: {e}") from e
+
+    # Run benchmark
+    logger.info("Running...")
+    sess = None
+    try:
+        sess = BenchmarkSession.start(
+            ctx.rt_settings,
+            ctx.dataloader,
+            sample_issuer,
+            ctx.scheduler,
+            name=f"cli_benchmark_{uuid.uuid4().hex[0:8]}",
+            report_dir=ctx.report_dir,
+            tokenizer_override=ctx.tokenizer,
+            accuracy_datasets=ctx.accuracy_datasets,
+            max_shutdown_timeout_s=config.timeout or SystemDefaults.DEFAULT_TIMEOUT,
+            dump_events_log=True,
+        )
+
+        # Wait for test end with ability to interrupt
+        def _raise_keyboard_interrupt(*_: object) -> None:
+            raise KeyboardInterrupt
+
+        old_handler = signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
         try:
-            api_type: APIType = config.endpoint_config.api_type
-            http_config = HTTPClientConfig(
-                endpoint_urls=[urljoin(e, api_type.default_route()) for e in endpoints],
-                api_type=api_type,
-                num_workers=config.settings.client.workers,
-                record_worker_events=config.settings.client.record_worker_events,
-                event_logs_dir=ctx.report_dir,
-                log_level=config.settings.client.log_level,
-                cpu_affinity=ctx.affinity_plan,
-                warmup_connections=config.settings.client.warmup_connections,
-                max_connections=config.settings.client.max_connections,
-                api_key=config.endpoint_config.api_key,
-            )
-            http_client = HTTPEndpointClient(http_config, zmq_context=zmq_ctx)
-            sample_issuer = HttpClientSampleIssuer(http_client)
-        except Exception as e:
-            raise SetupError(f"Failed to connect to endpoint: {e}") from e
-
-        # Run benchmark
-        logger.info("Running...")
-        sess = None
-        try:
-            sess = BenchmarkSession.start(
-                ctx.rt_settings,
-                ctx.dataloader,
-                sample_issuer,
-                ctx.scheduler,
-                name=f"cli_benchmark_{uuid.uuid4().hex[0:8]}",
-                report_dir=ctx.report_dir,
-                tokenizer_override=ctx.tokenizer,
-                accuracy_datasets=ctx.accuracy_datasets,
-                max_shutdown_timeout_s=config.timeout or SystemDefaults.DEFAULT_TIMEOUT,
-                dump_events_log=True,
-            )
-
-            # Wait for test end with ability to interrupt
-            def _raise_keyboard_interrupt(*_: object) -> None:
-                raise KeyboardInterrupt
-
-            old_handler = signal.signal(signal.SIGINT, _raise_keyboard_interrupt)
-            try:
-                sess.wait_for_test_end()
-            finally:
-                # Always restore original handler
-                signal.signal(signal.SIGINT, old_handler)
-
-            # Prefer authoritative metrics from the session report
-            report = getattr(sess, "report", None)
-            if report is None:
-                raise ExecutionError("Session report missing — cannot produce results")
-            return report, collector
-
-        except KeyboardInterrupt:
-            logger.warning("Benchmark interrupted by user")
-            raise
-        except ExecutionError:
-            # Re-raise our own exceptions
-            raise
-        except Exception as e:
-            raise ExecutionError(f"Benchmark execution failed: {e}") from e
+            sess.wait_for_test_end()
         finally:
-            # Cleanup - always execute
-            logger.info("Cleaning up...")
-            try:
-                if sess is not None:
-                    sess.stop()
-                pbar.close()
-                sample_issuer.shutdown()
-                http_client.shutdown()
-            except Exception as e:
-                logger.debug(f"Cleanup error: {e}")
+            # Always restore original handler
+            signal.signal(signal.SIGINT, old_handler)
+
+        # Prefer authoritative metrics from the session report
+        report = getattr(sess, "report", None)
+        if report is None:
+            raise ExecutionError("Session report missing — cannot produce results")
+        return report, collector
+
+    except KeyboardInterrupt:
+        logger.warning("Benchmark interrupted by user")
+        raise
+    except ExecutionError:
+        # Re-raise our own exceptions
+        raise
+    except Exception as e:
+        raise ExecutionError(f"Benchmark execution failed: {e}") from e
+    finally:
+        # Cleanup - always execute
+        logger.info("Cleaning up...")
+        try:
+            if sess is not None:
+                sess.stop()
+            pbar.close()
+            sample_issuer.shutdown()
+            http_client.shutdown()
+        except Exception as e:
+            logger.debug(f"Cleanup error: {e}")
 
 
 def finalize_benchmark(

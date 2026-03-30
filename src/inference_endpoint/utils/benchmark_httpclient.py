@@ -37,9 +37,6 @@ import threading
 import time
 from dataclasses import dataclass
 
-from inference_endpoint.async_utils.transport.zmq.context import (
-    ManagedZMQContext,
-)
 from inference_endpoint.core.types import Query, QueryResult
 from inference_endpoint.endpoint_client.config import HTTPClientConfig
 from inference_endpoint.endpoint_client.cpu_affinity import (
@@ -409,7 +406,6 @@ def _create_client(
     prompt: str,
     enable_affinity: bool,
     verbose: bool = True,
-    zmq_context: ManagedZMQContext | None = None,
 ) -> tuple:
     """Create an endpoint client and query data dict.
 
@@ -441,11 +437,11 @@ def _create_client(
 
     if verbose:
         print(
-            f"Config: workers={config.num_workers}, "
+            f"Config: num_workers={config.num_workers}, "
             f"max_connections={config.max_connections}, stream={streaming}"
         )
 
-    client = HTTPEndpointClient(config, zmq_context=zmq_context)
+    client = HTTPEndpointClient(config)
     query_data = {
         "prompt": prompt,
         "model": "benchmark-model",
@@ -499,9 +495,6 @@ def run_benchmark(
         except OSError:
             pass
 
-    zmq_ctx_manager = ManagedZMQContext.scoped()
-    zmq_ctx = zmq_ctx_manager.__enter__()
-
     client, query_data = _create_client(
         endpoint_url,
         num_workers,
@@ -509,7 +502,6 @@ def run_benchmark(
         streaming,
         prompt,
         enable_affinity,
-        zmq_context=zmq_ctx,
     )
     loop = client.loop
     stats = BenchmarkStats(sse_events_per_response=sse_events_per_response)
@@ -639,7 +631,6 @@ def run_benchmark(
     gc.collect()
 
     client.shutdown()
-    zmq_ctx_manager.__exit__(None, None, None)
 
     # Restore original affinity so the next sweep iteration sees all CPUs
     if saved_affinity is not None:
@@ -769,7 +760,7 @@ def run_single(
     stats = run_benchmark(
         endpoint_url=endpoint_url,
         duration=args.duration,
-        num_workers=args.num_workers[0],
+        num_workers=args.workers[0],
         max_connections=args.max_connections[0],
         prompt=prompt,
         track_memory=args.track_memory,
@@ -850,7 +841,7 @@ def run_sweep(
     sweep_values = [s[1] for s in sweeps]
     combinations = list(itertools.product(*sweep_values))
 
-    default_workers = args.num_workers[0]
+    default_workers = args.workers[0]
     default_connections = args.max_connections[0]
     default_prompt_length = args.prompt_length[0]
     default_stream_interval = args.stream_interval[0]
@@ -1380,6 +1371,7 @@ def main() -> None:
         "--num-workers",
         type=int_or_range,
         default=[-1],
+        dest="workers",
         help="Number of worker processes, or range (e.g. 4:12). -1 for auto. Default: -1",
     )
     parser.add_argument(
@@ -1432,8 +1424,8 @@ def main() -> None:
     args._stream_interval_pcts = None
 
     if args.full:
-        if args.num_workers == [-1]:
-            args.num_workers = _FULL_WORKERS
+        if args.workers == [-1]:
+            args.workers = _FULL_WORKERS
         if args.prompt_length == [-1]:
             args.prompt_length = _FULL_PROMPT_LENGTHS
         if args.streaming and args.stream_interval == [1]:
@@ -1443,7 +1435,7 @@ def main() -> None:
         args.prompt_length = [1000]
 
     sweeps = collect_sweep_params(
-        args.num_workers,
+        args.workers,
         args.max_connections,
         args.prompt_length,
         stream_intervals=(
