@@ -73,7 +73,7 @@ CLI is auto-generated from `config/schema.py` Pydantic models via cyclopts. Fiel
 
 - **CLI mode** (`offline`/`online`): cyclopts constructs `OfflineBenchmarkConfig`/`OnlineBenchmarkConfig` (subclasses in `config/schema.py`) directly from CLI args. Type locked via `Literal`. `--dataset` is repeatable with TOML-style format `[perf|acc:]<path>[,key=value...]` (e.g. `--dataset data.csv,samples=500,parser.prompt=article`). Full accuracy support via `accuracy_config.eval_method=pass_at_1` etc.
 - **YAML mode** (`from-config`): `BenchmarkConfig.from_yaml_file()` loads YAML, resolves env vars, and auto-selects the right subclass via Pydantic discriminated union. Optional `--timeout`/`--mode` overrides via `config.with_updates()`.
-- **eval**: Not yet implemented (raises `NotImplementedError`)
+- **eval**: Not yet implemented (raises `CLIError` with a tracking issue link)
 
 ### Config Construction & Validation
 
@@ -137,7 +137,11 @@ src/inference_endpoint/
 │   └── utils.py               # Port range helpers
 ├── async_utils/
 │   ├── loop_manager.py        # LoopManager (uvloop + eager_task_factory)
+│   ├── runner.py              # run_async() — uvloop + eager_task_factory entry point for CLI commands
 │   ├── event_publisher.py     # Async event pub/sub
+│   ├── services/
+│   │   ├── event_logger/      # EventLoggerService: writes EventRecords to JSONL/SQLite
+│   │   └── metrics_aggregator/ # MetricsAggregatorService: real-time metrics (TTFT, TPOT, ISL, OSL)
 │   └── transport/             # ZMQ-based IPC transport layer
 │       ├── protocol.py        # Transport protocols + TransportConfig base
 │       ├── record.py          # Transport records
@@ -192,7 +196,7 @@ tests/
 
 ## Development Standards
 
-### Code Style
+### Code Style and Pre-commit Hooks
 
 - **Formatter/Linter**: `ruff` (line-length 88, target Python 3.12)
 - **Type checking**: `mypy` (via pre-commit)
@@ -200,17 +204,11 @@ tests/
 - **License headers**: Required on all Python files (enforced by pre-commit hook `scripts/add_license_header.py`)
 - **Conventional commits**: `feat:`, `fix:`, `docs:`, `test:`, `chore:`
 
-### Pre-commit Hooks
-
-All of these run automatically on commit:
-
-- trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, debug-statements
-- `ruff` (lint + autofix) and `ruff-format`
-- `mypy` type checking
-- `prettier` for YAML/JSON/Markdown
-- License header enforcement
+All of these hooks run automatically on commit: trailing-whitespace, end-of-file-fixer, check-yaml, check-merge-conflict, debug-statements, `ruff` (lint + autofix), `ruff-format`, `mypy`, `prettier` (YAML/JSON/Markdown), license header enforcement.
 
 **Always run `pre-commit run --all-files` before committing.**
+
+See [Development Guide](docs/DEVELOPMENT.md) for full setup and workflow details.
 
 ### Data Types & Serialization
 
@@ -291,7 +289,7 @@ Update AGENTS.md as part of any PR that includes a **significant refactor**, mea
 - **Added or removed CLI commands/subcommands** — update CLI Modes and Common Commands
 - **Changed test infrastructure** (new fixtures, changed markers, new test directories) — update Testing section
 - **Added or removed key dependencies** — update Key Dependencies table
-- **Changed build/tooling** (new pre-commit hooks, changed ruff config, new CI steps) — update Code Style and Pre-commit Hooks
+- **Changed build/tooling** (new pre-commit hooks, changed ruff config, new CI steps) — update [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 - **Changed hot-path patterns** (new transport, changed serialization, new performance constraints) — update Performance Guidelines
 
 ### How to Update
