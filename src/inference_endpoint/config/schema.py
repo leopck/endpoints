@@ -417,51 +417,6 @@ class OnlineSettings(Settings):
     pass
 
 
-def _default_metrics() -> list[str]:
-    """
-    TODO: PoC only, subject to change!
-    Default metrics to collect."""
-    return ["throughput", "latency", "ttft", "tpot"]
-
-
-class Metrics(BaseModel):
-    """Metrics collection configuration.
-
-    Note: Currently uses string-based metric names for YAML simplicity.
-    Use get_metric_types() to convert to actual Metric type classes.
-    """
-
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    collect: list[str] = Field(default_factory=_default_metrics)
-
-    def get_metric_types(self) -> list[type[metrics.Metric]]:
-        """Convert string metric names to Metric type classes.
-
-        Returns:
-            List of Metric type classes corresponding to collect list
-
-        Raises:
-            ValueError: If metric name is not recognized
-        """
-        metric_map = {
-            "throughput": metrics.Throughput,
-            "latency": metrics.QueryLatency,
-            "ttft": metrics.TTFT,
-            "tpot": metrics.TPOT,
-        }
-
-        result = []
-        for name in self.collect:
-            if name not in metric_map:
-                raise ValueError(
-                    f"Unknown metric name: {name}. Available: {list(metric_map.keys())}"
-                )
-            result.append(metric_map[name])
-
-        return result
-
-
 class EndpointConfig(BaseModel):
     """Endpoint connection configuration.
 
@@ -516,9 +471,6 @@ class BenchmarkConfig(WithUpdatesMixin, BaseModel):
         default_factory=list, description="Dataset configs"
     )
     settings: Settings = Field(default_factory=Settings)
-    metrics: Annotated[Metrics, cyclopts.Parameter(show=False)] = Field(
-        default_factory=Metrics
-    )
     endpoint_config: EndpointConfig
     report_dir: Annotated[
         Path | None,

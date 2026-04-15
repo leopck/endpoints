@@ -22,7 +22,6 @@ from inference_endpoint.config.schema import (
     Dataset,
     DatasetType,
     EvalMethod,
-    Metrics,
     ModelParams,
     OSLDistribution,
     OSLDistributionType,
@@ -107,20 +106,6 @@ class TestDataset:
     def test_auto_derive_name(self):
         ds = Dataset(path="datasets/my_data.jsonl")
         assert ds.name == "my_data"
-
-
-class TestMetrics:
-    @pytest.mark.unit
-    def test_get_metric_types(self):
-        m = Metrics(collect=["throughput", "latency", "ttft", "tpot"])
-        types = m.get_metric_types()
-        assert len(types) == 4
-
-    @pytest.mark.unit
-    def test_unknown_metric_raises(self):
-        m = Metrics(collect=["nonexistent"])
-        with pytest.raises(ValueError, match="Unknown metric"):
-            m.get_metric_types()
 
 
 class TestBenchmarkConfig:

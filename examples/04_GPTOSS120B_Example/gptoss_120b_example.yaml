@@ -30,13 +30,6 @@ settings:
     num_workers: 4
     record_worker_events: false
 
-metrics:
-  collect:
-    - "throughput"
-    - "latency"
-    - "ttft"
-    - "tpot"
-
 endpoint_config:
   endpoints:
     - "http://localhost:3000"

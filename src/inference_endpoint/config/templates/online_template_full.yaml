@@ -69,12 +69,6 @@ settings:
     max_idle_time: 4.0  # Discard connections idle longer than this (seconds)
     min_required_connections: -1  # Min connections to initialize (-1=auto, 0=disabled)
     worker_gc_mode: relaxed  # Worker GC strategy | options: disabled, relaxed, system
-metrics:
-  collect:
-  - throughput
-  - latency
-  - ttft
-  - tpot
 endpoint_config:
   endpoints:  # Endpoint URL(s)
   - '<ENDPOINT_URL eg: http://localhost:8000>'
