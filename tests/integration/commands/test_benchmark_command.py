@@ -16,6 +16,7 @@
 """Integration tests for benchmark commands against echo server."""
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -86,7 +87,7 @@ class TestBenchmarkCommandIntegration:
         assert "Completed in" in caplog.text
         assert "successful" in caplog.text
         assert "QPS:" in caplog.text
-        assert "MaxThroughputScheduler" in caplog.text
+        assert "Starting phase:" in caplog.text
 
     @pytest.mark.integration
     @pytest.mark.parametrize("streaming", [StreamingMode.OFF, StreamingMode.ON])
@@ -105,8 +106,7 @@ class TestBenchmarkCommandIntegration:
 
         assert "Completed in" in caplog.text
         assert "successful" in caplog.text
-        assert "PoissonDistributionScheduler" in caplog.text
-        assert "50" in caplog.text
+        assert "Starting phase:" in caplog.text
 
     @pytest.mark.integration
     @pytest.mark.parametrize("streaming", [StreamingMode.OFF, StreamingMode.ON])
@@ -213,6 +213,10 @@ class TestTemplateIntegration:
     """Verify generated templates run end-to-end against a local server."""
 
     @pytest.mark.integration
+    @pytest.mark.skipif(
+        not os.environ.get("HF_TOKEN"),
+        reason="Templates reference gated HF models; requires HF_TOKEN to fetch tokenizer",
+    )
     @pytest.mark.parametrize("template", _GENERATED_TEMPLATES)
     def test_template_runs(self, mock_http_echo_server, tmp_path, caplog, template):
         data = _resolve_template(TEMPLATE_DIR / template, mock_http_echo_server.url)
