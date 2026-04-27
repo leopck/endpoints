@@ -256,6 +256,17 @@ class HTTPClientConfig(WithUpdatesMixin, BaseModel):
 
         return self
 
+    def with_updates(self, **updates: object) -> HTTPClientConfig:
+        """Reconstruct with updates; clear stale auto-resolved fields.
+
+        When ``api_type`` changes, drop ``adapter`` / ``accumulator`` so they
+        re-resolve against the new type. Explicit overrides in ``updates`` win.
+        """
+        if "api_type" in updates and updates["api_type"] != self.api_type:
+            updates.setdefault("adapter", None)
+            updates.setdefault("accumulator", None)
+        return super().with_updates(**updates)
+
 
 @functools.lru_cache(maxsize=1)
 def _get_auto_num_workers() -> int:
