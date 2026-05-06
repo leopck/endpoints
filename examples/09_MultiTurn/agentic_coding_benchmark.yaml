@@ -3,14 +3,15 @@ version: "1.0"
 type: "online"
 
 model_params:
-  name: "your-model-name" # Replace with your actual model name
-  max_new_tokens: 1024
+  name: "/model"            # SGLang registers the model under its --model-path
+  temperature: 0            # MLPerf-inference convention: greedy decoding for reproducibility.
+                            # MLPerf references (Llama 3.1, Mixtral, DeepSeek-R1, GPT-OSS-120B)
+                            # all override to greedy so the benchmark stays reproducible.
+  max_new_tokens: 20000     # covers longest observed assistant turn (~18k tokens)
 
 datasets:
   - name: agentic_coding
     type: performance
-    # Run: python scripts/convert_agentic_snapshot.py <input.jsonl> examples/09_MultiTurn/datasets/agentic_coding_flat.jsonl --verify
-    # The datasets/ directory is a placeholder; populate it with the conversion script above.
     path: examples/09_MultiTurn/datasets/agentic_coding_flat.jsonl
     multi_turn:
       turn_timeout_s: 600.0
@@ -22,11 +23,17 @@ settings:
 
   load_pattern:
     type: multi_turn
-    target_concurrency: 4096
+    target_concurrency: 4
+
+  # Mandatory: with the default warmup behaviour, every request fails with
+  # ConnectionResetError because uvicorn closes pre-warmed idle sockets after 5s.
+  client:
+    warmup_connections: 0
+    max_idle_time: 0.5
 
 endpoint_config:
   endpoints:
-    - "http://localhost:8868"
+    - "http://localhost:8000"
   api_type: openai
 
 report_dir: logs/agentic_coding

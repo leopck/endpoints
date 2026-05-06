@@ -140,9 +140,9 @@ inference-endpoint benchmark from-config \
 
 ```yaml
 datasets:
-  - name: customer_support
+  - name: agentic_coding
     type: performance
-    path: examples/09_MultiTurn/customer_support_conversations.jsonl
+    path: examples/09_MultiTurn/datasets/agentic_coding_flat.jsonl
     multi_turn:
       turn_timeout_s: 300.0
 
@@ -200,7 +200,7 @@ If a turn does not receive a response within `turn_timeout_s` seconds, that turn
 
 ```bash
 inference-endpoint benchmark from-config \
-  --config examples/09_MultiTurn/multi_turn_benchmark.yaml
+  --config examples/09_MultiTurn/agentic_coding_benchmark.yaml
 ```
 
 ### Viewing Results
@@ -216,16 +216,6 @@ Results are stored in the configured `report_dir`. Each record in
 `events.jsonl` carries `conversation_id` and `turn` alongside `sample_uuid`,
 so conversation-level filtering requires no join. `sample_idx_map.json` maps
 `sample_uuid → dataset sample index` for callers that need it.
-
-## Example Datasets
-
-### customer_support_conversations.jsonl
-
-Simple customer support conversations demonstrating basic multi-turn interactions:
-
-- 3 conversations
-- 2-4 turns per conversation
-- Customer support agent system prompt
 
 ## Architecture Notes
 
