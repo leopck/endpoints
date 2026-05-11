@@ -21,6 +21,7 @@ client-turn ordering), and scores them against the gt jsonl.
 In ``--model`` mode the model assistant turns are read from a pre-built
 flat JSONL — same shape as the gt assistant rows.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -28,8 +29,8 @@ import json
 import logging
 import re
 from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable
 
 logger = logging.getLogger("inline_accuracy")
 
@@ -42,29 +43,70 @@ logger = logging.getLogger("inline_accuracy")
 # absent — they're navigation/output verbs, not action classes.
 EXE_MAP: dict[str, str] = {
     # python ecosystem
-    "python": "python", "python2": "python", "python3": "python", "py": "python",
-    "pip": "pip", "pip3": "pip",
-    "pytest": "pytest", "pylint": "pylint",
-    "sphinx-build": "sphinx", "sphinx-quickstart": "sphinx",
-    "cython": "cython", "make": "make", "conda": "conda",
+    "python": "python",
+    "python2": "python",
+    "python3": "python",
+    "py": "python",
+    "pip": "pip",
+    "pip3": "pip",
+    "pytest": "pytest",
+    "pylint": "pylint",
+    "sphinx-build": "sphinx",
+    "sphinx-quickstart": "sphinx",
+    "cython": "cython",
+    "make": "make",
+    "conda": "conda",
     # text view / search / transform
-    "cat": "cat", "head": "head", "tail": "tail", "less": "cat", "more": "cat",
-    "wc": "wc", "diff": "diff",
-    "grep": "grep", "egrep": "grep", "fgrep": "grep", "rg": "grep", "ag": "grep",
-    "sed": "sed", "awk": "awk", "gawk": "awk", "tr": "tr",
-    "sort": "sort", "uniq": "uniq", "cut": "cut",
+    "cat": "cat",
+    "head": "head",
+    "tail": "tail",
+    "less": "cat",
+    "more": "cat",
+    "wc": "wc",
+    "diff": "diff",
+    "grep": "grep",
+    "egrep": "grep",
+    "fgrep": "grep",
+    "rg": "grep",
+    "ag": "grep",
+    "sed": "sed",
+    "awk": "awk",
+    "gawk": "awk",
+    "tr": "tr",
+    "sort": "sort",
+    "uniq": "uniq",
+    "cut": "cut",
     # find / list
-    "find": "find", "ls": "ls", "locate": "find", "xargs": "xargs",
+    "find": "find",
+    "ls": "ls",
+    "locate": "find",
+    "xargs": "xargs",
     # filesystem ops
-    "cp": "cp", "mv": "mv", "rm": "rm", "mkdir": "mkdir", "touch": "touch", "tee": "tee",
+    "cp": "cp",
+    "mv": "mv",
+    "rm": "rm",
+    "mkdir": "mkdir",
+    "touch": "touch",
+    "tee": "tee",
     # shell
-    "source": "source", ".": "source",
-    "which": "which", "alias": "alias", "unset": "unset", "export": "export",
+    "source": "source",
+    ".": "source",
+    "which": "which",
+    "alias": "alias",
+    "unset": "unset",
+    "export": "export",
     # vcs / fetch
-    "git": "git", "curl": "curl", "wget": "curl",
+    "git": "git",
+    "curl": "curl",
+    "wget": "curl",
     # misc
-    "true": "true", "false": "false", "timeout": "timeout", "date": "date",
-    "apt-get": "apt", "apt": "apt", "yum": "yum",
+    "true": "true",
+    "false": "false",
+    "timeout": "timeout",
+    "date": "date",
+    "apt-get": "apt",
+    "apt": "apt",
+    "yum": "yum",
 }
 _WRAPPERS = {"env", "time", "nice", "sudo", "exec", "command"}
 
@@ -341,7 +383,9 @@ def derive_model_assistants(
         else:
             logger.warning(
                 "uuid %s -> index %d out of range (max %d)",
-                uuid, idx, len(index_to_key) - 1,
+                uuid,
+                idx,
+                len(index_to_key) - 1,
             )
 
     rows_written = 0
@@ -389,16 +433,24 @@ def derive_model_assistants(
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+    )
     p = argparse.ArgumentParser(description="Score a multi-turn benchmark run.")
     p.add_argument("--gt", required=True, type=Path)
     p.add_argument("--domain", required=True, choices=("coding", "workflow"))
     src = p.add_mutually_exclusive_group(required=True)
-    src.add_argument("--report-dir", type=Path,
-                     help="Benchmark report dir — derives model assistants from events.jsonl")
+    src.add_argument(
+        "--report-dir",
+        type=Path,
+        help="Benchmark report dir — derives model assistants from events.jsonl",
+    )
     src.add_argument("--model", type=Path, help="Pre-built model assistants JSONL")
-    p.add_argument("--dataset-name", default=None,
-                   help="Key in sample_idx_map.json (only needed if multiple datasets in one run)")
+    p.add_argument(
+        "--dataset-name",
+        default=None,
+        help="Key in sample_idx_map.json (only needed if multiple datasets in one run)",
+    )
     p.add_argument("--out", type=Path)
     args = p.parse_args()
 
@@ -409,7 +461,9 @@ def main() -> int:
         model_path = args.model
 
     out_path = args.out or (
-        (args.report_dir / "scores.json") if args.report_dir else (model_path.parent / "scores.json")
+        (args.report_dir / "scores.json")
+        if args.report_dir
+        else (model_path.parent / "scores.json")
     )
 
     result = score_run(args.gt, model_path, args.domain)

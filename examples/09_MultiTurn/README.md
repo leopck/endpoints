@@ -217,6 +217,25 @@ Results are stored in the configured `report_dir`. Each record in
 so conversation-level filtering requires no join. `sample_idx_map.json` maps
 `sample_uuid → dataset sample index` for callers that need it.
 
+### Accuracy Evaluation
+
+For the agentic coding and workflow datasets, score a completed run against
+the dataset's reference assistant turns:
+
+```bash
+python examples/09_MultiTurn/scripts/score_inline_accuracy.py \
+    --gt examples/09_MultiTurn/datasets/agentic_<domain>_flat.jsonl \
+    --domain <domain> \
+    --report-dir <report_dir>
+```
+
+`<domain>` is `coding` or `workflow`; `<report_dir>` is the same path used
+as `report_dir` in the benchmark config. The scorer extracts model
+assistant turns from `events.jsonl`, aligns them with the ground-truth
+flat JSONL on `(conversation_id, turn)`, and writes `model_assistants.jsonl`
+and `scores.json` into the report directory. The metric is multiset IoU on
+bash executables for `coding` and exact-match on intent code for `workflow`
+
 ## Architecture Notes
 
 ### Key Components
