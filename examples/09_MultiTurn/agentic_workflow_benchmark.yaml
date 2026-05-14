@@ -3,18 +3,25 @@ version: "1.0"
 type: "online"
 
 model_params:
-  name: "/model"            # SGLang registers the model under its --model-path
-  temperature: 0            # MLPerf-inference convention: greedy decoding for reproducibility.
-                            # MLPerf references (Llama 3.1, Mixtral, DeepSeek-R1, GPT-OSS-120B)
-                            # all override to greedy so the benchmark stays reproducible.
-  max_new_tokens: 20000     # generous cap; longest observed workflow turn is ~840 tokens
+  name: "/model" # SGLang registers the model under its --model-path
+  # Moonshot's recommended Thinking-mode sampling for Kimi-K2.6
+  # (https://huggingface.co/moonshotai/Kimi-K2.6). Verified end-to-end
+  # against SGLang: extra_body.chat_template_kwargs reaches the chat
+  # template and preserve_thinking expands prompt_tokens as expected.
+  temperature: 1.0
+  top_p: 0.95
+  max_new_tokens: 20000 # generous cap; longest observed workflow turn is ~840 tokens
+  chat_template_kwargs:
+    thinking: true
+    preserve_thinking: true
 
 datasets:
   - name: agentic_workflow
     type: performance
-    path: examples/09_MultiTurn/datasets/agentic_workflow_flat.jsonl
+    path: examples/09_MultiTurn/datasets/agentic_workflow_t1.jsonl
     multi_turn:
       turn_timeout_s: 600.0
+      enable_salt: true # cache-bursting salt — see docs/EVALUATION.md §2
 
 settings:
   runtime:

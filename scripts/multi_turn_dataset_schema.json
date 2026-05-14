@@ -424,6 +424,11 @@
         "description": "Tool execution results (required for all 'tool' role rows). Each element has {tool_call_id, content}. Single results have one entry; parallel results have multiple entries."
       },
       {
+        "field": "delay_seconds",
+        "type": "number",
+        "description": "Optional. Inter-turn wall-clock delay (seconds) the client should sleep before issuing this row. Typically set only on 'tool' rows and embedded from upstream capture timestamps via scripts/embed_tool_delays.py. For parallel tool calls (multi-entry tool_results) this is the row-level max — i.e. the wait until the last tool finished. Honored at run time only when MultiTurnConfig.inject_tool_delay=True; otherwise ignored. Missing or zero means no sleep."
+      },
+      {
         "field": "model",
         "type": "string",
         "description": "Model name override for this turn."

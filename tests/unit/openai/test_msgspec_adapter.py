@@ -191,3 +191,51 @@ def test_from_endpoint_response_populates_tool_calls_in_text_output():
     assert result.response_output.tool_calls[0]["function"]["name"] == "search"
     # metadata path unchanged
     assert result.metadata.get("tool_calls") == tool_calls
+
+
+@pytest.mark.unit
+def test_chat_template_kwargs_forwarded_when_set():
+    """chat_template_kwargs lands in the wire payload when provided on the Query."""
+    query = Query(
+        id="q3",
+        data={
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "chat_template_kwargs": {"thinking": True, "preserve_thinking": True},
+        },
+    )
+    request = OpenAIMsgspecAdapter.to_endpoint_request(query)
+    payload = json.loads(msgspec.json.encode(request))
+    assert payload["chat_template_kwargs"] == {
+        "thinking": True,
+        "preserve_thinking": True,
+    }
+
+
+@pytest.mark.unit
+def test_chat_template_kwargs_omitted_when_unset():
+    """chat_template_kwargs is dropped from the wire payload when None."""
+    query = Query(
+        id="q4",
+        data={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+    )
+    request = OpenAIMsgspecAdapter.to_endpoint_request(query)
+    payload = json.loads(msgspec.json.encode(request))
+    assert "chat_template_kwargs" not in payload
+
+
+@pytest.mark.unit
+def test_dataset_transforms_includes_chat_template_kwargs():
+    """ModelParams.chat_template_kwargs flows through to the metadata dict."""
+    from inference_endpoint.config.schema import ModelParams
+    from inference_endpoint.dataset_manager.transforms import AddStaticColumns
+
+    mp = ModelParams(
+        name="m", chat_template_kwargs={"thinking": True, "preserve_thinking": True}
+    )
+    transforms = OpenAIMsgspecAdapter.dataset_transforms(mp)
+    add_static = next(t for t in transforms if isinstance(t, AddStaticColumns))
+    assert add_static.data["chat_template_kwargs"] == {
+        "thinking": True,
+        "preserve_thinking": True,
+    }

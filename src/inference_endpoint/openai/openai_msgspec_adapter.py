@@ -33,8 +33,6 @@ from inference_endpoint.dataset_manager.transforms import (
 # Import base class and shared SSE types
 from inference_endpoint.endpoint_client.adapter_protocol import HttpRequestAdapter
 
-logger = logging.getLogger(__name__)
-
 from .types import (
     ChatCompletionChoice,
     ChatCompletionRequest,
@@ -44,6 +42,8 @@ from .types import (
     SSEChoice,
     SSEMessage,
 )
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # msgspec-based OpenAI Adapter
@@ -85,6 +85,7 @@ class OpenAIMsgspecAdapter(HttpRequestAdapter):
             "repetition_penalty": model_params.repetition_penalty,
             "presence_penalty": model_params.presence_penalty,
             "frequency_penalty": model_params.frequency_penalty,
+            "chat_template_kwargs": model_params.chat_template_kwargs,
         }
 
         # These fields are used in .to_endpoint_request() but don't exist in ModelParams,
@@ -203,6 +204,7 @@ class OpenAIMsgspecAdapter(HttpRequestAdapter):
             logit_bias=query.data.get("logit_bias"),
             user=query.data.get("user"),
             chat_template=query.data.get("chat_template"),
+            chat_template_kwargs=query.data.get("chat_template_kwargs"),
             tools=query.data.get("tools"),
         )
 

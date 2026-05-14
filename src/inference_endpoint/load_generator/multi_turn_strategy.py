@@ -19,7 +19,6 @@ import asyncio
 import logging
 import time
 from collections import defaultdict, deque
-from collections.abc import Iterator
 from typing import Any
 
 from ..config.schema import MultiTurnConfig
@@ -131,9 +130,17 @@ class MultiTurnStrategy:
         self._conv_states: dict[str, ConversationState] = {}
 
         # Event-driven state — populated in execute().
+        # ``_active_iters`` carries the ordered (sample_index, turn) list for
+        # each active conversation plus a cursor pointing at the next turn to
+        # issue. Using a cursor (not an Iterator) lets us peek at the upcoming
+        # turn for delay-injection without consuming it.
         self._pending_convs: deque[tuple[str, list[tuple[int, int]]]] = deque()
-        self._active_iters: dict[str, Iterator[tuple[int, int]]] = {}
+        self._active_iters: dict[str, tuple[list[tuple[int, int]], int]] = {}
         self._timeout_handles: dict[str, asyncio.TimerHandle] = {}
+        # Pending inter-turn delay handle per conversation. At most one is in
+        # flight per conversation because the strategy is strictly turn-serial
+        # within a single conv.
+        self._delay_handles: dict[str, asyncio.TimerHandle] = {}
         self._error: BaseException | None = None
         self._all_done: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -199,6 +206,9 @@ class MultiTurnStrategy:
             for handle in self._timeout_handles.values():
                 handle.cancel()
             self._timeout_handles.clear()
+            for handle in self._delay_handles.values():
+                handle.cancel()
+            self._delay_handles.clear()
             if self._inflight:
                 logger.warning(
                     "%d query(ies) never received a response (session stop or transport failure): %s",
@@ -210,22 +220,65 @@ class MultiTurnStrategy:
     def _start_conversation(self) -> None:
         """Pop the next conversation from the pending queue and issue its first turn."""
         conv_id, turns = self._pending_convs.popleft()
-        self._active_iters[conv_id] = iter(turns)
+        self._active_iters[conv_id] = (turns, 0)
         self._issue_next_turn(conv_id)
 
     def _issue_next_turn(self, conv_id: str) -> None:
-        """Issue the next turn for conv_id, or mark the conversation done."""
-        it = self._active_iters.get(conv_id)
-        if it is None:
+        """Schedule the next turn for conv_id, applying inter-turn delay if set.
+
+        Pops the upcoming (sample_index, turn) from the active cursor and either
+        issues it immediately or defers it via ``loop.call_later`` when the
+        dataset has a positive ``delay_seconds`` for that turn and
+        ``MultiTurnConfig.inject_tool_delay`` is enabled. Issuing is delegated
+        to ``_issue_turn_now`` so the actual phase-issuer call path is shared
+        between the immediate and delayed branches.
+        """
+        state = self._active_iters.get(conv_id)
+        if state is None:
             return
 
-        pair = next(it, None)
-        if pair is None:
+        turns, cursor = state
+        if cursor >= len(turns):
             del self._active_iters[conv_id]
             self._fill_slot()
             return
 
-        idx, turn = pair
+        idx, turn = turns[cursor]
+        # Advance the cursor up front. From this point on the turn is "owned"
+        # by either the deferred call_later or the direct _issue_turn_now path.
+        self._active_iters[conv_id] = (turns, cursor + 1)
+
+        delay = 0.0
+        if (
+            self._multi_turn_config is not None
+            and self._multi_turn_config.inject_tool_delay
+        ):
+            delay_map = self._dataset_metadata.delay_seconds_by_key
+            delay = float(delay_map.get((conv_id, turn), 0.0))
+
+        if delay > 0.0:
+            assert self._loop is not None
+            handle = self._loop.call_later(
+                delay, self._issue_turn_now, conv_id, idx, turn
+            )
+            self._delay_handles[conv_id] = handle
+        else:
+            self._issue_turn_now(conv_id, idx, turn)
+
+    def _issue_turn_now(self, conv_id: str, idx: int, turn: int) -> None:
+        """Issue a single turn to the phase issuer (no further delay handling).
+
+        Safe to call from a deferred ``loop.call_later`` because it checks
+        whether the conversation is still active before doing anything that
+        would mutate inflight/timeout state.
+        """
+        self._delay_handles.pop(conv_id, None)
+
+        # If the conversation was cancelled (e.g. timeout, session stop) while
+        # we were sleeping, drop the scheduled issue silently.
+        if conv_id not in self._active_iters:
+            return
+
         state = self._conv_states[conv_id]
 
         data_override: dict[str, Any] | None = None
@@ -379,12 +432,16 @@ class MultiTurnStrategy:
                 )
 
     def _abort_remaining_turns(self, conv_id: str, reason: str) -> int:
-        it = self._active_iters.pop(conv_id, None)
-        if it is None:
+        delay_handle = self._delay_handles.pop(conv_id, None)
+        if delay_handle is not None:
+            delay_handle.cancel()
+        state = self._active_iters.pop(conv_id, None)
+        if state is None:
             return 0
+        turns, cursor = state
         assert self._phase_issuer is not None
         dropped = 0
-        for idx, turn in it:
+        for idx, turn in turns[cursor:]:
             self._conv_manager.mark_turn_failed(
                 conv_id, store_in_history=self._store_in_history
             )

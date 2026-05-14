@@ -139,6 +139,7 @@ class ChatCompletionRequest(
     logit_bias: dict[str, float] | None = None
     user: str | None = None
     chat_template: str | None = None
+    chat_template_kwargs: dict[str, Any] | None = None
     tools: list[dict[str, Any]] | None = None
 
 

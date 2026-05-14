@@ -219,12 +219,45 @@ def _extract_intent_code(turn: dict) -> str | None:
     return None
 
 
+def _ground_truth_intent_set(turn: dict) -> set[str] | None:
+    """Ground-truth intent code set for a single assistant turn.
+
+    Reads the structured ``intent_codes`` field only. Stamped by the
+    Workato converter from the source record's ``output[i]``. Tool-only
+    assistant turns (no text reply, no classification) have no
+    ``intent_codes`` and are returned as unscorable.
+
+    Regex extraction from reasoning text is intentionally *not* used as a
+    ground-truth source. Reasoning-text intent (when present) is the
+    *model's* claim about the intent; using it as ground truth would
+    compare model claim against model claim. Ground truth lives only in
+    the dataset's structured ``intent_codes`` field.
+    """
+    codes = turn.get("intent_codes")
+    if isinstance(codes, list) and codes:
+        out = {c.upper() for c in codes if isinstance(c, str) and c}
+        return out or None
+    return None
+
+
 def score_workflow(gt: dict, model: dict) -> float | None:
-    """1.0 if intent codes match, 0.0 if not, None if gt has no intent code."""
-    gt_code = _extract_intent_code(gt)
-    if gt_code is None:
+    """1.0 if the model's extracted intent is in the gt intent set, else 0.0.
+
+    Returns ``None`` when the gt has no intent label (turn is unscorable).
+
+    The asymmetry is intentional: the dataset's ``intent_codes`` can carry
+    multiple cumulative codes per turn (e.g. ``[I000, I057, I058]``) while
+    the model emits a single code per turn through its reasoning trace. The
+    model's code is "correct" iff it matches **any** of the ground-truth
+    codes for that turn.
+    """
+    gt_set = _ground_truth_intent_set(gt)
+    if gt_set is None:
         return None
-    return float(gt_code == _extract_intent_code(model))
+    model_code = _extract_intent_code(model)
+    if model_code is None:
+        return 0.0
+    return 1.0 if model_code in gt_set else 0.0
 
 
 # ---------------------------------------------------------------------------

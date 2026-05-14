@@ -67,6 +67,7 @@ class ConversationMetadata:
         default_factory=dict
     )
     system_prompts_by_conv: dict[str, str | None] = field(default_factory=dict)
+    delay_seconds_by_key: dict[tuple[str, int], float] = field(default_factory=dict)
 
 
 def _expand_tool_results(row: dict) -> list[dict]:
@@ -408,6 +409,12 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
         pre_built_messages_by_key: dict[tuple, list[dict]] = {}
         current_turn_messages_by_key: dict[tuple, list[dict]] = {}
         system_prompts_by_conv: dict[str, str | None] = {}
+        # Per-turn wall-clock delay (seconds) to wait before issuing this client
+        # turn. Populated only for tool rows that carry a ``delay_seconds``
+        # field (typically embedded from upstream capture timestamps; see
+        # ``scripts/embed_tool_delays.py``). Rows without the field are absent
+        # from this map and are treated as zero delay at issue time.
+        delay_seconds_by_key: dict[tuple, float] = {}
 
         assert self.dataframe is not None, "Dataframe must be initialized"
         for conv_id, group in self._conv_groups.items():
@@ -498,6 +505,17 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
                 pre_built_messages_by_key[(str_conv_id, t_n)] = messages
                 current_turn_messages_by_key[(str_conv_id, t_n)] = current_turn_msgs
 
+                delay_val = row.get("delay_seconds")
+                if delay_val is not None and not (
+                    isinstance(delay_val, float) and pd.isna(delay_val)
+                ):
+                    try:
+                        delay_f = float(delay_val)
+                    except (TypeError, ValueError):
+                        delay_f = 0.0
+                    if delay_f > 0.0:
+                        delay_seconds_by_key[(str_conv_id, t_n)] = delay_f
+
                 samples.append(
                     ConversationSampleEntry(
                         conversation_id=str_conv_id,
@@ -513,6 +531,7 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
             pre_built_messages_by_key=pre_built_messages_by_key,
             current_turn_messages_by_key=current_turn_messages_by_key,
             system_prompts_by_conv=system_prompts_by_conv,
+            delay_seconds_by_key=delay_seconds_by_key,
         )
 
     def load(
@@ -624,6 +643,9 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
             # Strip dataset-internal fields that must not reach the endpoint.
             sample.pop("tool_results", None)
             sample.pop("tool_calls", None)
+            # ``delay_seconds`` is consumed by the multi-turn strategy via the
+            # metadata map; the endpoint adapter must not see it.
+            sample.pop("delay_seconds", None)
 
             # Fill missing propagated fields from the first user row of this conversation.
             for k, v in conv_defaults.get(row.get("conversation_id"), {}).items():

@@ -79,10 +79,12 @@ def _make_strategy(
     ds: MultiTurnDataset,
     use_dataset_history: bool = True,
     target_concurrency: int | None = None,
+    inject_tool_delay: bool = False,
 ) -> MultiTurnStrategy:
     mt_cfg = MultiTurnConfig(
         turn_timeout_s=10.0,
         use_dataset_history=use_dataset_history,
+        inject_tool_delay=inject_tool_delay,
     )
     assert ds.conversation_metadata is not None
     return MultiTurnStrategy(
@@ -836,4 +838,152 @@ def test_live_history_rejects_tool_turns():
             conversation_manager=ConversationManager(),
             dataset_metadata=ds.conversation_metadata,
             multi_turn_config=mt_cfg,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Inter-turn tool-response delay injection (delay_seconds on tool rows)
+# ---------------------------------------------------------------------------
+
+
+def _tool_use_rows_with_delays(
+    tool_row_delays: dict[int, float | None],
+) -> list[dict]:
+    """Build a 5-turn tool-use conversation, stamping delay_seconds on tool rows.
+
+    ``tool_row_delays`` maps the tool-row turn index (3 in this fixture) to the
+    desired ``delay_seconds`` value, or ``None`` to omit the field entirely.
+    """
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "search", "arguments": '{"q": "test"}'},
+        }
+    ]
+    tool_results = [{"tool_call_id": "call_1", "content": "search result"}]
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"q": {"type": "string"}},
+                    "required": ["q"],
+                },
+            },
+        }
+    ]
+    rows: list[dict] = [
+        {
+            "conversation_id": "c1",
+            "turn": 1,
+            "role": "user",
+            "content": "Find something",
+            "tools": tools,
+        },
+        {
+            "conversation_id": "c1",
+            "turn": 2,
+            "role": "assistant",
+            "content": None,
+            "tool_calls": tool_calls,
+        },
+        {
+            "conversation_id": "c1",
+            "turn": 3,
+            "role": "tool",
+            "tool_results": tool_results,
+            "tools": tools,
+        },
+        {
+            "conversation_id": "c1",
+            "turn": 4,
+            "role": "assistant",
+            "content": "Here is the result",
+        },
+        {"conversation_id": "c1", "turn": 5, "role": "user", "content": "Thanks"},
+    ]
+    for turn_idx, delay in tool_row_delays.items():
+        if delay is None:
+            continue
+        for r in rows:
+            if r["turn"] == turn_idx and r["role"] == "tool":
+                r["delay_seconds"] = delay
+    return rows
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_delay_seconds_end_to_end(echo_server):
+    """End-to-end: enabling inject_tool_delay measurably stretches the same dataset.
+
+    Compares the same 3-turn tool conversation run twice — once with delay
+    injection disabled (baseline) and once enabled with a 1.5s tool delay.
+    Asserts the gap matches the configured sleep within a generous tolerance;
+    fixed harness overhead cancels in the delta so the test is robust to
+    cold-start and connection-pool warmup.
+    """
+    baseline_rows = _tool_use_rows_with_delays({3: 1.5})
+
+    # Run #1: flag off — dataset delay is ignored.
+    ds_off = _make_dataset(baseline_rows)
+    strat_off = _make_strategy(ds_off, inject_tool_delay=False)
+    t0 = time.monotonic()
+    count_off = await _run_session(echo_server.url, ds_off, strat_off, {})
+    elapsed_off = time.monotonic() - t0
+
+    # Run #2: flag on — dataset delay should add ~1.5s to wall-clock.
+    ds_on = _make_dataset(baseline_rows)
+    strat_on = _make_strategy(ds_on, inject_tool_delay=True)
+    t1 = time.monotonic()
+    count_on = await _run_session(echo_server.url, ds_on, strat_on, {})
+    elapsed_on = time.monotonic() - t1
+
+    assert count_off == count_on == 3
+    delta = elapsed_on - elapsed_off
+    # The injected sleep is 1.5s; allow slack for scheduler jitter but require
+    # at least 1.0s of growth to prove the delay actually fired.
+    assert 1.0 <= delta <= 3.0, (
+        f"delay-on minus delay-off should be ~1.5s, got delta={delta:.3f}s "
+        f"(off={elapsed_off:.3f}s, on={elapsed_on:.3f}s)"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.asyncio
+async def test_delay_does_not_leak_to_endpoint_payload():
+    """The delay_seconds field is consumed by the strategy and must not appear in any HTTP request body."""
+    received_payloads: list[dict] = []
+
+    class CapturingEchoServer(EchoServer):
+        async def _handle_echo_chat_completions_request(self, request):
+            try:
+                payload = await request.json()
+                received_payloads.append(payload)
+            except Exception:
+                # Body capture is best-effort; assertion below covers correctness.
+                logger = None  # noqa: F841
+            return await super()._handle_echo_chat_completions_request(request)
+
+    server = CapturingEchoServer(port=0)
+    server.start()
+    try:
+        rows = _tool_use_rows_with_delays({3: 0.05})
+        ds = _make_dataset(rows)
+        strategy = _make_strategy(ds, inject_tool_delay=True)
+        responses: dict = {}
+
+        await _run_session(server.url, ds, strategy, responses)
+    finally:
+        server.stop()
+
+    assert received_payloads, "echo server captured no payloads"
+    for payload in received_payloads:
+        # Top-level request: openai chat-completion shape. delay_seconds is
+        # dataset-internal and must not appear here.
+        assert "delay_seconds" not in payload, (
+            "delay_seconds leaked into request payload: " f"keys={list(payload.keys())}"
         )
