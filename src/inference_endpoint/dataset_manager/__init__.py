@@ -28,7 +28,10 @@ from .predefined.gpqa import GPQA
 from .predefined.livecodebench import LiveCodeBench
 from .predefined.open_orca import OpenOrca
 from .predefined.random import RandomDataset
-from .predefined.shopify_product_catalogue import ShopifyProductCatalogue
+from .predefined.shopify_product_catalogue import (
+    ShopifyProductCatalogue,
+    ShopifyProductCatalogue8k,
+)
 from .transforms import (
     AddStaticColumns,
     ColumnFilter,
@@ -59,5 +62,6 @@ __all__ = [
     "CNNDailyMail",
     "RandomDataset",
     "ShopifyProductCatalogue",
+    "ShopifyProductCatalogue8k",
     "MultiTurnDataset",
 ]
