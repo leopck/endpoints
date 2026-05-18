@@ -169,10 +169,12 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
         # sentinel record on line 1 carrying license/source attribution. It has
         # no conversation_id and is not a real conversation; drop it before
         # grouping. Real flat rows always have a conversation_id.
-        if self.dataframe["conversation_id"].isna().any():
-            self.dataframe = self.dataframe.dropna(
-                subset=["conversation_id"]
-            ).reset_index(drop=True)
+        if "_type" in self.dataframe.columns:
+            metadata_rows = self.dataframe["_type"] == "dataset_metadata"
+            if metadata_rows.any():
+                self.dataframe = self.dataframe.loc[~metadata_rows].reset_index(
+                    drop=True
+                )
         self._enable_salt = enable_salt
         self._conv_groups = dict(
             list(self.dataframe.groupby("conversation_id", sort=False, dropna=False))
