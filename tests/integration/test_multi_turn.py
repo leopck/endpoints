@@ -841,19 +841,9 @@ def test_live_history_rejects_tool_turns():
         )
 
 
-# ---------------------------------------------------------------------------
-# Inter-turn tool-response delay injection (delay_seconds on tool rows)
-# ---------------------------------------------------------------------------
-
-
 def _tool_use_rows_with_delays(
     tool_row_delays: dict[int, float | None],
 ) -> list[dict]:
-    """Build a 5-turn tool-use conversation, stamping delay_seconds on tool rows.
-
-    ``tool_row_delays`` maps the tool-row turn index (3 in this fixture) to the
-    desired ``delay_seconds`` value, or ``None`` to omit the field entirely.
-    """
     tool_calls = [
         {
             "id": "call_1",
@@ -918,24 +908,14 @@ def _tool_use_rows_with_delays(
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_delay_seconds_end_to_end(echo_server):
-    """End-to-end: enabling inject_tool_delay measurably stretches the same dataset.
-
-    Compares the same 3-turn tool conversation run twice — once with delay
-    injection disabled (baseline) and once enabled with a 1.5s tool delay.
-    Asserts the gap matches the configured sleep within a generous tolerance;
-    fixed harness overhead cancels in the delta so the test is robust to
-    cold-start and connection-pool warmup.
-    """
     baseline_rows = _tool_use_rows_with_delays({3: 1.5})
 
-    # Run #1: flag off — dataset delay is ignored.
     ds_off = _make_dataset(baseline_rows)
     strat_off = _make_strategy(ds_off, inject_tool_delay=False)
     t0 = time.monotonic()
     count_off = await _run_session(echo_server.url, ds_off, strat_off, {})
     elapsed_off = time.monotonic() - t0
 
-    # Run #2: flag on — dataset delay should add ~1.5s to wall-clock.
     ds_on = _make_dataset(baseline_rows)
     strat_on = _make_strategy(ds_on, inject_tool_delay=True)
     t1 = time.monotonic()
@@ -944,8 +924,6 @@ async def test_delay_seconds_end_to_end(echo_server):
 
     assert count_off == count_on == 3
     delta = elapsed_on - elapsed_off
-    # The injected sleep is 1.5s; allow slack for scheduler jitter but require
-    # at least 1.0s of growth to prove the delay actually fired.
     assert 1.0 <= delta <= 3.0, (
         f"delay-on minus delay-off should be ~1.5s, got delta={delta:.3f}s "
         f"(off={elapsed_off:.3f}s, on={elapsed_on:.3f}s)"
@@ -955,7 +933,6 @@ async def test_delay_seconds_end_to_end(echo_server):
 @pytest.mark.integration
 @pytest.mark.asyncio
 async def test_delay_does_not_leak_to_endpoint_payload():
-    """The delay_seconds field is consumed by the strategy and must not appear in any HTTP request body."""
     received_payloads: list[dict] = []
 
     class CapturingEchoServer(EchoServer):
@@ -964,7 +941,6 @@ async def test_delay_does_not_leak_to_endpoint_payload():
                 payload = await request.json()
                 received_payloads.append(payload)
             except Exception:
-                # Body capture is best-effort; assertion below covers correctness.
                 logger = None  # noqa: F841
             return await super()._handle_echo_chat_completions_request(request)
 
@@ -982,8 +958,6 @@ async def test_delay_does_not_leak_to_endpoint_payload():
 
     assert received_payloads, "echo server captured no payloads"
     for payload in received_payloads:
-        # Top-level request: openai chat-completion shape. delay_seconds is
-        # dataset-internal and must not appear here.
         assert "delay_seconds" not in payload, (
             "delay_seconds leaked into request payload: " f"keys={list(payload.keys())}"
         )

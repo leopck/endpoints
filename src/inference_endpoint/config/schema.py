@@ -251,8 +251,6 @@ class MultiTurnConfig(BaseModel):
             turns of the same conversation because subsequent turns depend
             on the timed-out response.
         use_dataset_history: If True, use pre-built message history from dataset.
-        enable_salt: If True, append a per-trajectory hash to the system message.
-        inject_tool_delay: If True, sleep dataset ``delay_seconds`` before turns.
     """
 
     model_config = ConfigDict(extra="forbid", frozen=True)

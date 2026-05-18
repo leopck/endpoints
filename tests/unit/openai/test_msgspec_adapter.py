@@ -195,7 +195,6 @@ def test_from_endpoint_response_populates_tool_calls_in_text_output():
 
 @pytest.mark.unit
 def test_chat_template_kwargs_forwarded_when_set():
-    """chat_template_kwargs lands in the wire payload when provided on the Query."""
     query = Query(
         id="q3",
         data={
@@ -214,7 +213,6 @@ def test_chat_template_kwargs_forwarded_when_set():
 
 @pytest.mark.unit
 def test_chat_template_kwargs_omitted_when_unset():
-    """chat_template_kwargs is dropped from the wire payload when None."""
     query = Query(
         id="q4",
         data={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
@@ -226,7 +224,6 @@ def test_chat_template_kwargs_omitted_when_unset():
 
 @pytest.mark.unit
 def test_dataset_transforms_includes_chat_template_kwargs():
-    """ModelParams.chat_template_kwargs flows through to the metadata dict."""
     from inference_endpoint.config.schema import ModelParams
     from inference_endpoint.dataset_manager.transforms import AddStaticColumns
 

@@ -15,6 +15,7 @@
 
 """Multi-turn conversation dataset for conversational AI benchmarking."""
 
+import hashlib
 import logging
 from dataclasses import dataclass, field, replace
 from typing import Any
@@ -23,7 +24,6 @@ import pandas as pd
 
 from ..config.schema import APIType, ModelParams
 from ..exceptions import InputValidationError
-from .cache_salt import apply_salt, compute_salt
 from .dataset import Dataset
 from .transforms import (
     AddStaticColumns,
@@ -144,19 +144,11 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
 
     COLUMN_NAMES = ["conversation_id", "turn", "role", "content"]
 
-    def __init__(
-        self,
-        dataframe: pd.DataFrame,
-        *,
-        enable_salt: bool = False,
-        **kwargs,
-    ):
+    def __init__(self, dataframe: pd.DataFrame, **kwargs):
         """Initialize multi-turn dataset.
 
         Args:
             dataframe: DataFrame with conversation data.
-            enable_salt: If True, append a per-trajectory hash to the end of
-                each trajectory's system prompt.
             **kwargs: Additional arguments passed to Dataset.__init__.
 
         Raises:
@@ -170,7 +162,7 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
                 self.dataframe = self.dataframe.loc[~metadata_rows].reset_index(
                     drop=True
                 )
-        self._enable_salt = enable_salt
+        self._enable_salt = False
         self._conv_groups = dict(
             list(self.dataframe.groupby("conversation_id", sort=False, dropna=False))
         )
@@ -179,11 +171,9 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
         self._validate_turn_numbering()
         # Populated by load() after transforms; None until then.
         self.conversation_metadata: ConversationMetadata | None = None
-        if enable_salt:
-            logger.info(
-                "MultiTurnDataset cache-bursting salt enabled "
-                "(salt = blake2b(conversation_id) truncated to 16 hex chars)"
-            )
+
+    def enable_salt(self) -> None:
+        self._enable_salt = True
 
     def _validate_conversation_grouping(self) -> None:
         """Validate that all rows for each conversation_id appear consecutively in file order.
@@ -421,7 +411,10 @@ class MultiTurnDataset(Dataset, dataset_id="multi_turn_conversations"):
                     system_content = val
                     break
             if self._enable_salt and system_content:
-                system_content = apply_salt(system_content, compute_salt(str(conv_id)))
+                salt_hex = hashlib.blake2b(
+                    str(conv_id).encode("utf-8"), digest_size=8
+                ).hexdigest()
+                system_content = f"{system_content}\n\n[cache_salt: {salt_hex}]"
             system_prompts_by_conv[str(conv_id)] = system_content
 
             for _, row in client_rows.iterrows():

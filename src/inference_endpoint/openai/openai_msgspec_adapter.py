@@ -17,7 +17,6 @@
 Msgspec-based OpenAI adapter for fast serialization/deserialization.
 """
 
-import logging
 import time
 from typing import Any
 
@@ -42,8 +41,6 @@ from .types import (
     SSEChoice,
     SSEMessage,
 )
-
-logger = logging.getLogger(__name__)
 
 # ============================================================================
 # msgspec-based OpenAI Adapter
@@ -125,17 +122,8 @@ class OpenAIMsgspecAdapter(HttpRequestAdapter):
 
     @classmethod
     def decode_sse_message(cls, json_bytes: bytes) -> SSEChoice | None:
-        """Decode SSE message and return the SSEChoice."""
-        try:
-            msg = cls._sse_decoder.decode(json_bytes)
-        except msgspec.ValidationError as e:
-            preview = json_bytes[:1024].decode("utf-8", errors="replace")
-            logger.warning(
-                "SSE chunk failed to decode: %s. Raw bytes (first 1024): %s",
-                e,
-                preview,
-            )
-            return None
+        """Decode SSE message and return the SSEChoice (delta + finish_reason)."""
+        msg = cls._sse_decoder.decode(json_bytes)
         if not msg.choices:
             return None
         return msg.choices[0]
@@ -237,7 +225,6 @@ class OpenAIMsgspecAdapter(HttpRequestAdapter):
                 output=choice.message.content or "",
                 reasoning=choice.message.reasoning_content,
                 tool_calls=tool_calls_tuple,
-                finish_reason=choice.finish_reason,
             ),
             metadata=metadata,
         )

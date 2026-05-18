@@ -48,8 +48,6 @@ class OpenAISSEAccumulator(SSEAccumulatorProtocol):
         if delta is None:
             return None
 
-        reasoning_payload = delta.reasoning_content or delta.reasoning
-
         # Accumulate tool_calls partials (streamed as incremental JSON fragments)
         if delta.tool_calls:
             for partial in delta.tool_calls:
@@ -71,9 +69,10 @@ class OpenAISSEAccumulator(SSEAccumulatorProtocol):
         if delta.content:
             self.output_chunks.append(delta.content)
             content = delta.content
-        elif reasoning_payload:
-            self.reasoning_chunks.append(reasoning_payload)
-            content = reasoning_payload
+        elif delta.reasoning_content or delta.reasoning:
+            rc = delta.reasoning_content or delta.reasoning
+            self.reasoning_chunks.append(rc)  # type: ignore[arg-type]
+            content = rc
         elif delta.tool_calls and not self.first_chunk_sent:
             # Pure tool-call delta with no text: emit a zero-length sentinel so
             # RECV_FIRST / TTFT fires for agentic responses that have no content.
@@ -117,24 +116,17 @@ class OpenAISSEAccumulator(SSEAccumulatorProtocol):
                 output="".join(self.output_chunks),
                 reasoning=resp_reasoning,
                 tool_calls=tool_calls_tuple,
-                finish_reason=self._finish_reason,
             )
         elif self.output_chunks:
             resp_output: list[str] = [self.output_chunks[0]]
             if len(self.output_chunks) > 1:
                 resp_output.append("".join(self.output_chunks[1:]))
             text_output = TextModelOutput(
-                output=resp_output,
-                reasoning=None,
-                tool_calls=tool_calls_tuple,
-                finish_reason=self._finish_reason,
+                output=resp_output, reasoning=None, tool_calls=tool_calls_tuple
             )
         else:
             text_output = TextModelOutput(
-                output=[],
-                reasoning=None,
-                tool_calls=tool_calls_tuple,
-                finish_reason=self._finish_reason,
+                output=[], reasoning=None, tool_calls=tool_calls_tuple
             )
 
         metadata: dict[str, Any] = {

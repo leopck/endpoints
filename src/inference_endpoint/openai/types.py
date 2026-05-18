@@ -48,14 +48,12 @@ class SSEDelta(msgspec.Struct, frozen=True, kw_only=True, omit_defaults=True, gc
     AT-RISK (gc=False): Has mutable container field `tool_calls`. Any change that
     mutates `tool_calls` after construction or stores cyclic references in it
     must be audited; if so, remove gc=False.
-
-    Thinking-mode payloads may arrive as ``reasoning_content`` or ``reasoning``.
     """
 
     role: str | None = None
     content: str | None = None
-    reasoning_content: str | None = None
-    reasoning: str | None = None
+    reasoning_content: str | None = None  # SGLang / DeepSeek field name
+    reasoning: str | None = None  # vLLM field name
     tool_calls: list[dict[str, Any]] | None = None
 
 
@@ -95,7 +93,6 @@ class ChatMessage(
              None for tool-dispatching assistant messages.
     tool_calls: list of tool call objects for assistant messages that invoke tools.
     tool_call_id: correlates a tool result message to its tool call.
-    reasoning_content: thinking-mode trace from a prior assistant turn.
     """
 
     role: str
@@ -142,7 +139,9 @@ class ChatCompletionResponseMessage(
 ):  # type: ignore[call-arg]
     """Response message from OpenAI.
 
-    Non-role fields default to None because compatible servers may omit them.
+    ``content`` and ``refusal`` are nullable per the OpenAI spec and vLLM
+    routinely omits them (e.g. when the model returns no text or no refusal
+    block), so they default to ``None`` to allow successful decoding.
     """
 
     role: str

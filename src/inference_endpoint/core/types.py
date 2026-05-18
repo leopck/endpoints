@@ -101,13 +101,13 @@ class TextModelOutput(
         output: Main model output. Defaults to empty string.
         reasoning: Optional reasoning trace. Defaults to None.
         tool_calls: Optional structured tool calls. Defaults to None.
-        finish_reason: Optional generation stop reason. Defaults to None.
+                    Placed after reasoning so wire-format with array_like=True is
+                    backward compatible (missing trailing elements decode as default).
     """
 
     output: OUTPUT_ELEM_TYPE = ""
     reasoning: OUTPUT_ELEM_TYPE | None = None
     tool_calls: tuple[dict[str, Any], ...] | None = None
-    finish_reason: str | None = None
 
     def __post_init__(self):
         """Convert list to tuple for output, reasoning, and tool_calls to preserve immutability."""

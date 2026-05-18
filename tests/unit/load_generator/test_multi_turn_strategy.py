@@ -709,15 +709,9 @@ async def test_issue_passes_conversation_id_and_turn_to_phase_issuer():
     assert issuer.uuid_to_conv_info == expected
 
 
-# ---------------------------------------------------------------------------
-# Inter-turn tool-response delay injection
-# ---------------------------------------------------------------------------
-
-
 def _metadata_with_delay(
     conv_id: str, turns: list[int], delay_turn: int, delay: float
 ) -> ConversationMetadata:
-    """Build minimal dataset_metadata with one delayed turn."""
     md = _make_dataset_metadata({conv_id: turns})
     md.delay_seconds_by_key = {(conv_id, delay_turn): delay}
     return md
@@ -726,7 +720,6 @@ def _metadata_with_delay(
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_inject_tool_delay_defers_issue_via_call_later():
-    """With inject_tool_delay=True, the strategy schedules via loop.call_later for the delayed turn."""
     from inference_endpoint.config.schema import MultiTurnConfig
 
     conv_manager = ConversationManager()
@@ -769,9 +762,8 @@ async def test_inject_tool_delay_defers_issue_via_call_later():
     responder.cancel()
 
     assert issuer.issued == [0, 1]
-    # Turn 2 (sample idx 1) should be issued ≥ 0.05s after turn 1 thanks to call_later.
     gap = issue_times[1] - issue_times[0]
-    assert gap >= 0.04, f"expected ≥0.04s gap between issues, got {gap:.4f}s"
+    assert gap >= 0.04, f"expected >=0.04s gap between issues, got {gap:.4f}s"
 
 
 @pytest.mark.unit
@@ -871,11 +863,9 @@ async def test_error_turn_aborts_remaining_turns():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_inject_tool_delay_disabled_issues_immediately():
-    """With inject_tool_delay=False the dataset delay is ignored — turn 2 issued without sleep."""
     from inference_endpoint.config.schema import MultiTurnConfig
 
     conv_manager = ConversationManager()
-    # Dataset stamps a 2-second delay; if honored the test would time out.
     metadata = _metadata_with_delay("c1", [1, 2], delay_turn=2, delay=2.0)
     cfg = MultiTurnConfig(turn_timeout_s=5.0, inject_tool_delay=False)
     strategy = MultiTurnStrategy(conv_manager, metadata, multi_turn_config=cfg)
@@ -922,12 +912,10 @@ async def test_inject_tool_delay_disabled_issues_immediately():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_inject_tool_delay_no_dataset_field_back_compat():
-    """No delay_seconds_by_key entry → behaves like the pre-delay strategy."""
     from inference_endpoint.config.schema import MultiTurnConfig
 
     conv_manager = ConversationManager()
     metadata = _make_dataset_metadata({"c1": [1, 2]})
-    # Intentionally no delay_seconds_by_key — must not crash.
     cfg = MultiTurnConfig(turn_timeout_s=5.0, inject_tool_delay=True)
     strategy = MultiTurnStrategy(conv_manager, metadata, multi_turn_config=cfg)
     issuer = FakePhaseIssuer()
@@ -955,19 +943,14 @@ async def test_inject_tool_delay_no_dataset_field_back_compat():
 @pytest.mark.unit
 @pytest.mark.asyncio
 async def test_inject_tool_delay_cancels_on_timeout():
-    """If a turn times out while a delay is pending for the NEXT turn, the deferred issue is dropped."""
     from inference_endpoint.config.schema import MultiTurnConfig
 
     conv_manager = ConversationManager()
-    # 3 turns; delay 1.0s on turn 3 (sample idx 2).
     metadata = _metadata_with_delay("c1", [1, 2, 3], delay_turn=3, delay=1.0)
-    # turn_timeout shorter than the dataset delay so the deferred call_later
-    # for turn 3 will still be pending when the timeout for turn 2 fires.
     cfg = MultiTurnConfig(turn_timeout_s=0.1, inject_tool_delay=True)
     strategy = MultiTurnStrategy(conv_manager, metadata, multi_turn_config=cfg)
     issuer = FakePhaseIssuer()
 
-    # Auto-respond to turn 1 only; never respond to turn 2 so its timeout fires.
     async def respond_first_only():
         while not issuer.issued:
             await asyncio.sleep(0.005)
@@ -979,9 +962,6 @@ async def test_inject_tool_delay_cancels_on_timeout():
     await asyncio.wait_for(strategy.execute(issuer), timeout=2.0)
     responder.cancel()
 
-    # Turns 1 and 2 (sample indices 0, 1) issued; turn 3 (sample idx 2) must
-    # NOT have been issued — the conversation was cancelled by the turn-2
-    # timeout, and the delay handle for turn 3 was cancelled with it.
     assert issuer.issued == [
         0,
         1,
