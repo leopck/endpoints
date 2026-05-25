@@ -124,9 +124,9 @@ class TextModelOutput(
     Supports main output, optional reasoning (e.g. chain-of-thought), and tool calls.
     Each field may be a string (non-streaming) or tuple of strings (streaming chunks).
 
-    AT-RISK (gc=False): Has mutable container field `tool_calls`. Any change
-    that mutates it after construction or stores cyclic references in it must
-    be audited; if so, remove gc=False.
+    AT-RISK (gc=False): Has mutable container field `tool_calls`. Any change that
+    mutates `tool_calls` after construction or stores cyclic references in it
+    must be audited; if so, remove gc=False.
 
     Attributes:
         output: Main model output. Defaults to empty string.
@@ -134,8 +134,6 @@ class TextModelOutput(
         tool_calls: Optional structured tool calls. Defaults to None.
                     Placed after reasoning so wire-format with array_like=True is
                     backward compatible (missing trailing elements decode as default).
-                    For streaming responses this may contain tool-call delta
-                    chunks, which are merged at tokenization boundaries.
     """
 
     output: OUTPUT_ELEM_TYPE = ""
@@ -177,8 +175,9 @@ class TextModelOutput(
     def text_after_first_chunk(self) -> str:
         """Return the full output text excluding the first chunk.
 
-        For streamed responses, this returns the text/message content emitted
-        after the first chunk.
+        For TPOT calculation: token_count(text_after_first_chunk) gives the
+        number of tokens generated after the first chunk, which is the TPOT
+        denominator.
 
         For non-streaming (str fields), there is no "first chunk" concept so
         this returns an empty string.

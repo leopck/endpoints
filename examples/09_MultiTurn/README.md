@@ -19,8 +19,7 @@ contiguous and ordered by increasing `turn`.
 
 Required fields are `conversation_id`, `turn`, and `role`. User rows normally
 include `content`; agentic rows can also include `system`, `tools`,
-`tool_calls`, `tool_results`, `reasoning_content`, `intent_codes`, and
-`delay_seconds`.
+`tool_calls`, `tool_results`, `reasoning_content`, and `delay_seconds`.
 
 Place the dataset under `examples/09_MultiTurn/datasets/` or point the YAML at
 another accessible JSONL path.
@@ -28,8 +27,7 @@ another accessible JSONL path.
 ## Start A Server
 
 Start an SGLang OpenAI-compatible server. This is the standard recipe used for
-throughput and inline-accuracy replays; adjust `--model-path`, `--tp`, and
-`--port` for your node.
+throughput replays; adjust `--model-path`, `--tp`, and `--port` for your node.
 
 ```bash
 python3 -m sglang.launch_server \
@@ -93,20 +91,3 @@ Update the first `datasets` entry (`name` and `path`), `model_params.name`, and
 uv run inference-endpoint benchmark from-config \
   --config examples/09_MultiTurn/kimi_agentic_benchmark.yaml
 ```
-
-## Score Inline Accuracy
-
-After a run completes, score the model assistant turns against the same ground
-truth JSONL:
-
-```bash
-uv run python examples/09_MultiTurn/accuracy/score_inline_accuracy.py \
-  --gt <dataset.jsonl> \
-  --domain coding \
-  --report-dir logs/kimi_agentic \
-  --out logs/kimi_agentic/scores.json
-```
-
-Use `--domain workflow` for workflow traces. In `--report-dir` mode the scorer
-reads `events.jsonl` and `sample_idx_map.json`, derives assistant turns, and
-writes a compact score summary plus per-turn scores.
