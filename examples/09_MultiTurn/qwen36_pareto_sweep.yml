@@ -1,0 +1,124 @@
+# benchctl sweep — Qwen3.6-35B-A3B-FP8 multi-turn agentic benchmarking
+# on the lyris cluster (GB200, 8 GPUs per node).
+#
+# Replicates a tractable subset of the GB200 Pareto front from
+# GEN_pareto.xlsx (94 rows, 49 on GB200) on real hardware, using PR #314's
+# MultiTurnDataset against agentic_combined_v3_shuffled_seed42.jsonl
+# (990 conversations: 490 coding + 500 workflow, deterministically
+# shuffled at conversation granularity).
+#
+# Pareto regimes captured (num_gpu=8 rows from the xlsx):
+#   - MTP1, large chunk-size (rows 13-14: ck=5120/7168, ep=2pp4)
+#       → vLLM TP=4 DP=2 EP, --max-num-batched-tokens=4096
+#   - MTP3, small chunk-size, tep=8 (rows 24-27: ck=1/2/4/8)
+#       → vLLM TP=4 DP=2 EP, --max-num-batched-tokens=256
+#
+# Server flags follow the Task-4 review:
+#   --enable-auto-tool-choice --tool-call-parser qwen3_coder    (tool round-trips)
+#   --reasoning-parser qwen3                                    (reasoning_content replay)
+#   --language-model-only                                       (vision encoder unused)
+#
+# Client side uses PR-314's MultiTurnDataset (id=multi_turn_conversations)
+# via from-config YAMLs in this directory (qwen36_offline.yaml,
+# qwen36_multiturn_conc32.yaml, qwen36_multiturn_conc64.yaml). The YAMLs
+# embed all knobs (enable_salt, inject_tool_delay, chat_template_kwargs,
+# samples, multi_turn config), so the benchctl command: lines stay deterministic.
+#
+# Prerequisites on cluster (push from laptop before running):
+#   ~/endpoints/                            -- this PR-314 checkout (pip install -e'd in container)
+#   ~/datasets/agentic_combined_v3_shuffled_seed42.jsonl
+#
+# Drive from laptop:
+#   slurmctl --host lyris reserve -A coreai_mlperf_inference -p gb200-backfill -N 1 -g 8 -t 4:00:00
+#   export SLURM_JOBID=<jobid>
+#   export SLURMCTL_HOST=lyris
+#   benchctl run endpoints/examples/09_MultiTurn/qwen36_pareto_sweep.yml --backend slurm
+
+name: qwen36-pareto-multiturn
+
+defaults:
+  backend: slurm
+  image: vllm/vllm-openai:latest
+  mounts:
+    - /lustre/fsw/coreai_mlperf_inference:/workspace
+    - /home/sphoong/endpoints:/opt/endpoints
+    - /home/sphoong/datasets:/workspace/datasets
+    - /home/sphoong:/home/sphoong
+  results_dir: /Users/sphoong/work/07-qwen36-multiturn/qwen36-pareto-results
+  env:
+    VLLM_ENGINE_READY_TIMEOUT_S: "1800"
+
+servers:
+  # Zip mode: two servers, one per Pareto regime.
+  - id: qwen36-mtp${mtp}-tok${tok}
+    sweep:
+      axes:
+        mtp: [1, 3]
+        tok: [4096, 256]
+      mode: zip
+    command: |
+      vllm serve Qwen/Qwen3.6-35B-A3B-FP8
+        --tensor-parallel-size 4
+        --enable-expert-parallel
+        --gpu-memory-utilization 0.85
+        --kv-cache-dtype fp8
+        --speculative-config '{"method":"qwen3_5_mtp","num_speculative_tokens":${mtp}}'
+        --max-num-batched-tokens ${tok}
+        --max-num-seqs 64
+        --enable-auto-tool-choice
+        --tool-call-parser qwen3_coder
+        --reasoning-parser qwen3
+        --language-model-only
+        --trust-remote-code
+        --limit-mm-per-prompt '{"image":0,"video":0}'
+    ready:
+      pattern: "Application startup complete"
+      timeout: 1800
+    port: 8000
+    resources: {gpus: 4}
+
+clients:
+  # Fast smoke client: 128-conv subset, conc=8, ~30s benchmark. For plumbing
+  # validation only — set its `to_run: false` (or filter via --pair) for the
+  # real Pareto sweep.
+  - id: ep-smoke
+    command: |
+      if ! command -v inference-endpoint >/dev/null 2>&1; then
+        pip install -q -e /opt/endpoints
+      fi
+      inference-endpoint benchmark from-config \
+        --config /opt/endpoints/examples/09_MultiTurn/qwen36_smoke.yaml
+
+  - id: ep-multiturn-conc128
+    command: |
+      if ! command -v inference-endpoint >/dev/null 2>&1; then
+        pip install -q -e /opt/endpoints
+      fi
+      inference-endpoint benchmark from-config \
+        --config /opt/endpoints/examples/09_MultiTurn/qwen36_multiturn_conc128.yaml
+
+  - id: ep-multiturn-conc32
+    command: |
+      if ! command -v inference-endpoint >/dev/null 2>&1; then
+        pip install -q -e /opt/endpoints
+      fi
+      inference-endpoint benchmark from-config \
+        --config /opt/endpoints/examples/09_MultiTurn/qwen36_multiturn_conc32.yaml
+
+  - id: ep-multiturn-conc64
+    command: |
+      if ! command -v inference-endpoint >/dev/null 2>&1; then
+        pip install -q -e /opt/endpoints
+      fi
+      inference-endpoint benchmark from-config \
+        --config /opt/endpoints/examples/09_MultiTurn/qwen36_multiturn_conc64.yaml
+
+# Resolved matrix (verify with `benchctl ls`):
+#   qwen36-mtp1-tok4096 × ep-offline-200
+#   qwen36-mtp1-tok4096 × ep-multiturn-conc32
+#   qwen36-mtp1-tok4096 × ep-multiturn-conc64
+#   qwen36-mtp3-tok256  × ep-offline-200
+#   qwen36-mtp3-tok256  × ep-multiturn-conc32
+#   qwen36-mtp3-tok256  × ep-multiturn-conc64
+# 6 pairs. Wall-clock estimate: ~2h on a single 8-GPU node
+# (~3min vLLM warmup × 2 servers + ~15min per client average).

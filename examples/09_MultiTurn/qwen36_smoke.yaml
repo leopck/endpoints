@@ -1,0 +1,47 @@
+# Qwen3.6 fast smoke — 128-conv subset, multi-turn conc=8, 30s.
+#
+# Goal: validate the plumbing (vLLM ready, endpoints loads + tokenizes +
+# issues requests, vLLM serves the multi-turn requests). NOT a perf
+# measurement. Tokenize time should be ~30s instead of ~15 min on the full
+# 990-conv dataset.
+name: "qwen36-smoke"
+version: "1.0"
+type: "online"
+
+model_params:
+  name: "Qwen/Qwen3.6-35B-A3B-FP8"
+  temperature: 1.0
+  top_p: 0.95
+  max_new_tokens: 2048
+  chat_template_kwargs:
+    thinking: true
+    preserve_thinking: true
+
+datasets:
+  - name: agentic_coding_128
+    type: performance
+    path: /workspace/datasets/subsets/agentic_coding_128.jsonl
+    samples: 50
+    multi_turn:
+      turn_timeout_s: 300.0
+      enable_salt: true
+      inject_tool_delay: true
+
+settings:
+  runtime:
+    min_duration_ms: 0
+
+  load_pattern:
+    type: multi_turn
+    target_concurrency: 8
+
+  client:
+    warmup_connections: 0
+    max_idle_time: 0.5
+
+endpoint_config:
+  endpoints:
+    - "http://localhost:8000"
+  api_type: openai
+
+report_dir: /home/sphoong/qwen36-pareto-results/report
