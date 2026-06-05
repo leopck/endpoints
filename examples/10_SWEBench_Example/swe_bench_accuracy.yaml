@@ -24,8 +24,8 @@ datasets:
       eval_method: "swe_bench_scorer"
       num_repeats: 1
       extras:
-        # Defaults to $MINI_SWE_AGENT_DIR or ~/vllm_test/swe_mini_combined.
-        mini_swe_agent_dir: "/home/user/vllm_test/swe_mini_combined"
+        # Defaults to $SWE_BENCH_PROJECT_PATH or the in-repo subproject.
+        # swe_bench_project_path: "/path/to/examples/10_SWEBench_Example/accuracy"
         swebench_config_template: "examples/10_SWEBench_Example/swebench_template.yaml"
         num_instances: 10
         subset: "verified"

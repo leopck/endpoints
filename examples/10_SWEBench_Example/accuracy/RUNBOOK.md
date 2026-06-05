@@ -11,28 +11,26 @@ HuggingFace access, or mini-swe-agent wiring issues.
 - `uv` binary on PATH (`curl -LsSf https://astral.sh/uv/install.sh | sh`).
 - Parent endpoints env already synced (`uv sync --extra dev` from repo root).
 
-## 1. Set up the mini-swe-agent venv
+## 1. Sync the accuracy subproject
 
-Create the venv and install dependencies once:
+From the repo root:
 
 ```bash
-mkdir -p ~/vllm_test/swe_mini_combined
-cd ~/vllm_test/swe_mini_combined
-uv venv
-uv pip install mini-swe-agent==2.3.0 swebench==4.1.0
+cd examples/10_SWEBench_Example/accuracy
+uv sync
 ```
 
 Sanity check:
 
 ```bash
-.venv/bin/mini-extra --help
-.venv/bin/python -m swebench.harness.run_evaluation --help
+uv run mini-extra --help
+uv run python -m swebench.harness.run_evaluation --help
 ```
 
-Override the default path via env var if your venv lives elsewhere:
+Override the default subproject path via env var if needed:
 
 ```bash
-export MINI_SWE_AGENT_DIR=/path/to/your/swe_mini_combined
+export SWE_BENCH_PROJECT_PATH=/path/to/examples/10_SWEBench_Example/accuracy
 ```
 
 ## 2. End-to-end test (requires live endpoint)
@@ -44,9 +42,9 @@ uv run inference-endpoint benchmark from-config \
 
 ## Common failure modes
 
-| Symptom                                  | Likely cause              | Fix                                                |
-| ---------------------------------------- | ------------------------- | -------------------------------------------------- |
-| `FileNotFoundError: mini-swe-agent venv` | venv not created          | Run the setup commands in §1                       |
-| Docker error during `run_evaluation`     | Docker daemon not running | Start Docker and retry                             |
-| HuggingFace rate limit                   | No auth token             | Set `HF_TOKEN` env var and retry                   |
-| `uv: command not found`                  | uv not installed          | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Symptom                                             | Likely cause              | Fix                                                      |
+| --------------------------------------------------- | ------------------------- | -------------------------------------------------------- |
+| `FileNotFoundError: SWE-bench subproject not found` | subproject not synced     | Run `uv sync` in `examples/10_SWEBench_Example/accuracy` |
+| Docker error during `run_evaluation`                | Docker daemon not running | Start Docker and retry                                   |
+| HuggingFace rate limit                              | No auth token             | Set `HF_TOKEN` env var and retry                         |
+| `uv: command not found`                             | uv not installed          | `curl -LsSf https://astral.sh/uv/install.sh \| sh`       |
