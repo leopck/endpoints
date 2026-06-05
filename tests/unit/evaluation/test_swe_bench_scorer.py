@@ -65,12 +65,11 @@ def _make_dataset(n: int = 3) -> MagicMock:
 
 
 @pytest.fixture
-def mini_swe_dir(tmp_path: Path) -> Path:
-    """Fake mini-swe-agent directory with a minimal venv structure."""
-    d = tmp_path / "swe_mini_combined"
-    (d / ".venv" / "bin").mkdir(parents=True)
-    (d / ".venv" / "bin" / "python").write_text("#!/usr/bin/env python3\n")
-    (d / ".venv" / "bin" / "mini-extra").write_text("#!/bin/sh\n")
+def swe_bench_project(tmp_path: Path) -> Path:
+    """Fake accuracy subproject directory with a minimal pyproject.toml."""
+    d = tmp_path / "accuracy"
+    d.mkdir(parents=True)
+    (d / "pyproject.toml").write_text("[project]\nname = 'swe-bench-accuracy'\n")
     return d
 
 
@@ -101,7 +100,7 @@ def report_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def patch_subprocess(monkeypatch, report_dir: Path, mini_swe_dir: Path):
+def patch_subprocess(monkeypatch, report_dir: Path, swe_bench_project: Path):
     """Patch subprocess.run to write fake preds.json and result JSON."""
     captured: list[list[str]] = []
 
@@ -139,13 +138,13 @@ class TestSWEBenchScorerRegistration:
 
 class TestSWEBenchScorer:
     def test_score_happy_path(
-        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+        self, report_dir, swe_bench_project, template_yaml, patch_subprocess
     ):
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
         )
         score, n_repeats = scorer.score()
@@ -154,31 +153,35 @@ class TestSWEBenchScorer:
         assert n_repeats == 1
         assert (report_dir / "swe_bench_results.json").exists()
 
-    def test_missing_venv_raises_at_init(self, report_dir, tmp_path, template_yaml):
-        empty_dir = tmp_path / "empty_swe"
+    def test_missing_subproject_raises_at_init(
+        self, report_dir, tmp_path, template_yaml
+    ):
+        empty_dir = tmp_path / "empty_project"
         empty_dir.mkdir()
-        with pytest.raises(FileNotFoundError, match="mini-swe-agent venv"):
+        with pytest.raises(FileNotFoundError, match="SWE-bench subproject not found"):
             SWEBenchScorer(
                 dataset_name=_DATASET_NAME,
                 dataset=_make_dataset(),
                 report_dir=report_dir,
-                mini_swe_agent_dir=empty_dir,
+                swe_bench_project_path=empty_dir,
                 swebench_config_template=template_yaml,
             )
 
-    def test_missing_template_raises_at_init(self, report_dir, mini_swe_dir, tmp_path):
+    def test_missing_template_raises_at_init(
+        self, report_dir, swe_bench_project, tmp_path
+    ):
         nonexistent = tmp_path / "no_such_template.yaml"
         with pytest.raises(FileNotFoundError, match="swebench template"):
             SWEBenchScorer(
                 dataset_name=_DATASET_NAME,
                 dataset=_make_dataset(),
                 report_dir=report_dir,
-                mini_swe_agent_dir=mini_swe_dir,
+                swe_bench_project_path=swe_bench_project,
                 swebench_config_template=nonexistent,
             )
 
     def test_missing_preds_returns_none(
-        self, report_dir, mini_swe_dir, template_yaml, monkeypatch
+        self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
         def fake_run(cmd, **kwargs):
             return MagicMock(returncode=0, stdout="ok\n")
@@ -188,14 +191,14 @@ class TestSWEBenchScorer:
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
         )
         score, n_repeats = scorer.score()
         assert score is None
         assert n_repeats == 1
 
-    def test_config_patching_all_fields(self, report_dir, mini_swe_dir, tmp_path):
+    def test_config_patching_all_fields(self, report_dir, swe_bench_project, tmp_path):
         tmpl = {
             "model": {
                 "model_name": "",
@@ -224,7 +227,7 @@ class TestSWEBenchScorer:
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_path,
         )
         output_dir = tmp_path / "out"
@@ -246,7 +249,7 @@ class TestSWEBenchScorer:
         }
 
     def test_config_patching_omits_none_fields(
-        self, report_dir, mini_swe_dir, tmp_path
+        self, report_dir, swe_bench_project, tmp_path
     ):
         tmpl = {
             "model": {
@@ -265,7 +268,7 @@ class TestSWEBenchScorer:
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_path,
         )
         output_dir = tmp_path / "out"
@@ -278,13 +281,13 @@ class TestSWEBenchScorer:
         assert "top_k" not in patched["model"]["model_kwargs"]
 
     def test_num_instances_slice(
-        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+        self, report_dir, swe_bench_project, template_yaml, patch_subprocess
     ):
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(n=100),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
             num_instances=5,
         )
@@ -295,14 +298,14 @@ class TestSWEBenchScorer:
         assert agent_cmd[agent_cmd.index("--slice") + 1] == "0:5"
 
     def test_default_slice_uses_full_dataset(
-        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+        self, report_dir, swe_bench_project, template_yaml, patch_subprocess
     ):
         n = 42
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(n=n),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
         )
         scorer.score()
@@ -311,13 +314,13 @@ class TestSWEBenchScorer:
         assert agent_cmd[agent_cmd.index("--slice") + 1] == f"0:{n}"
 
     def test_lite_subset_uses_correct_hf_name(
-        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+        self, report_dir, swe_bench_project, template_yaml, patch_subprocess
     ):
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
             report_dir=report_dir,
-            mini_swe_agent_dir=mini_swe_dir,
+            swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
             subset="lite",
         )

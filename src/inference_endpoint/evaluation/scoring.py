@@ -1660,10 +1660,15 @@ class VBenchScorer(Scorer, scorer_id="vbench"):
         return mean_score, n_repeats
 
 
-_DEFAULT_MINI_SWE_AGENT_DIR = Path.home() / "vllm_test" / "swe_mini_combined"
-_MINI_SWE_AGENT_DIR_ENV = "MINI_SWE_AGENT_DIR"
+_DEFAULT_SWE_BENCH_PROJECT_PATH = (
+    Path(__file__).resolve().parents[3]
+    / "examples"
+    / "10_SWEBench_Example"
+    / "accuracy"
+)
+_SWE_BENCH_PROJECT_PATH_ENV = "SWE_BENCH_PROJECT_PATH"
 _DEFAULT_SWE_BENCH_TEMPLATE = (
-    Path(__file__).parent.parent.parent
+    Path(__file__).resolve().parents[3]
     / "examples"
     / "10_SWEBench_Example"
     / "swebench_template.yaml"
@@ -1680,13 +1685,16 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
     3. Runs swebench.harness.run_evaluation to grade the predictions.
     4. Returns resolved_rate = resolved_instances / submitted_instances.
 
-    Required setup: mini-swe-agent venv must exist at mini_swe_agent_dir/.venv.
-    Run: cd <mini_swe_agent_dir> && uv venv && uv pip install mini-swe-agent swebench
+    mini-swe-agent and swebench are invoked via ``uv run --project
+    <swe_bench_project_path>`` so the parent benchmark process never needs to
+    import them directly. Run ``uv sync`` in the subproject directory once
+    before use.
 
     extras keys (all optional except those listed):
-        mini_swe_agent_dir    Path to the swe_mini_combined checkout.
-                              Falls back to $MINI_SWE_AGENT_DIR or
-                              ~/vllm_test/swe_mini_combined.
+        swe_bench_project_path  Path to the accuracy subproject directory
+                                (examples/10_SWEBench_Example/accuracy).
+                                Falls back to $SWE_BENCH_PROJECT_PATH or
+                                the in-repo default.
         swebench_config_template  Path to a swebench YAML template.
                                   Defaults to examples/10_SWEBench_Example/
                                   swebench_template.yaml in this repo.
@@ -1709,7 +1717,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         report_dir: os.PathLike,
         extractor: type[Extractor] | None = None,
         ground_truth_column: str | None = "instance_id",
-        mini_swe_agent_dir: str | os.PathLike | None = None,
+        swe_bench_project_path: str | os.PathLike | None = None,
         swebench_config_template: str | os.PathLike | None = None,
         subset: str = "verified",
         split: str = "test",
@@ -1725,7 +1733,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             extractor=extractor,
             ground_truth_column=ground_truth_column,
         )
-        self.mini_swe_agent_dir = self._resolve_mini_swe_agent_dir(mini_swe_agent_dir)
+        self.swe_bench_project_path = self._resolve_project_path(swe_bench_project_path)
         self.swebench_config_template = (
             Path(swebench_config_template)
             if swebench_config_template is not None
@@ -1747,24 +1755,25 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
                 f"swebench template not found: {self.swebench_config_template}. "
                 f"Pass swebench_config_template= in accuracy_config.extras."
             )
-        venv_python = self.mini_swe_agent_dir / ".venv" / "bin" / "python"
-        if not venv_python.exists():
+        pyproject = self.swe_bench_project_path / "pyproject.toml"
+        if not pyproject.exists():
             raise FileNotFoundError(
-                f"mini-swe-agent venv not found at {venv_python}. "
-                f"Run: cd {self.mini_swe_agent_dir} && uv venv && "
-                f"uv pip install mini-swe-agent swebench"
+                f"SWE-bench subproject not found at {self.swe_bench_project_path}. "
+                f"Set ${_SWE_BENCH_PROJECT_PATH_ENV} to the subproject path, "
+                f"then run: cd {self.swe_bench_project_path} && uv sync"
             )
 
     @staticmethod
-    def _resolve_mini_swe_agent_dir(
+    def _resolve_project_path(
         explicit: str | os.PathLike | None,
     ) -> Path:
+        """Lookup order: explicit ctor arg → ``$SWE_BENCH_PROJECT_PATH`` env var → in-repo default."""
         if explicit is not None:
             return Path(explicit)
-        from_env = os.environ.get(_MINI_SWE_AGENT_DIR_ENV)
+        from_env = os.environ.get(_SWE_BENCH_PROJECT_PATH_ENV)
         if from_env:
             return Path(from_env)
-        return Path(_DEFAULT_MINI_SWE_AGENT_DIR)
+        return Path(_DEFAULT_SWE_BENCH_PROJECT_PATH)
 
     def score_single_sample(self, value: str, ground_truth: str) -> float:
         raise RuntimeError(
@@ -1814,15 +1823,17 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         return patched_path
 
     def _run_subprocess(self, cmd: list[str], log_path: Path, cwd: Path) -> None:
-        """Run a subprocess with the mini-swe-agent venv activated."""
-        venv_bin = self.mini_swe_agent_dir / ".venv" / "bin"
-        env = os.environ.copy()
-        env["VIRTUAL_ENV"] = str(self.mini_swe_agent_dir / ".venv")
-        env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+        """Run a command inside the accuracy subproject via ``uv run --project``."""
+        full_cmd = [
+            "uv",
+            "run",
+            "--project",
+            str(self.swe_bench_project_path),
+        ] + cmd
 
         try:
             completed = subprocess.run(
-                cmd,
+                full_cmd,
                 check=False,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -1830,7 +1841,6 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
                 text=True,
                 timeout=self.subprocess_timeout_s,
                 cwd=str(cwd),
-                env=env,
             )
         except subprocess.TimeoutExpired as e:
             partial = (
@@ -1874,9 +1884,8 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
 
         patched_config = self._patch_config(output_dir, benchmark_cfg)
 
-        mini_extra_bin = self.mini_swe_agent_dir / ".venv" / "bin" / "mini-extra"
         agent_cmd = [
-            str(mini_extra_bin),
+            "mini-extra",
             "swebench",
             "--model",
             model_name,
@@ -1897,7 +1906,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         self._run_subprocess(
             agent_cmd,
             self.report_dir / "swe_bench_agent.log",
-            cwd=self.mini_swe_agent_dir,
+            cwd=output_dir,
         )
 
         preds_path = output_dir / "preds.json"
@@ -1913,9 +1922,8 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             else "princeton-nlp/SWE-bench_Lite"
         )
         run_id = f"endpoints_{uuid.uuid4().hex[:8]}"
-        venv_python = self.mini_swe_agent_dir / ".venv" / "bin" / "python"
         eval_cmd = [
-            str(venv_python),
+            "python",
             "-m",
             "swebench.harness.run_evaluation",
             "--dataset_name",
