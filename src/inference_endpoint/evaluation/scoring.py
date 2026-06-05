@@ -1658,3 +1658,310 @@ class VBenchScorer(Scorer, scorer_id="vbench"):
         per_dim_scores = self._extract_per_dim_scores(results)
         mean_score = float(np.mean(per_dim_scores))
         return mean_score, n_repeats
+
+
+_DEFAULT_MINI_SWE_AGENT_DIR = Path.home() / "vllm_test" / "swe_mini_combined"
+_MINI_SWE_AGENT_DIR_ENV = "MINI_SWE_AGENT_DIR"
+_DEFAULT_SWE_BENCH_TEMPLATE = (
+    Path(__file__).parent.parent.parent
+    / "examples"
+    / "10_SWEBench_Example"
+    / "swebench_template.yaml"
+)
+
+
+class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
+    """SWE-bench accuracy scorer using mini-swe-agent.
+
+    Overrides score() entirely — ignores events.jsonl. Instead:
+    1. Patches swebench_template.yaml with model name, endpoint URL, and
+       sampling parameters read from the saved benchmark config.
+    2. Runs mini-extra swebench to generate predictions (preds.json).
+    3. Runs swebench.harness.run_evaluation to grade the predictions.
+    4. Returns resolved_rate = resolved_instances / submitted_instances.
+
+    Required setup: mini-swe-agent venv must exist at mini_swe_agent_dir/.venv.
+    Run: cd <mini_swe_agent_dir> && uv venv && uv pip install mini-swe-agent swebench
+
+    extras keys (all optional except those listed):
+        mini_swe_agent_dir    Path to the swe_mini_combined checkout.
+                              Falls back to $MINI_SWE_AGENT_DIR or
+                              ~/vllm_test/swe_mini_combined.
+        swebench_config_template  Path to a swebench YAML template.
+                                  Defaults to examples/10_SWEBench_Example/
+                                  swebench_template.yaml in this repo.
+        subset                "verified" (default) or "lite".
+        split                 HF split to evaluate (default: "test").
+        num_instances         How many instances to run (default: all rows
+                              in the loaded dataset).
+        workers               mini-extra parallelism (default: 10).
+        max_eval_workers      swebench harness parallelism (default: 64).
+        subprocess_timeout_s  Total wall-clock budget in seconds (default: 28800).
+    """
+
+    REQUIRES_EXTRACTOR: ClassVar[bool] = False
+    DEFAULT_SUBPROCESS_TIMEOUT_S: ClassVar[int] = 8 * 60 * 60
+
+    def __init__(
+        self,
+        dataset_name: str,
+        dataset: Dataset,
+        report_dir: os.PathLike,
+        extractor: type[Extractor] | None = None,
+        ground_truth_column: str | None = "instance_id",
+        mini_swe_agent_dir: str | os.PathLike | None = None,
+        swebench_config_template: str | os.PathLike | None = None,
+        subset: str = "verified",
+        split: str = "test",
+        num_instances: int | None = None,
+        workers: int = 10,
+        max_eval_workers: int = 64,
+        subprocess_timeout_s: int | None = None,
+    ):
+        super().__init__(
+            dataset_name=dataset_name,
+            dataset=dataset,
+            report_dir=report_dir,
+            extractor=extractor,
+            ground_truth_column=ground_truth_column,
+        )
+        self.mini_swe_agent_dir = self._resolve_mini_swe_agent_dir(mini_swe_agent_dir)
+        self.swebench_config_template = (
+            Path(swebench_config_template)
+            if swebench_config_template is not None
+            else _DEFAULT_SWE_BENCH_TEMPLATE
+        )
+        self.subset = subset
+        self.split = split
+        self.num_instances = num_instances
+        self.workers = workers
+        self.max_eval_workers = max_eval_workers
+        self.subprocess_timeout_s = (
+            subprocess_timeout_s
+            if subprocess_timeout_s is not None
+            else self.DEFAULT_SUBPROCESS_TIMEOUT_S
+        )
+
+        if not self.swebench_config_template.exists():
+            raise FileNotFoundError(
+                f"swebench template not found: {self.swebench_config_template}. "
+                f"Pass swebench_config_template= in accuracy_config.extras."
+            )
+        venv_python = self.mini_swe_agent_dir / ".venv" / "bin" / "python"
+        if not venv_python.exists():
+            raise FileNotFoundError(
+                f"mini-swe-agent venv not found at {venv_python}. "
+                f"Run: cd {self.mini_swe_agent_dir} && uv venv && "
+                f"uv pip install mini-swe-agent swebench"
+            )
+
+    @staticmethod
+    def _resolve_mini_swe_agent_dir(
+        explicit: str | os.PathLike | None,
+    ) -> Path:
+        if explicit is not None:
+            return Path(explicit)
+        from_env = os.environ.get(_MINI_SWE_AGENT_DIR_ENV)
+        if from_env:
+            return Path(from_env)
+        return Path(_DEFAULT_MINI_SWE_AGENT_DIR)
+
+    def score_single_sample(self, value: str, ground_truth: str) -> float:
+        raise RuntimeError(
+            "SWEBenchScorer uses subprocess evaluation; call score() instead."
+        )
+
+    def _patch_config(self, output_dir: Path, benchmark_config_dict: dict) -> Path:
+        """Load template YAML, patch model fields from benchmark config, write to output_dir."""
+        import yaml as _yaml
+
+        with self.swebench_config_template.open() as f:
+            cfg = _yaml.safe_load(f)
+
+        model_params = benchmark_config_dict.get("model_params", {})
+        endpoints = benchmark_config_dict.get("endpoint_config", {}).get(
+            "endpoints", []
+        )
+
+        cfg["model"]["model_name"] = model_params["name"]
+        cfg["model"]["model_kwargs"]["api_base"] = (
+            endpoints[0].rstrip("/") + "/v1" if endpoints else ""
+        )
+
+        for field in (
+            "temperature",
+            "top_p",
+            "top_k",
+            "repetition_penalty",
+            "presence_penalty",
+            "frequency_penalty",
+        ):
+            val = model_params.get(field)
+            if val is not None:
+                cfg["model"]["model_kwargs"][field] = val
+            else:
+                cfg["model"]["model_kwargs"].pop(field, None)
+
+        chat_tmpl = model_params.get("chat_template_kwargs")
+        if chat_tmpl:
+            cfg["model"]["model_kwargs"]["chat_template_kwargs"] = chat_tmpl
+        else:
+            cfg["model"]["model_kwargs"].pop("chat_template_kwargs", None)
+
+        patched_path = output_dir / "swebench_patched.yaml"
+        with patched_path.open("w") as f:
+            _yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
+        return patched_path
+
+    def _run_subprocess(self, cmd: list[str], log_path: Path, cwd: Path) -> None:
+        """Run a subprocess with the mini-swe-agent venv activated."""
+        venv_bin = self.mini_swe_agent_dir / ".venv" / "bin"
+        env = os.environ.copy()
+        env["VIRTUAL_ENV"] = str(self.mini_swe_agent_dir / ".venv")
+        env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=self.subprocess_timeout_s,
+                cwd=str(cwd),
+                env=env,
+            )
+        except subprocess.TimeoutExpired as e:
+            partial = (
+                e.stdout
+                if isinstance(e.stdout, str)
+                else (e.stdout or b"").decode("utf-8", errors="replace")
+            )
+            log_path.write_text(partial)
+            raise RuntimeError(
+                f"SWE-bench subprocess timed out after {self.subprocess_timeout_s}s; "
+                f"see {log_path} for partial output."
+            ) from e
+
+        log_path.write_text(completed.stdout or "")
+        if completed.returncode != 0:
+            tail = "\n".join((completed.stdout or "").splitlines()[-50:])
+            raise RuntimeError(
+                f"SWE-bench subprocess exited with code {completed.returncode}; "
+                f"full log at {log_path}. Last 50 lines:\n{tail}"
+            )
+
+    def score(self) -> tuple[float | None, int]:
+        """Run mini-swe-agent + swebench evaluation. Returns (resolved_rate, 1)."""
+        import yaml as _yaml
+
+        with (self.report_dir / "config.yaml").open() as f:
+            benchmark_cfg = _yaml.safe_load(f)
+
+        model_name: str = benchmark_cfg["model_params"]["name"]
+        assert self.dataset.dataframe is not None
+
+        n = (
+            self.num_instances
+            if self.num_instances is not None
+            else len(self.dataset.dataframe)
+        )
+        slice_str = f"0:{n}"
+
+        output_dir = self.report_dir / "swe_bench_output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        patched_config = self._patch_config(output_dir, benchmark_cfg)
+
+        mini_extra_bin = self.mini_swe_agent_dir / ".venv" / "bin" / "mini-extra"
+        agent_cmd = [
+            str(mini_extra_bin),
+            "swebench",
+            "--model",
+            model_name,
+            "--config",
+            str(patched_config),
+            "--subset",
+            self.subset,
+            "--split",
+            self.split,
+            "--slice",
+            slice_str,
+            "--workers",
+            str(self.workers),
+            "--output",
+            str(output_dir),
+        ]
+        logger.info("Running mini-swe-agent: %s", " ".join(agent_cmd))
+        self._run_subprocess(
+            agent_cmd,
+            self.report_dir / "swe_bench_agent.log",
+            cwd=self.mini_swe_agent_dir,
+        )
+
+        preds_path = output_dir / "preds.json"
+        if not preds_path.exists():
+            logger.error(
+                "preds.json not found after mini-swe-agent run; returning None score"
+            )
+            return None, 1
+
+        hf_dataset_name = (
+            "princeton-nlp/SWE-bench_Verified"
+            if self.subset == "verified"
+            else "princeton-nlp/SWE-bench_Lite"
+        )
+        run_id = f"endpoints_{uuid.uuid4().hex[:8]}"
+        venv_python = self.mini_swe_agent_dir / ".venv" / "bin" / "python"
+        eval_cmd = [
+            str(venv_python),
+            "-m",
+            "swebench.harness.run_evaluation",
+            "--dataset_name",
+            hf_dataset_name,
+            "--split",
+            self.split,
+            "--predictions_path",
+            str(preds_path),
+            "--max_workers",
+            str(self.max_eval_workers),
+            "--run_id",
+            run_id,
+        ]
+        logger.info("Running swebench evaluation: %s", " ".join(eval_cmd))
+        self._run_subprocess(
+            eval_cmd,
+            self.report_dir / "swe_bench_eval.log",
+            cwd=self.mini_swe_agent_dir,
+        )
+
+        safe_model = model_name.replace("/", "__")
+        result_path = self.mini_swe_agent_dir / f"{safe_model}.{run_id}.json"
+        if not result_path.exists():
+            candidates = list(self.mini_swe_agent_dir.glob(f"*{run_id}*.json"))
+            if not candidates:
+                logger.error(
+                    "SWE-bench result file not found (run_id=%s); returning None",
+                    run_id,
+                )
+                return None, 1
+            result_path = candidates[0]
+
+        shutil.copy2(result_path, self.report_dir / "swe_bench_results.json")
+
+        result = msgspec.json.decode(result_path.read_bytes())
+        submitted = result.get("submitted_instances", 0)
+        resolved = result.get("resolved_instances", 0)
+        if submitted == 0:
+            logger.warning("SWE-bench: submitted_instances=0; returning None score")
+            return None, 1
+
+        resolved_rate = resolved / submitted
+        logger.info(
+            "SWE-bench: resolved %d / %d submitted (%.1f%%)",
+            resolved,
+            submitted,
+            resolved_rate * 100,
+        )
+        return resolved_rate, 1
