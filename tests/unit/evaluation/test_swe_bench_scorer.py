@@ -1,0 +1,330 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Unit tests for SWEBenchScorer."""
+
+import json
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import msgspec
+import pandas as pd
+import pytest
+import yaml
+from inference_endpoint.evaluation import scoring as scoring_mod
+from inference_endpoint.evaluation.scoring import (
+    Scorer,
+    SWEBenchScorer,
+)
+
+pytestmark = pytest.mark.unit
+
+_DATASET_NAME = "swe_bench_acc"
+_MODEL_NAME = "TestOrg/test-model-7b"
+
+
+def _write_benchmark_config(report_dir: Path, model_params: dict | None = None) -> None:
+    mp: dict = {"name": _MODEL_NAME}
+    defaults = {
+        "model_params": mp,
+        "endpoint_config": {"endpoints": ["http://localhost:30000"]},
+    }
+    if model_params is not None:
+        mp.update(model_params)
+    (report_dir / "config.yaml").write_text(yaml.dump(defaults))
+
+
+def _write_sample_idx_map(report_dir: Path, n: int = 3) -> None:
+    idx_map = {_DATASET_NAME: {f"uuid-{i}": i for i in range(n)}}
+    (report_dir / "sample_idx_map.json").write_bytes(msgspec.json.encode(idx_map))
+
+
+def _make_dataset(n: int = 3) -> MagicMock:
+    df = pd.DataFrame(
+        {
+            "instance_id": [f"repo__repo-{i}" for i in range(n)],
+            "prompt": ["placeholder"] * n,
+        }
+    )
+    ds = MagicMock()
+    ds.dataframe = df
+    ds.num_samples.return_value = n
+    return ds
+
+
+@pytest.fixture
+def mini_swe_dir(tmp_path: Path) -> Path:
+    """Fake mini-swe-agent directory with a minimal venv structure."""
+    d = tmp_path / "swe_mini_combined"
+    (d / ".venv" / "bin").mkdir(parents=True)
+    (d / ".venv" / "bin" / "python").write_text("#!/usr/bin/env python3\n")
+    (d / ".venv" / "bin" / "mini-extra").write_text("#!/bin/sh\n")
+    return d
+
+
+@pytest.fixture
+def template_yaml(tmp_path: Path) -> Path:
+    """Minimal swebench template YAML."""
+    tmpl = {
+        "model": {
+            "model_name": "",
+            "model_kwargs": {
+                "custom_llm_provider": "openai",
+                "api_base": "",
+            },
+        }
+    }
+    p = tmp_path / "swebench_template.yaml"
+    p.write_text(yaml.dump(tmpl))
+    return p
+
+
+@pytest.fixture
+def report_dir(tmp_path: Path) -> Path:
+    d = tmp_path / "report"
+    d.mkdir()
+    _write_benchmark_config(d)
+    _write_sample_idx_map(d)
+    return d
+
+
+@pytest.fixture
+def patch_subprocess(monkeypatch, report_dir: Path, mini_swe_dir: Path):
+    """Patch subprocess.run to write fake preds.json and result JSON."""
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(list(cmd))
+        cmd_str = " ".join(cmd)
+        if "mini-extra" in cmd_str:
+            output_dir = Path(cmd[cmd.index("--output") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "preds.json").write_text(json.dumps({}))
+        elif "run_evaluation" in cmd_str:
+            run_id = cmd[cmd.index("--run_id") + 1]
+            safe_model = _MODEL_NAME.replace("/", "__")
+            (mini_swe_dir / f"{safe_model}.{run_id}.json").write_text(
+                json.dumps(
+                    {
+                        "resolved_instances": 3,
+                        "submitted_instances": 10,
+                        "total_instances": 500,
+                    }
+                )
+            )
+        return MagicMock(returncode=0, stdout="ok\n")
+
+    monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+    return captured
+
+
+class TestSWEBenchScorerRegistration:
+    def test_registered(self):
+        assert "swe_bench_scorer" in Scorer.PREDEFINED
+        assert Scorer.get("swe_bench_scorer") is SWEBenchScorer
+
+
+class TestSWEBenchScorer:
+    def test_score_happy_path(
+        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+    ):
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_yaml,
+        )
+        score, n_repeats = scorer.score()
+
+        assert score == pytest.approx(0.3)
+        assert n_repeats == 1
+        assert (report_dir / "swe_bench_results.json").exists()
+
+    def test_missing_venv_raises_at_init(self, report_dir, tmp_path, template_yaml):
+        empty_dir = tmp_path / "empty_swe"
+        empty_dir.mkdir()
+        with pytest.raises(FileNotFoundError, match="mini-swe-agent venv"):
+            SWEBenchScorer(
+                dataset_name=_DATASET_NAME,
+                dataset=_make_dataset(),
+                report_dir=report_dir,
+                mini_swe_agent_dir=empty_dir,
+                swebench_config_template=template_yaml,
+            )
+
+    def test_missing_template_raises_at_init(self, report_dir, mini_swe_dir, tmp_path):
+        nonexistent = tmp_path / "no_such_template.yaml"
+        with pytest.raises(FileNotFoundError, match="swebench template"):
+            SWEBenchScorer(
+                dataset_name=_DATASET_NAME,
+                dataset=_make_dataset(),
+                report_dir=report_dir,
+                mini_swe_agent_dir=mini_swe_dir,
+                swebench_config_template=nonexistent,
+            )
+
+    def test_missing_preds_returns_none(
+        self, report_dir, mini_swe_dir, template_yaml, monkeypatch
+    ):
+        def fake_run(cmd, **kwargs):
+            return MagicMock(returncode=0, stdout="ok\n")
+
+        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_yaml,
+        )
+        score, n_repeats = scorer.score()
+        assert score is None
+        assert n_repeats == 1
+
+    def test_config_patching_all_fields(self, report_dir, mini_swe_dir, tmp_path):
+        tmpl = {
+            "model": {
+                "model_name": "",
+                "model_kwargs": {
+                    "api_base": "",
+                    "temperature": None,
+                    "top_k": None,
+                },
+            }
+        }
+        template_path = tmp_path / "tmpl.yaml"
+        template_path.write_text(yaml.dump(tmpl))
+
+        _write_benchmark_config(
+            report_dir,
+            model_params={
+                "temperature": 0.8,
+                "top_p": 0.9,
+                "top_k": 15,
+                "chat_template_kwargs": {"preserve_thinking": True},
+            },
+        )
+        _write_sample_idx_map(report_dir)
+
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_path,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        with (report_dir / "config.yaml").open() as f:
+            benchmark_cfg = yaml.safe_load(f)
+        patched_path = scorer._patch_config(output_dir, benchmark_cfg)
+        patched = yaml.safe_load(patched_path.read_text())
+
+        assert patched["model"]["model_name"] == _MODEL_NAME
+        assert (
+            patched["model"]["model_kwargs"]["api_base"] == "http://localhost:30000/v1"
+        )
+        assert patched["model"]["model_kwargs"]["temperature"] == pytest.approx(0.8)
+        assert patched["model"]["model_kwargs"]["top_p"] == pytest.approx(0.9)
+        assert patched["model"]["model_kwargs"]["top_k"] == 15
+        assert patched["model"]["model_kwargs"]["chat_template_kwargs"] == {
+            "preserve_thinking": True
+        }
+
+    def test_config_patching_omits_none_fields(
+        self, report_dir, mini_swe_dir, tmp_path
+    ):
+        tmpl = {
+            "model": {
+                "model_name": "",
+                "model_kwargs": {"api_base": "", "top_k": 20},
+            }
+        }
+        template_path = tmp_path / "tmpl.yaml"
+        template_path.write_text(yaml.dump(tmpl))
+
+        # model_params has no top_k — should be removed from patched config
+        _write_benchmark_config(report_dir)
+        _write_sample_idx_map(report_dir)
+
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_path,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        with (report_dir / "config.yaml").open() as f:
+            benchmark_cfg = yaml.safe_load(f)
+        patched_path = scorer._patch_config(output_dir, benchmark_cfg)
+        patched = yaml.safe_load(patched_path.read_text())
+
+        assert "top_k" not in patched["model"]["model_kwargs"]
+
+    def test_num_instances_slice(
+        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+    ):
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(n=100),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_yaml,
+            num_instances=5,
+        )
+        scorer.score()
+
+        agent_cmd = patch_subprocess[0]
+        assert "--slice" in agent_cmd
+        assert agent_cmd[agent_cmd.index("--slice") + 1] == "0:5"
+
+    def test_default_slice_uses_full_dataset(
+        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+    ):
+        n = 42
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(n=n),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_yaml,
+        )
+        scorer.score()
+
+        agent_cmd = patch_subprocess[0]
+        assert agent_cmd[agent_cmd.index("--slice") + 1] == f"0:{n}"
+
+    def test_lite_subset_uses_correct_hf_name(
+        self, report_dir, mini_swe_dir, template_yaml, patch_subprocess
+    ):
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            mini_swe_agent_dir=mini_swe_dir,
+            swebench_config_template=template_yaml,
+            subset="lite",
+        )
+        scorer.score()
+
+        eval_cmd = patch_subprocess[1]
+        assert "--dataset_name" in eval_cmd
+        assert (
+            eval_cmd[eval_cmd.index("--dataset_name") + 1]
+            == "princeton-nlp/SWE-bench_Lite"
+        )
