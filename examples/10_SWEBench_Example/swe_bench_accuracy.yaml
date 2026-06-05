@@ -20,7 +20,7 @@ datasets:
   # framework do not reflect real SWE-bench usage.
   - name: swe_bench_perf
     type: "performance"
-    path: "examples/10_SWEBench_Example/smoke_1instance.jsonl"
+    path: "tests/assets/datasets/dummy_1k.jsonl"
 
   # Accuracy dataset — instance_id rows tell mini-swe-agent which instances to run.
   - name: swe_bench
@@ -32,10 +32,7 @@ datasets:
         # Defaults to $SWE_BENCH_PROJECT_PATH or the in-repo subproject.
         # swe_bench_project_path: "/path/to/examples/10_SWEBench_Example/accuracy"
         swebench_config_template: "examples/10_SWEBench_Example/swebench_template.yaml"
-        num_instances: 10
-        subset: "verified"
-        workers: 10
-        max_eval_workers: 64
+        num_instances: 100
 
 settings:
   load_pattern:

@@ -298,13 +298,12 @@ class TestSWEBenchScorer:
         assert "--slice" in agent_cmd
         assert agent_cmd[agent_cmd.index("--slice") + 1] == "0:5"
 
-    def test_default_slice_uses_full_dataset(
+    def test_default_slice_uses_default_num_instances(
         self, report_dir, swe_bench_project, template_yaml, patch_subprocess
     ):
-        n = 42
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
-            dataset=_make_dataset(n=n),
+            dataset=_make_dataset(),
             report_dir=report_dir,
             swe_bench_project_path=swe_bench_project,
             swebench_config_template=template_yaml,
@@ -312,7 +311,7 @@ class TestSWEBenchScorer:
         scorer.score()
 
         agent_cmd = patch_subprocess[0]
-        assert agent_cmd[agent_cmd.index("--slice") + 1] == f"0:{n}"
+        assert agent_cmd[agent_cmd.index("--slice") + 1] == "0:100"
 
     def test_lite_subset_uses_correct_hf_name(
         self, report_dir, swe_bench_project, template_yaml, patch_subprocess
