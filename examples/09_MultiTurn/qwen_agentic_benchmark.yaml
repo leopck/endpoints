@@ -1,0 +1,43 @@
+name: "qwen-agentic-benchmark"
+version: "1.0"
+type: "online" # do not change.
+
+model_params:
+  name: "Qwen/Qwen3.6-35B-A3B"
+  temperature: 1.0 # do not change.
+  top_p: 0.95 # do not change.
+  max_new_tokens: 20000 # do not change.
+  chat_template_kwargs:
+    thinking: true # do not change.
+    preserve_thinking: true # do not change.
+
+datasets:
+  - name: agentic_combined
+    type: performance # do not change.
+    path: <path-to-agentic-combined-jsonl>
+    multi_turn:
+      turn_timeout_s: 600.0
+      enable_salt: true # do not change.
+      inject_tool_delay: true # do not change.
+      inline_accuracy: true # do not change.
+      num_trajectories_to_issue: 990 # Should be integer multiple of 990.
+      stop_issuing_on_first_user_complete: false # set to true during optimization for faster runtime, should be false in final submission.
+
+settings:
+  runtime:
+    min_duration_ms: 0
+
+  load_pattern:
+    type: multi_turn
+    target_concurrency: 128 # Submission-specific concurrency.
+
+  client:
+    warmup_connections: 0
+    max_idle_time: 0.5
+
+endpoint_config:
+  endpoints:
+    - "http://localhost:30000" # SMG gateway port (see server.sflow.yaml).
+  api_type: openai # do not change.
+
+report_dir: logs/qwen_agentic

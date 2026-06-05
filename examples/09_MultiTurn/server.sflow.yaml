@@ -1,0 +1,163 @@
+# nv-sflow workflow — Qwen3.6 server: 8 vLLM workers + 1 SMG cache-aware gateway,
+# one worker per GPU on a single node.
+#
+# Sequence:
+#   1. system_capture  — host/GPU/CUDA/NCCL/Torch snapshot for reproducibility
+#   2. hf_prefetch     — pre-download model into shared cache (avoids 8-way HF race)
+#   3. vllm_workers    — 8 replicas, GPU i ↔ port 8100+i, each writes its URL into registry/
+#   4. smg_gateway     — depends on workers ready; reads URLs from registry/, launches
+#                        `smg launch --policy cache_aware`. Probes :30000.
+#
+# Run with `sflow run -f server.sflow.yaml --tui`. When up, point
+# `qwen_agentic_benchmark.yaml` at http://localhost:30000.
+
+version: "0.1"
+
+variables:
+  MODEL_NAME:
+    value: "Qwen/Qwen3.6-35B-A3B"
+    description: HF repo id served by every worker
+  VLLM_IMAGE:
+    value: "docker://vllm/vllm-openai:latest"
+    description: pin to a digest (`@sha256:...`) for reproducibility
+  SMG_IMAGE:
+    value: "ghcr.io#lightseekorg/smg:nightly"
+    description: SMG cache-aware gateway image
+  HF_CACHE_HOST:
+    value: "/tmp/hf-cache"
+    description: node-local model cache (shared across the 8 workers); override with --set HF_CACHE_HOST=...
+  REGISTRY_DIR:
+    value: "${SFLOW_WORKFLOW_OUTPUT_DIR}/registry"
+    description: per-worker URL files land here; the gateway reads them
+  SMG_PORT:
+    value: 30000
+    type: int
+
+backends:
+  slurm_cluster:
+    type: slurm
+    # Fill in for your cluster — account/partition/time are site-specific.
+    # Drop this block and add `local: { type: local }` to dry-run on a workstation.
+    account: <YOUR_SLURM_ACCOUNT>
+    partition: <YOUR_PARTITION>
+    time: "08:00:00"
+    nodes: 1
+    gpus_per_node: 8
+
+operators:
+  vllm_srun:
+    type: srun
+    container_image: ${{ variables.VLLM_IMAGE }}
+    container_mounts:
+      - "${HF_CACHE_HOST}:${HF_CACHE_HOST}"
+      - "${SFLOW_WORKFLOW_OUTPUT_DIR}:/work"
+    container_workdir: "/work"
+    container_remap_root: true
+
+  smg_srun:
+    type: srun
+    container_image: ${{ variables.SMG_IMAGE }}
+    container_mounts:
+      - "${HF_CACHE_HOST}:/workspace/hf_cache"
+      - "${SFLOW_WORKFLOW_OUTPUT_DIR}:/work"
+    container_workdir: "/work"
+
+workflow:
+  name: qwen_smg_server
+  tasks:
+    - name: system_capture
+      operator: vllm_srun
+      script: |
+        set -euo pipefail
+        OUT=${SFLOW_TASK_OUTPUT_DIR}
+        nvidia-smi --query-gpu=index,name,driver_version,vbios_version,clocks.current.sm,clocks.current.memory,power.draw,power.limit,ecc.errors.uncorrected.aggregate.total --format=csv > ${OUT}/gpu_state.csv
+        nvidia-smi topo -m > ${OUT}/topo.txt
+        nvcc --version > ${OUT}/nvcc.txt
+        cat /proc/version > ${OUT}/proc_version.txt
+        dpkg -l | grep -E '^(ii)\s+(cuda|nccl|cudnn|tensorrt|libnvidia)' > ${OUT}/packages.txt || true
+        env | sort > ${OUT}/env.txt
+        python -c "import torch, vllm; print(torch.__version__, torch.version.cuda, vllm.__version__)" > ${OUT}/versions.txt 2>/dev/null || true
+
+    - name: hf_prefetch
+      operator: vllm_srun
+      depends_on: [system_capture]
+      script: |
+        set -e
+        mkdir -p ${HF_CACHE_HOST}
+        export HF_HOME=${HF_CACHE_HOST}
+        pip install -q hf-transfer huggingface_hub
+        python -c 'from huggingface_hub import snapshot_download; snapshot_download(repo_id="${MODEL_NAME}", max_workers=8)'
+        du -sh ${HF_CACHE_HOST}
+
+    - name: vllm_workers
+      operator: vllm_srun
+      depends_on: [hf_prefetch]
+      replicas:
+        count: 8
+        policy: parallel
+      ntasks_per_node: 1
+      gpus_per_task: 1
+      script: |
+        set -e
+        WORKER_PORT=$(( 8100 + SFLOW_REPLICA_INDEX ))
+        export CUDA_VISIBLE_DEVICES=${SFLOW_REPLICA_INDEX}
+        export HF_HOME=${HF_CACHE_HOST}
+        export HF_HUB_OFFLINE=1
+        export TRANSFORMERS_OFFLINE=1
+        export VLLM_ENGINE_READY_TIMEOUT_S=1800
+        mkdir -p ${REGISTRY_DIR}
+        echo "http://localhost:${WORKER_PORT}" > ${REGISTRY_DIR}/worker_$(printf '%04d' ${SFLOW_REPLICA_INDEX}).url
+        exec vllm serve ${MODEL_NAME} \
+          --host 0.0.0.0 --port ${WORKER_PORT} \
+          --served-model-name ${MODEL_NAME} \
+          --tensor-parallel-size 1 \
+          --data-parallel-size 1 \
+          --enable-expert-parallel \
+          --enable-prefix-caching \
+          --gpu-memory-utilization 0.85 \
+          --speculative-config '{"method":"mtp","num_speculative_tokens":1}' \
+          --max-num-batched-tokens 32768 \
+          --max-num-seqs 1024 \
+          --enable-auto-tool-choice \
+          --tool-call-parser qwen3_coder \
+          --reasoning-parser qwen3 \
+          --language-model-only \
+          --trust-remote-code \
+          --limit-mm-per-prompt '{"image":0,"video":0}' \
+          --enable-prompt-tokens-details
+      probes:
+        readiness:
+          - type: log_watch
+            match_pattern: "Application startup complete"
+            match_count: 1
+            timeout_s: 2400
+        failure:
+          - type: log_watch
+            match_pattern: "(CUDA out of memory|RuntimeError|vllm serve: error|Exited with exit code [^0])"
+            match_count: 1
+
+    - name: smg_gateway
+      operator: smg_srun
+      depends_on: [vllm_workers]
+      script: |
+        set -e
+        WORKER_URLS=$(cat ${REGISTRY_DIR}/worker_*.url | tr '\n' ' ')
+        echo "starting SMG with workers: ${WORKER_URLS}"
+        exec smg launch --host 0.0.0.0 --port ${SMG_PORT} \
+          --model-path ${MODEL_NAME} \
+          --policy cache_aware \
+          --worker-urls ${WORKER_URLS}
+      probes:
+        readiness:
+          - type: tcp_port
+            host: localhost
+            port: ${{ variables.SMG_PORT }}
+            timeout_s: 900
+          - type: http
+            url: "http://localhost:${SMG_PORT}/v1/models"
+            expected_status: 200
+            timeout_s: 900
+        failure:
+          - type: log_watch
+            match_pattern: "(Traceback|panic|ERROR|Exited with exit code [^0])"
+            match_count: 1
