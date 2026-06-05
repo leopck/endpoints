@@ -13,11 +13,10 @@ model_params:
 datasets:
   - name: swe_bench_perf
     type: "performance"
-    path: "examples/10_SWEBench_Example/smoke_1instance.jsonl"
+    path: "tests/assets/datasets/dummy_1k.jsonl"
 
-  - name: swe_bench_smoke
+  - name: swe_bench
     type: "accuracy"
-    path: "examples/10_SWEBench_Example/smoke_1instance.jsonl"
     accuracy_config:
       eval_method: "swe_bench_scorer"
       num_repeats: 1

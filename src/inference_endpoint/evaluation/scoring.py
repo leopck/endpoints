@@ -1715,10 +1715,9 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
                                   swebench_template.yaml in this repo.
         subset                "verified" (default) or "lite".
         split                 HF split to evaluate (default: "test").
-        num_instances         How many instances to run (default: all rows
-                              in the loaded dataset).
+        num_instances         How many instances to run (default: 100).
         workers               mini-extra parallelism (default: 10).
-        max_eval_workers      swebench harness parallelism (default: 64).
+        max_eval_workers      swebench harness parallelism (default: 10).
         subprocess_timeout_s  Total wall-clock budget in seconds (default: 28800).
     """
 
@@ -1736,9 +1735,9 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         swebench_config_template: str | os.PathLike | None = None,
         subset: str = "verified",
         split: str = "test",
-        num_instances: int | None = None,
+        num_instances: int = 100,
         workers: int = 10,
-        max_eval_workers: int = 64,
+        max_eval_workers: int = 10,
         subprocess_timeout_s: int | None = None,
     ):
         super().__init__(
@@ -1959,12 +1958,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         model_name: str = benchmark_cfg["model_params"]["name"]
         assert self.dataset.dataframe is not None
 
-        n = (
-            self.num_instances
-            if self.num_instances is not None
-            else len(self.dataset.dataframe)
-        )
-        slice_str = f"0:{n}"
+        slice_str = f"0:{self.num_instances}"
 
         output_dir = self.report_dir / "swe_bench_output"
         output_dir.mkdir(parents=True, exist_ok=True)
