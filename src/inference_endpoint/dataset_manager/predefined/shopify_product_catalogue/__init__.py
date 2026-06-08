@@ -24,9 +24,8 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 import pandas as pd
-from tqdm import tqdm
-
 from datasets import load_dataset
+from tqdm import tqdm
 
 from ...dataset import Dataset
 from . import presets
