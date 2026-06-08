@@ -10,14 +10,14 @@
 # so the main benchmark process never needs to import these packages.
 #
 # Usage on the accuracy host:
-#   cd examples/10_SWEBench_Example/accuracy
+#   cd examples/09_MultiTurn/accuracy
 #   uv sync
 #   # SWEBenchScorer in the parent will shell out automatically.
 
 [project]
 name = "swe-bench-accuracy"
 version = "0.1.0"
-description = "Isolated SWE-bench accuracy environment for the SWE-bench example."
+description = "Isolated SWE-bench accuracy environment for the multi-turn agentic benchmark."
 requires-python = ">=3.12"
 dependencies = [
     "mini-swe-agent==2.3.0",
