@@ -55,6 +55,7 @@ from ..core.types import TextModelOutput
 from ..dataset_manager.agentic_inference_dataset import AgenticInferenceDataset
 from ..dataset_manager.dataset import Dataset
 from ..dataset_manager.predefined.shopify_product_catalogue import ProductMetadata
+from ..dataset_manager.predefined.swe_bench import _REPO_MAP as _SWE_BENCH_HF_MAP
 from ..exceptions import SetupError
 from .extractor import Extractor, PythonCodeExtractor
 
@@ -197,6 +198,10 @@ class Scorer(ABC):
             tuple[float | None, int]: The mean score and the number of repeats.
                 Returns None as the score if evaluation fails.
         """
+        assert self.sample_index_map is not None, (
+            f"{self.__class__.__name__} sets SKIP_ENDPOINT_PHASE=True but did not "
+            "override score(); either override score() or set SKIP_ENDPOINT_PHASE=False."
+        )
         df = self.get_outputs()
 
         # Outputs are for all samples, not just the target dataset
@@ -1562,35 +1567,12 @@ class VBenchScorer(Scorer, scorer_id="vbench"):
             cmd += ["--full-info-json", self.full_info_json_path]
 
         log_path = self.report_dir / "vbench_subprocess.log"
-        try:
-            completed = subprocess.run(
-                cmd,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=self.subprocess_timeout_s,
-            )
-        except subprocess.TimeoutExpired as e:
-            partial = (
-                e.stdout
-                if isinstance(e.stdout, str)
-                else (e.stdout or b"").decode("utf-8", errors="replace")
-            )
-            log_path.write_text(partial)
-            raise RuntimeError(
-                f"VBench subprocess timed out after {self.subprocess_timeout_s}s; "
-                f"see {log_path} for partial output."
-            ) from e
-
-        log_path.write_text(completed.stdout or "")
-        if completed.returncode != 0:
-            tail = "\n".join((completed.stdout or "").splitlines()[-50:])
-            raise RuntimeError(
-                f"VBench subprocess exited with code {completed.returncode}; "
-                f"full log at {log_path}. Last 50 lines:\n{tail}"
-            )
+        _run_subprocess_with_log(
+            cmd,
+            log_path,
+            timeout_s=self.subprocess_timeout_s,
+            label="VBench",
+        )
 
     def _extract_per_dim_scores(self, results: dict[str, Any]) -> list[float]:
         """Pull each requested dim's aggregate score, with clear errors.
@@ -1680,6 +1662,46 @@ class VBenchScorer(Scorer, scorer_id="vbench"):
         return mean_score, n_repeats
 
 
+def _run_subprocess_with_log(
+    cmd: list[str],
+    log_path: Path,
+    *,
+    timeout_s: int,
+    label: str,
+    cwd: Path | None = None,
+) -> None:
+    """Run *cmd*, capture stdout+stderr to *log_path*, raise on timeout or non-zero exit."""
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+            cwd=str(cwd) if cwd is not None else None,
+        )
+    except subprocess.TimeoutExpired as e:
+        partial = (
+            e.stdout
+            if isinstance(e.stdout, str)
+            else (e.stdout or b"").decode("utf-8", errors="replace")
+        )
+        log_path.write_text(partial)
+        raise RuntimeError(
+            f"{label} subprocess timed out after {timeout_s}s; "
+            f"see {log_path} for partial output."
+        ) from e
+    log_path.write_text(completed.stdout or "")
+    if completed.returncode != 0:
+        tail = "\n".join((completed.stdout or "").splitlines()[-50:])
+        raise RuntimeError(
+            f"{label} subprocess exited with code {completed.returncode}; "
+            f"full log at {log_path}. Last 50 lines:\n{tail}"
+        )
+
+
 _DEFAULT_SWE_BENCH_PROJECT_PATH = (
     Path(__file__).resolve().parents[3]
     / "examples"
@@ -1693,10 +1715,6 @@ _DEFAULT_SWE_BENCH_TEMPLATE = (
     / "10_SWEBench_Example"
     / "swebench_template.yaml"
 )
-_SWE_BENCH_HF_MAP: dict[str, str] = {
-    "verified": "princeton-nlp/SWE-bench_Verified",
-    "lite": "princeton-nlp/SWE-bench_Lite",
-}
 
 
 class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
@@ -1876,9 +1894,13 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         )
 
         cfg["model"]["model_name"] = model_params["name"]
-        cfg["model"]["model_kwargs"]["api_base"] = (
-            endpoints[0].rstrip("/") + "/v1" if endpoints else ""
-        )
+        if endpoints:
+            base = endpoints[0].rstrip("/")
+            if base.endswith("/v1"):
+                base = base[:-3]
+            cfg["model"]["model_kwargs"]["api_base"] = base + "/v1"
+        else:
+            cfg["model"]["model_kwargs"]["api_base"] = ""
 
         for field in (
             "temperature",
@@ -1895,7 +1917,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
                 cfg["model"]["model_kwargs"].pop(field, None)
 
         chat_tmpl = model_params.get("chat_template_kwargs")
-        if chat_tmpl:
+        if chat_tmpl is not None:
             cfg["model"]["model_kwargs"]["chat_template_kwargs"] = chat_tmpl
         else:
             cfg["model"]["model_kwargs"].pop("chat_template_kwargs", None)
@@ -1913,47 +1935,31 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             "--project",
             str(self.swe_bench_project_path),
         ] + cmd
-
-        try:
-            completed = subprocess.run(
-                full_cmd,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=self.subprocess_timeout_s,
-                cwd=str(cwd),
-            )
-        except subprocess.TimeoutExpired as e:
-            partial = (
-                e.stdout
-                if isinstance(e.stdout, str)
-                else (e.stdout or b"").decode("utf-8", errors="replace")
-            )
-            log_path.write_text(partial)
-            raise RuntimeError(
-                f"SWE-bench subprocess timed out after {self.subprocess_timeout_s}s; "
-                f"see {log_path} for partial output."
-            ) from e
-
-        log_path.write_text(completed.stdout or "")
-        if completed.returncode != 0:
-            tail = "\n".join((completed.stdout or "").splitlines()[-50:])
-            raise RuntimeError(
-                f"SWE-bench subprocess exited with code {completed.returncode}; "
-                f"full log at {log_path}. Last 50 lines:\n{tail}"
-            )
+        _run_subprocess_with_log(
+            full_cmd,
+            log_path,
+            timeout_s=self.subprocess_timeout_s,
+            label="SWE-bench",
+            cwd=cwd,
+        )
 
     def score(self) -> tuple[float | None, int]:
         """Run mini-swe-agent + swebench evaluation. Returns (resolved_rate, 1)."""
-        with (self.report_dir / "config.yaml").open() as f:
+        config_path = self.report_dir / "config.yaml"
+        if not config_path.exists():
+            raise FileNotFoundError(
+                f"config.yaml not found at {config_path}. "
+                "SWEBenchScorer.score() must be called from within a benchmark run "
+                "that has already written its config, or the path must be pre-populated."
+            )
+        with config_path.open() as f:
             benchmark_cfg = yaml.safe_load(f)
 
         model_name: str = benchmark_cfg["model_params"]["name"]
         assert self.dataset.dataframe is not None
 
-        slice_str = f"0:{self.num_instances}"
+        n_rows = len(self.dataset.dataframe)
+        slice_str = f"0:{min(self.num_instances, n_rows)}"
 
         output_dir = self.report_dir / "swe_bench_output"
         output_dir.mkdir(parents=True, exist_ok=True)

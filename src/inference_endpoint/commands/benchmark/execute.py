@@ -405,22 +405,10 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
 
     # Calculate and display expected sample count
     total_samples = rt_settings.total_samples_to_issue()
-    if accuracy_datasets:
-        total_samples += sum(
-            ds.num_samples() * ds.repeats
-            for ds, ec in zip(accuracy_datasets, eval_configs, strict=False)
-            if not ec.scorer.SKIP_ENDPOINT_PHASE
-        )
-
-    collect_responses = test_mode in (TestMode.ACC, TestMode.BOTH)
-    logger.info(
-        f"Mode: {test_mode}, Target QPS: {config.settings.load_pattern.target_qps}, Responses: {collect_responses}"
-    )
-    logger.info(
-        f"Min Duration: {rt_settings.min_duration_ms / 1000:.1f}s, Expected samples: {total_samples}"
-    )
-    for ec in eval_configs:
-        if ec.scorer.SKIP_ENDPOINT_PHASE:
+    for ds, ec in zip(accuracy_datasets, eval_configs, strict=True):
+        if not ec.scorer.SKIP_ENDPOINT_PHASE:
+            total_samples += ds.num_samples() * ds.repeats
+        else:
             n = ec.scorer.external_sample_count(ec.extras)
             if n is not None:
                 logger.info(
@@ -429,6 +417,14 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
                     ec.scorer.SCORER_ID,
                     n,
                 )
+
+    collect_responses = test_mode in (TestMode.ACC, TestMode.BOTH)
+    logger.info(
+        f"Mode: {test_mode}, Target QPS: {config.settings.load_pattern.target_qps}, Responses: {collect_responses}"
+    )
+    logger.info(
+        f"Min Duration: {rt_settings.min_duration_ms / 1000:.1f}s, Expected samples: {total_samples}"
+    )
 
     return BenchmarkContext(
         config=config,
@@ -927,13 +923,14 @@ def finalize_benchmark(ctx: BenchmarkContext, bench: BenchmarkResult) -> None:
             **eval_cfg.extras,
         )
         score, n_repeats = scorer_instance.score()
-        assert eval_cfg.dataset.data is not None
         num_samples = len(eval_cfg.dataset.data)
         if eval_cfg.dataset_name == "performance":
             num_samples = sum(phase.issued_count for phase in result.perf_results)
         accuracy_scores[eval_cfg.dataset_name] = {
             "dataset_name": eval_cfg.dataset_name,
-            "num_samples": num_samples,
+            "num_samples": num_samples
+            if eval_cfg.dataset.data is not None
+            else 0,
             "extractor": (
                 eval_cfg.extractor.__name__ if eval_cfg.extractor is not None else None
             ),

@@ -37,6 +37,7 @@ from inference_endpoint.commands.benchmark.execute import (
     _run_benchmark_async,
     setup_benchmark,
     _load_datasets,
+    _run_benchmark_async,
 )
 from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.config.schema import (
@@ -1006,22 +1007,25 @@ class TestBuildPhases:
             def score(self):
                 return 1.0, 1
 
-        config = OfflineConfig(**_OFFLINE_KWARGS)
-        ctx = self._make_ctx(config, base_rt_settings, simple_dataset)
-        ctx.eval_configs = [
-            AccuracyConfiguration(
-                scorer=_SelfContainedScorer,
-                extractor=None,
-                dataset_name="acc",
-                dataset=simple_dataset,
-                report_dir=Path("/tmp"),
-                ground_truth_column=None,
-                num_repeats=1,
-            )
-        ]
-        phases = _build_phases(ctx)
+        try:
+            config = OfflineConfig(**_OFFLINE_KWARGS)
+            ctx = self._make_ctx(config, base_rt_settings, simple_dataset)
+            ctx.eval_configs = [
+                AccuracyConfiguration(
+                    scorer=_SelfContainedScorer,
+                    extractor=None,
+                    dataset_name="acc",
+                    dataset=simple_dataset,
+                    report_dir=Path("/tmp"),
+                    ground_truth_column=None,
+                    num_repeats=1,
+                )
+            ]
+            phases = _build_phases(ctx)
 
-        assert all(p.phase_type != PhaseType.ACCURACY for p in phases)
+            assert all(p.phase_type != PhaseType.ACCURACY for p in phases)
+        finally:
+            Scorer.PREDEFINED.pop("_test_skip_endpoint_phase", None)
 
     @pytest.mark.unit
     def test_warmup_uses_independent_rng_instances(
