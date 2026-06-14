@@ -80,7 +80,13 @@ class SWEBench(
         dst_path = datasets_dir / "swe_bench" / subset / f"swe_bench_{subset}.parquet"
         if dst_path.exists() and not force:
             logger.info("Loading SWE-bench %s from cache: %s", subset, dst_path)
-            return pd.read_parquet(dst_path)
+            try:
+                return pd.read_parquet(dst_path)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Cached SWE-bench parquet at {dst_path} appears corrupt ({e}). "
+                    "Delete it or pass force=True to re-download."
+                ) from e
 
         try:
             df = load_from_huggingface(
