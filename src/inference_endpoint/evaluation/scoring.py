@@ -1929,6 +1929,12 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             else:
                 cfg["model"]["model_kwargs"].pop(field, None)
 
+        max_new_tokens_val = model_params.get("max_new_tokens")
+        if max_new_tokens_val is not None:
+            cfg["model"]["model_kwargs"]["max_tokens"] = max_new_tokens_val
+        else:
+            cfg["model"]["model_kwargs"].pop("max_tokens", None)
+
         chat_tmpl = model_params.get("chat_template_kwargs")
         if chat_tmpl is not None:
             cfg["model"]["model_kwargs"]["chat_template_kwargs"] = chat_tmpl

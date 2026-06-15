@@ -301,6 +301,67 @@ class TestSWEBenchScorer:
 
         assert "top_k" not in patched["model"]["model_kwargs"]
 
+    def test_config_patching_max_new_tokens(
+        self, report_dir, swe_bench_project, tmp_path
+    ):
+        tmpl = {
+            "model": {
+                "model_name": "",
+                "model_kwargs": {"api_base": ""},
+            }
+        }
+        template_path = tmp_path / "tmpl.yaml"
+        template_path.write_text(yaml.dump(tmpl))
+
+        _write_benchmark_config(report_dir, model_params={"max_new_tokens": 4096})
+
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            swe_bench_project_path=swe_bench_project,
+            swebench_config_template=template_path,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        with (report_dir / "config.yaml").open() as f:
+            benchmark_cfg = yaml.safe_load(f)
+        patched_path = scorer._patch_config(output_dir, benchmark_cfg)
+        patched = yaml.safe_load(patched_path.read_text())
+
+        assert patched["model"]["model_kwargs"]["max_tokens"] == 4096
+
+    def test_config_patching_omits_max_tokens_when_not_set(
+        self, report_dir, swe_bench_project, tmp_path
+    ):
+        tmpl = {
+            "model": {
+                "model_name": "",
+                "model_kwargs": {"api_base": "", "max_tokens": 999},
+            }
+        }
+        template_path = tmp_path / "tmpl.yaml"
+        template_path.write_text(yaml.dump(tmpl))
+
+        # model_params has no max_new_tokens — max_tokens should be removed
+        _write_benchmark_config(report_dir)
+
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=report_dir,
+            swe_bench_project_path=swe_bench_project,
+            swebench_config_template=template_path,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+        with (report_dir / "config.yaml").open() as f:
+            benchmark_cfg = yaml.safe_load(f)
+        patched_path = scorer._patch_config(output_dir, benchmark_cfg)
+        patched = yaml.safe_load(patched_path.read_text())
+
+        assert "max_tokens" not in patched["model"]["model_kwargs"]
+
     @pytest.mark.parametrize(
         "num_instances, expected_slice",
         [
