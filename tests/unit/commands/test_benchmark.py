@@ -158,6 +158,55 @@ class TestCLIConfigModels:
                 datasets=[{"path": "test.jsonl"}],
             )
 
+    @pytest.mark.unit
+    def test_concurrency_injected_into_swe_bench_extras(self):
+        """target_concurrency is forwarded as workers into swe_bench_scorer extras."""
+        config = OnlineConfig(
+            endpoint_config={"endpoints": ["http://test:8000"]},
+            model_params={"name": "test-model"},
+            datasets=[
+                {
+                    "name": "swe_bench",
+                    "type": "accuracy",
+                    "accuracy_config": {"eval_method": "swe_bench_scorer"},
+                },
+                {"type": "performance", "path": "tests/assets/datasets/dummy_1k.jsonl"},
+            ],
+            settings={
+                "load_pattern": {"type": "concurrency", "target_concurrency": 32}
+            },
+        )
+        acc_ds = next(d for d in config.datasets if d.type == DatasetType.ACCURACY)
+        assert acc_ds.accuracy_config is not None
+        assert acc_ds.accuracy_config.extras is not None
+        assert acc_ds.accuracy_config.extras.get("workers") == 32
+
+    @pytest.mark.unit
+    def test_explicit_workers_not_overridden_by_concurrency(self):
+        """An explicit workers= in extras is not overwritten by target_concurrency."""
+        config = OnlineConfig(
+            endpoint_config={"endpoints": ["http://test:8000"]},
+            model_params={"name": "test-model"},
+            datasets=[
+                {
+                    "name": "swe_bench",
+                    "type": "accuracy",
+                    "accuracy_config": {
+                        "eval_method": "swe_bench_scorer",
+                        "extras": {"workers": 5},
+                    },
+                },
+                {"type": "performance", "path": "tests/assets/datasets/dummy_1k.jsonl"},
+            ],
+            settings={
+                "load_pattern": {"type": "concurrency", "target_concurrency": 32}
+            },
+        )
+        acc_ds = next(d for d in config.datasets if d.type == DatasetType.ACCURACY)
+        assert acc_ds.accuracy_config is not None
+        assert acc_ds.accuracy_config.extras is not None
+        assert acc_ds.accuracy_config.extras.get("workers") == 5
+
 
 class TestDurationSuffix:
     """Test duration suffix parsing (600s, 10m, 600000ms, plain int)."""
@@ -456,55 +505,6 @@ class TestAccuracyOnlyDataset:
             pytest.raises(SetupError, match="mock preflight failure"),
         ):
             _load_datasets(config, tmp_path)
-
-    @pytest.mark.unit
-    def test_concurrency_injected_into_swe_bench_extras(self):
-        """target_concurrency is forwarded as workers into swe_bench_scorer extras."""
-        config = OnlineConfig(
-            endpoint_config={"endpoints": ["http://test:8000"]},
-            model_params={"name": "test-model"},
-            datasets=[
-                {
-                    "name": "swe_bench",
-                    "type": "accuracy",
-                    "accuracy_config": {"eval_method": "swe_bench_scorer"},
-                },
-                {"type": "performance", "path": "tests/assets/datasets/dummy_1k.jsonl"},
-            ],
-            settings={
-                "load_pattern": {"type": "concurrency", "target_concurrency": 32}
-            },
-        )
-        acc_ds = next(d for d in config.datasets if d.type == DatasetType.ACCURACY)
-        assert acc_ds.accuracy_config is not None
-        assert acc_ds.accuracy_config.extras is not None
-        assert acc_ds.accuracy_config.extras.get("workers") == 32
-
-    @pytest.mark.unit
-    def test_explicit_workers_not_overridden_by_concurrency(self):
-        """An explicit workers= in extras is not overwritten by target_concurrency."""
-        config = OnlineConfig(
-            endpoint_config={"endpoints": ["http://test:8000"]},
-            model_params={"name": "test-model"},
-            datasets=[
-                {
-                    "name": "swe_bench",
-                    "type": "accuracy",
-                    "accuracy_config": {
-                        "eval_method": "swe_bench_scorer",
-                        "extras": {"workers": 5},
-                    },
-                },
-                {"type": "performance", "path": "tests/assets/datasets/dummy_1k.jsonl"},
-            ],
-            settings={
-                "load_pattern": {"type": "concurrency", "target_concurrency": 32}
-            },
-        )
-        acc_ds = next(d for d in config.datasets if d.type == DatasetType.ACCURACY)
-        assert acc_ds.accuracy_config is not None
-        assert acc_ds.accuracy_config.extras is not None
-        assert acc_ds.accuracy_config.extras.get("workers") == 5
 
     @pytest.mark.unit
     def test_perf_dataset_with_accuracy_config_does_not_crash_load_datasets(

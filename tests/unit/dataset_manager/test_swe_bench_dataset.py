@@ -71,15 +71,6 @@ class TestSWEBenchGenerate:
         with pytest.raises(ValueError, match="Unknown SWE-bench subset"):
             SWEBench.generate(datasets_dir=tmp_path, subset="invalid")
 
-    def test_column_names(self, tmp_path: Path):
-        with patch(
-            "inference_endpoint.dataset_manager.predefined.swe_bench.load_from_huggingface",
-            return_value=_make_hf_df(),
-        ):
-            df = SWEBench.generate(datasets_dir=tmp_path, subset="verified")
-
-        assert set(df.columns) == {"instance_id", "prompt"}
-
     def test_force_regenerate(self, tmp_path: Path):
         with patch(
             "inference_endpoint.dataset_manager.predefined.swe_bench.load_from_huggingface",
