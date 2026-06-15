@@ -302,6 +302,7 @@ def _load_datasets(
                 acc_cfg.accuracy_config.extras or {},
             )
         )
+        scorer_cls.preflight(acc_cfg.accuracy_config.extras or {})
         ds.load(
             api_type=config.endpoint_config.api_type, model_params=config.model_params
         )
@@ -923,14 +924,14 @@ def finalize_benchmark(ctx: BenchmarkContext, bench: BenchmarkResult) -> None:
             **eval_cfg.extras,
         )
         score, n_repeats = scorer_instance.score()
-        num_samples = len(eval_cfg.dataset.data)
+        num_samples = (
+            len(eval_cfg.dataset.data) if eval_cfg.dataset.data is not None else 0
+        )
         if eval_cfg.dataset_name == "performance":
             num_samples = sum(phase.issued_count for phase in result.perf_results)
         accuracy_scores[eval_cfg.dataset_name] = {
             "dataset_name": eval_cfg.dataset_name,
-            "num_samples": num_samples
-            if eval_cfg.dataset.data is not None
-            else 0,
+            "num_samples": num_samples,
             "extractor": (
                 eval_cfg.extractor.__name__ if eval_cfg.extractor is not None else None
             ),

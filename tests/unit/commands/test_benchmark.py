@@ -34,10 +34,9 @@ from inference_endpoint.commands.benchmark.execute import (
     BenchmarkContext,
     ResponseCollector,
     _build_phases,
-    _run_benchmark_async,
-    setup_benchmark,
     _load_datasets,
     _run_benchmark_async,
+    setup_benchmark,
 )
 from inference_endpoint.config.runtime_settings import RuntimeSettings
 from inference_endpoint.config.schema import (
@@ -64,6 +63,7 @@ from inference_endpoint.config.schema import (
 from inference_endpoint.config.utils import cli_error_formatter as _error_formatter
 from inference_endpoint.core.types import QueryResult
 from inference_endpoint.dataset_manager.dataset import Dataset
+from inference_endpoint.dataset_manager.predefined.swe_bench import SWEBench
 from inference_endpoint.endpoint_client.config import HTTPClientConfig
 from inference_endpoint.evaluation.scoring import Scorer
 from inference_endpoint.exceptions import InputValidationError, SetupError
@@ -388,11 +388,6 @@ class TestAccuracyOnlyDataset:
 
     @pytest.mark.unit
     def test_swe_bench_as_perf_raises(self, tmp_path):
-        from unittest.mock import patch
-
-        import pandas as pd
-        from inference_endpoint.dataset_manager.predefined.swe_bench import SWEBench
-
         fake_df = pd.DataFrame(
             [{"instance_id": "repo__repo-0", "problem_statement": "Fix bug 0"}]
         )
@@ -406,6 +401,52 @@ class TestAccuracyOnlyDataset:
             pytest.raises(InputValidationError, match="accuracy-only"),
         ):
             _load_datasets(config, tmp_path)
+
+    @pytest.mark.unit
+    def test_preflight_error_propagates(self, tmp_path):
+        """A scorer whose preflight() raises SetupError must stop _load_datasets."""
+        from inference_endpoint.commands.benchmark import execute as execute_mod
+        from inference_endpoint.evaluation.scoring import Scorer
+        from inference_endpoint.exceptions import SetupError
+
+        class _FailingPreflight(Scorer, scorer_id="_test_failing_preflight2"):
+            @classmethod
+            def preflight(cls, extras):
+                raise SetupError("mock preflight failure")
+
+            def score_single_sample(self, value, ground_truth):
+                return 0.0
+
+        try:
+            dummy_jsonl = tmp_path / "dummy.jsonl"
+            dummy_jsonl.write_text('{"prompt": "hello"}\n')
+            fake_acc_df = pd.DataFrame(
+                [{"instance_id": "repo__repo-0", "prompt": "Fix bug 0"}]
+            )
+            config = OfflineConfig(
+                endpoint_config={"endpoints": ["http://test:8000"]},
+                model_params={"name": "test-model"},
+                datasets=[
+                    {"type": "performance", "path": str(dummy_jsonl)},
+                    {
+                        "name": "swe_bench",
+                        "type": "accuracy",
+                        "accuracy_config": {"eval_method": "swe_bench_scorer"},
+                    },
+                ],
+            )
+            with (
+                patch.object(SWEBench, "generate", return_value=fake_acc_df),
+                patch.object(
+                    execute_mod,
+                    "_resolve_accuracy_components",
+                    return_value=(_FailingPreflight, None),
+                ),
+                pytest.raises(SetupError, match="mock preflight failure"),
+            ):
+                _load_datasets(config, tmp_path)
+        finally:
+            Scorer.PREDEFINED.pop("_test_failing_preflight2", None)
 
 
 class TestYAMLTemplateValidation:

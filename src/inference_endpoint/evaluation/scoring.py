@@ -33,6 +33,7 @@ import msgspec
 import msgspec.json
 import numpy as np
 import pandas as pd
+import yaml
 from pydantic import ValidationError
 from tqdm import tqdm
 
@@ -47,8 +48,6 @@ try:
 except ImportError:
     _evaluate = None
     _nltk = None
-
-import yaml
 
 from ..core.record import EventRecord, EventType, SampleEventType
 from ..core.types import TextModelOutput
