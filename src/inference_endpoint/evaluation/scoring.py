@@ -10,7 +10,7 @@
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific permissions and
+# See the License for the specific language governing permissions and
 # limitations under the License.
 
 
@@ -120,9 +120,10 @@ class Scorer(ABC):
         """
         return None
 
-    @classmethod  # noqa: B027
+    @classmethod  # noqa: B027 — intentional no-op default; subclasses override when needed
     def preflight(cls, extras: dict[str, Any]) -> None:
         """Verify external dependencies before the benchmark starts. No-op by default."""
+        pass
 
     def __init__(
         self,
@@ -140,7 +141,7 @@ class Scorer(ABC):
         self.ground_truth_column = (
             ground_truth_column if ground_truth_column is not None else "ground_truth"
         )
-        self.sample_index_map = (
+        self.sample_index_map: dict | None = (
             None if self.SKIP_ENDPOINT_PHASE else self._load_sample_index_map()
         )
 
@@ -183,6 +184,7 @@ class Scorer(ABC):
 
     def match_sample_index(self, row: pd.Series) -> pd.Series:
         # Pandas Apply function to create a new 'sample_index' column
+        assert self.sample_index_map is not None
         row["sample_index"] = self.sample_index_map[row["sample_uuid"]]
         return row
 
@@ -204,6 +206,7 @@ class Scorer(ABC):
         df = self.get_outputs()
 
         # Outputs are for all samples, not just the target dataset
+        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
 
@@ -297,6 +300,7 @@ class RougeScorer(Scorer, scorer_id="rouge"):
         df = self.get_outputs()
 
         # Outputs are for all samples, not just the target dataset
+        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
 
@@ -1123,6 +1127,7 @@ class LiveCodeBenchScorer(Scorer, scorer_id="code_bench_scorer"):
         df = self.get_outputs()
 
         # Outputs are for all samples, not just the target dataset
+        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
 
@@ -1343,6 +1348,7 @@ class ShopifyCategoryF1Scorer(Scorer, scorer_id="shopify_category_f1"):
     def score(self) -> tuple[float, int]:
         df = self.get_outputs()
 
+        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
         df = df.apply(self.match_sample_index, axis=1)
@@ -1601,6 +1607,7 @@ class VBenchScorer(Scorer, scorer_id="vbench"):
 
     def score(self) -> tuple[float | None, int]:
         df = self.get_outputs()
+        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
         # Drop failed queries: Scorer.get_outputs() emits "" when record.data

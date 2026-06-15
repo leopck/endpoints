@@ -80,6 +80,19 @@ TEMPLATE_DIR = (
     / "templates"
 )
 
+
+# Test-only scorer used by TestBuildPhases.test_skip_endpoint_phase_omits_accuracy_phase.
+# Registered with a leading underscore so TestScorerMethodSync can exclude it.
+class _SelfContainedScorer(Scorer, scorer_id="_test_skip_endpoint_phase"):
+    SKIP_ENDPOINT_PHASE = True
+
+    def score_single_sample(self, value, ground_truth):
+        return 0.0
+
+    def score(self):
+        return 1.0, 1
+
+
 # Reusable minimal config kwargs
 _OFFLINE_KWARGS = {
     "endpoint_config": {"endpoints": ["http://test:8000"]},
@@ -1039,34 +1052,22 @@ class TestBuildPhases:
     def test_skip_endpoint_phase_omits_accuracy_phase(
         self, base_rt_settings, simple_dataset
     ):
-        class _SelfContainedScorer(Scorer, scorer_id="_test_skip_endpoint_phase"):
-            SKIP_ENDPOINT_PHASE = True
+        config = OfflineConfig(**_OFFLINE_KWARGS)
+        ctx = self._make_ctx(config, base_rt_settings, simple_dataset)
+        ctx.eval_configs = [
+            AccuracyConfiguration(
+                scorer=_SelfContainedScorer,
+                extractor=None,
+                dataset_name="acc",
+                dataset=simple_dataset,
+                report_dir=Path("/tmp"),
+                ground_truth_column=None,
+                num_repeats=1,
+            )
+        ]
+        phases = _build_phases(ctx)
 
-            def score_single_sample(self, value, ground_truth):
-                return 0.0
-
-            def score(self):
-                return 1.0, 1
-
-        try:
-            config = OfflineConfig(**_OFFLINE_KWARGS)
-            ctx = self._make_ctx(config, base_rt_settings, simple_dataset)
-            ctx.eval_configs = [
-                AccuracyConfiguration(
-                    scorer=_SelfContainedScorer,
-                    extractor=None,
-                    dataset_name="acc",
-                    dataset=simple_dataset,
-                    report_dir=Path("/tmp"),
-                    ground_truth_column=None,
-                    num_repeats=1,
-                )
-            ]
-            phases = _build_phases(ctx)
-
-            assert all(p.phase_type != PhaseType.ACCURACY for p in phases)
-        finally:
-            Scorer.PREDEFINED.pop("_test_skip_endpoint_phase", None)
+        assert all(p.phase_type != PhaseType.ACCURACY for p in phases)
 
     @pytest.mark.unit
     def test_warmup_uses_independent_rng_instances(
@@ -1153,7 +1154,8 @@ class TestScorerMethodSync:
     @pytest.mark.unit
     def test_scorer_enum_matches_registry(self):
         enum_values = {m.value for m in ScorerMethod}
-        registry_keys = set(Scorer.PREDEFINED.keys())
+        # Exclude test-only scorers (ids starting with "_")
+        registry_keys = {k for k in Scorer.PREDEFINED if not k.startswith("_")}
         assert enum_values == registry_keys, (
             f"ScorerMethod enum out of sync with Scorer registry.\n"
             f"  In enum only: {enum_values - registry_keys}\n"

@@ -139,6 +139,11 @@ class TestSWEBenchScorerRegistration:
     def test_skip_endpoint_phase(self):
         assert SWEBenchScorer.SKIP_ENDPOINT_PHASE is True
 
+    def test_external_sample_count(self):
+        assert SWEBenchScorer.external_sample_count({"num_instances": 100}) == 100
+        assert SWEBenchScorer.external_sample_count({}) is None
+        assert SWEBenchScorer.external_sample_count({"num_instances": "bad"}) is None
+
 
 class TestSWEBenchScorer:
     def test_score_happy_path(
