@@ -406,18 +406,12 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
 
     # Calculate and display expected sample count
     total_samples = rt_settings.total_samples_to_issue()
-    for ds, ec in zip(accuracy_datasets, eval_configs, strict=True):
-        if not ec.scorer.SKIP_ENDPOINT_PHASE:
-            total_samples += ds.num_samples() * ds.repeats
-        else:
-            n = ec.scorer.external_sample_count(ec.extras)
-            if n is not None:
-                logger.info(
-                    "Accuracy dataset '%s' (%s): %d instances evaluated externally",
-                    ec.dataset_name,
-                    ec.scorer.SCORER_ID,
-                    n,
-                )
+    if accuracy_datasets:
+        total_samples += sum(
+            ds.num_samples() * ds.repeats
+            for ds, ec in zip(accuracy_datasets, eval_configs, strict=True)
+            if not ec.scorer.SKIP_ENDPOINT_PHASE
+        )
 
     collect_responses = test_mode in (TestMode.ACC, TestMode.BOTH)
     logger.info(
@@ -426,6 +420,16 @@ def setup_benchmark(config: BenchmarkConfig, test_mode: TestMode) -> BenchmarkCo
     logger.info(
         f"Min Duration: {rt_settings.min_duration_ms / 1000:.1f}s, Expected samples: {total_samples}"
     )
+    for ec in eval_configs:
+        if ec.scorer.SKIP_ENDPOINT_PHASE:
+            n = ec.scorer.external_sample_count(ec.extras)
+            if n is not None:
+                logger.info(
+                    "Accuracy dataset '%s' (%s): %d instances evaluated externally",
+                    ec.dataset_name,
+                    ec.scorer.SCORER_ID,
+                    n,
+                )
 
     return BenchmarkContext(
         config=config,
