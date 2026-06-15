@@ -344,6 +344,7 @@ def _load_datasets(
         scorer_cls, extractor_cls = _resolve_accuracy_components(
             perf_cfg.name, accuracy_config
         )
+        scorer_cls.preflight(accuracy_config.extras or {})
 
         eval_configs.append(
             AccuracyConfiguration(

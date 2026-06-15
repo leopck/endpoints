@@ -22,6 +22,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import inference_endpoint.commands.benchmark.execute as execute_mod
 import pandas as pd
 import pytest
 from inference_endpoint.commands.benchmark.cli import (
@@ -418,9 +419,6 @@ class TestAccuracyOnlyDataset:
     @pytest.mark.unit
     def test_preflight_error_propagates(self, tmp_path):
         """A scorer whose preflight() raises SetupError must stop _load_datasets."""
-        from inference_endpoint.commands.benchmark import execute as execute_mod
-        from inference_endpoint.evaluation.scoring import Scorer
-        from inference_endpoint.exceptions import SetupError
 
         class _FailingPreflight(Scorer, scorer_id="_test_failing_preflight2"):
             @classmethod
@@ -636,8 +634,6 @@ class TestAggregatorArgs:
     """Tests that metrics aggregator subprocess args are correctly forwarded."""
 
     def _make_ctx(self, config, tmp_path):
-        import random
-
         rt = RuntimeSettings(
             metric_target=Throughput(10.0),
             reported_metrics=[Throughput(10.0)],
