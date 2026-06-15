@@ -100,6 +100,20 @@ def report_dir(tmp_path: Path) -> Path:
     return d
 
 
+def _make_fake_run(on_eval_cmd):
+    """Return a fake_run that completes mini-extra successfully, then delegates to on_eval_cmd."""
+
+    def fake_run(cmd, **kwargs):
+        if "mini-extra" in " ".join(cmd):
+            output_dir = Path(cmd[cmd.index("--output") + 1])
+            output_dir.mkdir(parents=True, exist_ok=True)
+            (output_dir / "preds.json").write_text(json.dumps({}))
+            return MagicMock(returncode=0, stdout="ok\n")
+        return on_eval_cmd(cmd, **kwargs)
+
+    return fake_run
+
+
 @pytest.fixture
 def patch_subprocess(monkeypatch, report_dir: Path, swe_bench_project: Path):
     """Patch subprocess.run to write fake preds.json and result JSON."""
@@ -356,6 +370,29 @@ class TestSWEBenchScorer:
                 subset="full",
             )
 
+    def test_missing_model_name_raises_clear_error(self, swe_bench_project, tmp_path):
+        tmpl = {
+            "model": {
+                "model_name": "",
+                "model_kwargs": {"api_base": ""},
+            }
+        }
+        template_path = tmp_path / "tmpl.yaml"
+        template_path.write_text(yaml.dump(tmpl))
+
+        scorer = SWEBenchScorer(
+            dataset_name=_DATASET_NAME,
+            dataset=_make_dataset(),
+            report_dir=tmp_path,
+            swe_bench_project_path=swe_bench_project,
+            swebench_config_template=template_path,
+        )
+        output_dir = tmp_path / "out"
+        output_dir.mkdir()
+
+        with pytest.raises(ValueError, match="model_params.name is required"):
+            scorer._patch_config(output_dir, {"model_params": {}})
+
     def test_template_missing_model_kwargs_raises(
         self, report_dir, swe_bench_project, tmp_path
     ):
@@ -373,18 +410,15 @@ class TestSWEBenchScorer:
     def test_subprocess_failure_raises(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def fake_run(cmd, **kwargs):
-            cmd_str = " ".join(cmd)
-            if "mini-extra" in cmd_str:
-                output_dir = Path(cmd[cmd.index("--output") + 1])
-                output_dir.mkdir(parents=True, exist_ok=True)
-                (output_dir / "preds.json").write_text(json.dumps({}))
-                return MagicMock(returncode=0, stdout="ok\n")
-            return MagicMock(
-                returncode=2, stdout="", stderr=b"docker error: permission denied"
-            )
-
-        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            scoring_mod.subprocess,
+            "run",
+            _make_fake_run(
+                lambda cmd, **kwargs: MagicMock(
+                    returncode=2, stdout="", stderr=b"docker error: permission denied"
+                )
+            ),
+        )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -398,16 +432,10 @@ class TestSWEBenchScorer:
     def test_subprocess_timeout_raises(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def fake_run(cmd, **kwargs):
-            cmd_str = " ".join(cmd)
-            if "mini-extra" in cmd_str:
-                output_dir = Path(cmd[cmd.index("--output") + 1])
-                output_dir.mkdir(parents=True, exist_ok=True)
-                (output_dir / "preds.json").write_text(json.dumps({}))
-                return MagicMock(returncode=0, stdout="ok\n")
+        def _timeout(cmd, **kwargs):
             raise scoring_mod.subprocess.TimeoutExpired(cmd=cmd, timeout=300)
 
-        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(scoring_mod.subprocess, "run", _make_fake_run(_timeout))
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -421,13 +449,8 @@ class TestSWEBenchScorer:
     def test_result_glob_fallback(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def fake_run(cmd, **kwargs):
-            cmd_str = " ".join(cmd)
-            if "mini-extra" in cmd_str:
-                output_dir = Path(cmd[cmd.index("--output") + 1])
-                output_dir.mkdir(parents=True, exist_ok=True)
-                (output_dir / "preds.json").write_text(json.dumps({}))
-            elif "run_evaluation" in cmd_str:
+        def _write_alt_prefix(cmd, **kwargs):
+            if "run_evaluation" in " ".join(cmd):
                 cwd = Path(kwargs["cwd"])
                 run_id = cmd[cmd.index("--run_id") + 1]
                 # Write under a different prefix so exact name won't match; glob will find it
@@ -442,7 +465,9 @@ class TestSWEBenchScorer:
                 )
             return MagicMock(returncode=0, stdout="ok\n")
 
-        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            scoring_mod.subprocess, "run", _make_fake_run(_write_alt_prefix)
+        )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -457,13 +482,8 @@ class TestSWEBenchScorer:
     def test_zero_submitted_instances_returns_none(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def fake_run(cmd, **kwargs):
-            cmd_str = " ".join(cmd)
-            if "mini-extra" in cmd_str:
-                output_dir = Path(cmd[cmd.index("--output") + 1])
-                output_dir.mkdir(parents=True, exist_ok=True)
-                (output_dir / "preds.json").write_text(json.dumps({}))
-            elif "run_evaluation" in cmd_str:
+        def _write_zero_results(cmd, **kwargs):
+            if "run_evaluation" in " ".join(cmd):
                 cwd = Path(kwargs["cwd"])
                 run_id = cmd[cmd.index("--run_id") + 1]
                 safe_model = _MODEL_NAME.replace("/", "__")
@@ -478,7 +498,9 @@ class TestSWEBenchScorer:
                 )
             return MagicMock(returncode=0, stdout="ok\n")
 
-        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(
+            scoring_mod.subprocess, "run", _make_fake_run(_write_zero_results)
+        )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -552,29 +574,3 @@ class TestSWEBenchScorerPreflight:
         monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
         with pytest.raises(SetupError, match="Docker daemon is not running"):
             SWEBenchScorer.preflight(self._extras(swe_bench_project))
-
-
-class TestPatchConfigMissingName:
-    def test_missing_model_name_raises_clear_error(self, swe_bench_project, tmp_path):
-        """_patch_config raises ValueError with a clear message when model_params.name is absent."""
-        tmpl = {
-            "model": {
-                "model_name": "",
-                "model_kwargs": {"api_base": ""},
-            }
-        }
-        template_path = tmp_path / "tmpl.yaml"
-        template_path.write_text(yaml.dump(tmpl))
-
-        scorer = SWEBenchScorer(
-            dataset_name=_DATASET_NAME,
-            dataset=_make_dataset(),
-            report_dir=tmp_path,
-            swe_bench_project_path=swe_bench_project,
-            swebench_config_template=template_path,
-        )
-        output_dir = tmp_path / "out"
-        output_dir.mkdir()
-
-        with pytest.raises(ValueError, match="model_params.name is required"):
-            scorer._patch_config(output_dir, {"model_params": {}})
