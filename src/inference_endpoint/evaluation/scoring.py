@@ -206,7 +206,6 @@ class Scorer(ABC):
         df = self.get_outputs()
 
         # Outputs are for all samples, not just the target dataset
-        assert self.sample_index_map is not None
         valid_uuids = self.sample_index_map.keys()
         df = df[df["sample_uuid"].isin(valid_uuids)]
 
