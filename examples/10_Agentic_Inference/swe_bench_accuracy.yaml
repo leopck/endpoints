@@ -1,4 +1,4 @@
-type: "offline"
+type: "online"
 
 model_params:
   name: "Qwen/Qwen3.6-35B-A3B"
@@ -7,6 +7,7 @@ model_params:
   top_k: 20
   repetition_penalty: 1.0
   presence_penalty: 1.5
+  max_new_tokens: 8192
   chat_template_kwargs:
     preserve_thinking: true
 
@@ -29,13 +30,19 @@ datasets:
     accuracy_config:
       eval_method: "swe_bench_scorer"
       num_repeats: 1
+      extras:
+        num_instances: 10
 
 settings:
   load_pattern:
     type: "concurrency"
-    target_concurrency: 10
+    target_concurrency: 200
+  runtime:
+    n_samples_to_issue: 10
 
 endpoint_config:
   endpoints:
     - "http://localhost:30000"
   api_type: "openai"
+
+report_dir: logs/swe_standalone_1

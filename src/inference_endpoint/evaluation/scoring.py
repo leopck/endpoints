@@ -23,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 from abc import ABC, abstractmethod
 from collections import Counter, defaultdict
@@ -1680,99 +1681,35 @@ def _run_subprocess_with_log(
     timeout_s: int | None,
     label: str,
     cwd: Path | None = None,
-    passthrough_output: bool = False,
 ) -> None:
-    """Run *cmd*, capture stdout+stderr to *log_path*, raise on timeout or non-zero exit.
-
-    When *passthrough_output* is True, output is tee'd to sys.stdout in real-time while
-    still being captured to *log_path*.
-    """
-    if not passthrough_output:
-        try:
-            completed = subprocess.run(
-                cmd,
-                check=False,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                timeout=timeout_s,
-                cwd=str(cwd) if cwd is not None else None,
-            )
-        except subprocess.TimeoutExpired as e:
-            partial = (
-                e.stdout
-                if isinstance(e.stdout, str)
-                else (e.stdout or b"").decode("utf-8", errors="replace")
-            )
-            log_path.write_text(partial)
-            raise RuntimeError(
-                f"{label} subprocess timed out after {timeout_s}s; "
-                f"see {log_path} for partial output."
-            ) from e
-        log_path.write_text(completed.stdout or "")
-        if completed.returncode != 0:
-            tail = "\n".join((completed.stdout or "").splitlines()[-50:])
-            raise RuntimeError(
-                f"{label} subprocess exited with code {completed.returncode}; "
-                f"full log at {log_path}. Last 50 lines:\n{tail}"
-            )
-        return
-
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("LITELLM_LOG", "ERROR")
-
-    # Use a PTY for stdout so the child sees isatty()=True and enables turn counters /
-    # progress output that it would suppress when stdout is a plain pipe.
-    import pty
-
-    master_fd, slave_fd = pty.openpty()
-    process = subprocess.Popen(
-        cmd,
-        stdin=subprocess.DEVNULL,
-        stdout=slave_fd,
-        stderr=None,  # inherit parent stderr so progress bars / TTY detection work
-        env=env,
-        cwd=str(cwd) if cwd is not None else None,
-    )
-    os.close(slave_fd)
-
-    stdout_buffer: list[str] = []
-    master = os.fdopen(master_fd, "rb")
+    """Run *cmd*, capture stdout+stderr to *log_path*, raise on timeout or non-zero exit."""
     try:
-        while True:
-            try:
-                chunk = master.read(256)
-            except OSError:
-                break
-            if not chunk:
-                break
-            text = chunk.decode("utf-8", errors="replace")
-            sys.stdout.write(text)
-            sys.stdout.flush()
-            stdout_buffer.append(text)
-    finally:
-        master.close()
-
-    try:
-        return_code = process.wait(timeout=timeout_s)
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_s,
+            cwd=str(cwd) if cwd is not None else None,
+        )
     except subprocess.TimeoutExpired as e:
-        process.kill()
-        process.wait()
-        partial = "".join(stdout_buffer)
+        partial = (
+            e.stdout
+            if isinstance(e.stdout, str)
+            else (e.stdout or b"").decode("utf-8", errors="replace")
+        )
         log_path.write_text(partial)
         raise RuntimeError(
             f"{label} subprocess timed out after {timeout_s}s; "
             f"see {log_path} for partial output."
         ) from e
-
-    captured = "".join(stdout_buffer)
-    log_path.write_text(captured)
-    if return_code != 0:
-        tail = "\n".join(captured.splitlines()[-50:])
+    log_path.write_text(completed.stdout or "")
+    if completed.returncode != 0:
+        tail = "\n".join((completed.stdout or "").splitlines()[-50:])
         raise RuntimeError(
-            f"{label} subprocess exited with code {return_code}; "
+            f"{label} subprocess exited with code {completed.returncode}; "
             f"full log at {log_path}. Last 50 lines:\n{tail}"
         )
 
@@ -1790,6 +1727,49 @@ _DEFAULT_SWE_BENCH_TEMPLATE = (
     / "10_Agentic_Inference"
     / "swebench_template.yaml"
 )
+
+
+def _read_swebench_exit_statuses(
+    output_dir: Path, ignore: frozenset[Path]
+) -> dict[str, list[str]]:
+    """Read the newest exit_statuses_*.yaml not in *ignore*; return {} if none present."""
+    files = [
+        f for f in sorted(output_dir.glob("exit_statuses_*.yaml")) if f not in ignore
+    ]
+    if not files:
+        return {}
+    try:
+        data = yaml.safe_load(files[-1].read_text()) or {}
+        return data.get("instances_by_exit_status", {})
+    except Exception:
+        return {}
+
+
+def _poll_swebench_progress(
+    output_dir: Path, total: int, stop: threading.Event
+) -> None:
+    """Poll exit_statuses_*.yaml and update a tqdm bar until stop is set."""
+    # Snapshot pre-existing status files so stale data from prior runs is ignored.
+    existing = frozenset(output_dir.glob("exit_statuses_*.yaml"))
+    with tqdm(total=total, desc="SWE-bench instances", unit="instance") as bar:
+        last = 0
+        while not stop.is_set():
+            statuses = _read_swebench_exit_statuses(output_dir, existing)
+            done = sum(len(v) for v in statuses.values())
+            if done > last:
+                bar.update(done - last)
+                last = done
+            if statuses:
+                bar.set_postfix({k: len(v) for k, v in sorted(statuses.items())})
+            if last >= total:
+                break
+            stop.wait(timeout=5.0)
+        statuses = _read_swebench_exit_statuses(output_dir, existing)
+        done = sum(len(v) for v in statuses.values())
+        if done > last:
+            bar.update(done - last)
+        if statuses:
+            bar.set_postfix({k: len(v) for k, v in sorted(statuses.items())})
 
 
 class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
@@ -2024,7 +2004,6 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             timeout_s=self.subprocess_timeout_s,
             label="SWE-bench",
             cwd=cwd,
-            passthrough_output=True,
         )
 
     def score(self) -> tuple[float | None, int]:
@@ -2081,11 +2060,23 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             str(output_dir),
         ]
         logger.info("Running mini-extra swebench: %s", " ".join(agent_cmd))
-        self._run_subprocess(
-            agent_cmd,
-            self.report_dir / "swe_bench_agent.log",
-            cwd=output_dir,
+        total_instances = min(self.num_instances, n_rows)
+        stop_event = threading.Event()
+        poll_thread = threading.Thread(
+            target=_poll_swebench_progress,
+            args=(output_dir, total_instances, stop_event),
+            daemon=True,
         )
+        poll_thread.start()
+        try:
+            self._run_subprocess(
+                agent_cmd,
+                self.report_dir / "swe_bench_agent.log",
+                cwd=output_dir,
+            )
+        finally:
+            stop_event.set()
+            poll_thread.join(timeout=10)
 
         preds_path = output_dir / "preds.json"
         if not preds_path.exists():
