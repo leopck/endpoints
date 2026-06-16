@@ -100,26 +100,34 @@ def report_dir(tmp_path: Path) -> Path:
     return d
 
 
-def _make_fake_run(on_eval_cmd):
-    """Return a fake_run that completes mini-extra successfully, then delegates to on_eval_cmd."""
+def _make_fake_popen(cmd, **kwargs):
+    """Return a fake Popen object whose stdout yields empty output and wait() returns 0."""
+    mock_proc = MagicMock()
+    mock_proc.stdout.read = MagicMock(return_value="")
+    mock_proc.wait = MagicMock(return_value=0)
+    return mock_proc
 
-    def fake_run(cmd, **kwargs):
+
+def _make_staged_popen(on_eval_cmd):
+    """Return a fake_popen that handles mini-extra successfully, then delegates to on_eval_cmd."""
+
+    def fake_popen(cmd, **kwargs):
         if "mini-extra" in " ".join(cmd):
             output_dir = Path(cmd[cmd.index("--output") + 1])
             output_dir.mkdir(parents=True, exist_ok=True)
             (output_dir / "preds.json").write_text(json.dumps({}))
-            return MagicMock(returncode=0, stdout="ok\n")
+            return _make_fake_popen(cmd, **kwargs)
         return on_eval_cmd(cmd, **kwargs)
 
-    return fake_run
+    return fake_popen
 
 
 @pytest.fixture
 def patch_subprocess(monkeypatch, report_dir: Path, swe_bench_project: Path):
-    """Patch subprocess.run to write fake preds.json and result JSON."""
+    """Patch subprocess.Popen to write fake preds.json and result JSON."""
     captured: list[list[str]] = []
 
-    def fake_run(cmd, **kwargs):
+    def fake_popen(cmd, **kwargs):
         captured.append(list(cmd))
         cmd_str = " ".join(cmd)
         if "mini-extra" in cmd_str:
@@ -139,9 +147,9 @@ def patch_subprocess(monkeypatch, report_dir: Path, swe_bench_project: Path):
                     }
                 )
             )
-        return MagicMock(returncode=0, stdout="ok\n")
+        return _make_fake_popen(cmd, **kwargs)
 
-    monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(scoring_mod.subprocess, "Popen", fake_popen)
     return captured
 
 
@@ -206,10 +214,7 @@ class TestSWEBenchScorer:
     def test_missing_preds_returns_none(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def fake_run(cmd, **kwargs):
-            return MagicMock(returncode=0, stdout="ok\n")
-
-        monkeypatch.setattr(scoring_mod.subprocess, "run", fake_run)
+        monkeypatch.setattr(scoring_mod.subprocess, "Popen", _make_fake_popen)
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -471,14 +476,15 @@ class TestSWEBenchScorer:
     def test_subprocess_failure_raises(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
+        def _fail_eval(cmd, **kwargs):
+            proc = _make_fake_popen(cmd, **kwargs)
+            proc.wait = MagicMock(return_value=2)
+            return proc
+
         monkeypatch.setattr(
             scoring_mod.subprocess,
-            "run",
-            _make_fake_run(
-                lambda cmd, **kwargs: MagicMock(
-                    returncode=2, stdout="", stderr=b"docker error: permission denied"
-                )
-            ),
+            "Popen",
+            _make_staged_popen(_fail_eval),
         )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
@@ -493,10 +499,22 @@ class TestSWEBenchScorer:
     def test_subprocess_timeout_raises(
         self, report_dir, swe_bench_project, template_yaml, monkeypatch
     ):
-        def _timeout(cmd, **kwargs):
-            raise scoring_mod.subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+        def _timeout_eval(cmd, **kwargs):
+            proc = _make_fake_popen(cmd, **kwargs)
+            calls = [0]
 
-        monkeypatch.setattr(scoring_mod.subprocess, "run", _make_fake_run(_timeout))
+            def _wait_once(*args, **kwargs):
+                calls[0] += 1
+                if calls[0] == 1:
+                    raise scoring_mod.subprocess.TimeoutExpired(cmd=cmd, timeout=300)
+                return 1
+
+            proc.wait = MagicMock(side_effect=_wait_once)
+            return proc
+
+        monkeypatch.setattr(
+            scoring_mod.subprocess, "Popen", _make_staged_popen(_timeout_eval)
+        )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
             dataset=_make_dataset(),
@@ -524,10 +542,10 @@ class TestSWEBenchScorer:
                         }
                     )
                 )
-            return MagicMock(returncode=0, stdout="ok\n")
+            return _make_fake_popen(cmd, **kwargs)
 
         monkeypatch.setattr(
-            scoring_mod.subprocess, "run", _make_fake_run(_write_alt_prefix)
+            scoring_mod.subprocess, "Popen", _make_staged_popen(_write_alt_prefix)
         )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,
@@ -557,10 +575,10 @@ class TestSWEBenchScorer:
                         }
                     )
                 )
-            return MagicMock(returncode=0, stdout="ok\n")
+            return _make_fake_popen(cmd, **kwargs)
 
         monkeypatch.setattr(
-            scoring_mod.subprocess, "run", _make_fake_run(_write_zero_results)
+            scoring_mod.subprocess, "Popen", _make_staged_popen(_write_zero_results)
         )
         scorer = SWEBenchScorer(
             dataset_name=_DATASET_NAME,

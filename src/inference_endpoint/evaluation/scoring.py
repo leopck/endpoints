@@ -1677,38 +1677,85 @@ def _run_subprocess_with_log(
     cmd: list[str],
     log_path: Path,
     *,
-    timeout_s: int,
+    timeout_s: int | None,
     label: str,
     cwd: Path | None = None,
+    passthrough_output: bool = False,
 ) -> None:
-    """Run *cmd*, capture stdout+stderr to *log_path*, raise on timeout or non-zero exit."""
+    """Run *cmd*, capture stdout+stderr to *log_path*, raise on timeout or non-zero exit.
+
+    When *passthrough_output* is True, output is tee'd to sys.stdout in real-time while
+    still being captured to *log_path*.
+    """
+    if not passthrough_output:
+        try:
+            completed = subprocess.run(
+                cmd,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=timeout_s,
+                cwd=str(cwd) if cwd is not None else None,
+            )
+        except subprocess.TimeoutExpired as e:
+            partial = (
+                e.stdout
+                if isinstance(e.stdout, str)
+                else (e.stdout or b"").decode("utf-8", errors="replace")
+            )
+            log_path.write_text(partial)
+            raise RuntimeError(
+                f"{label} subprocess timed out after {timeout_s}s; "
+                f"see {log_path} for partial output."
+            ) from e
+        log_path.write_text(completed.stdout or "")
+        if completed.returncode != 0:
+            tail = "\n".join((completed.stdout or "").splitlines()[-50:])
+            raise RuntimeError(
+                f"{label} subprocess exited with code {completed.returncode}; "
+                f"full log at {log_path}. Last 50 lines:\n{tail}"
+            )
+        return
+
+    process = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=None,  # inherit parent stderr so progress bars / TTY detection work
+        text=True,
+        bufsize=1,
+        cwd=str(cwd) if cwd is not None else None,
+    )
+    stdout_buffer: list[str] = []
+    assert process.stdout is not None
+    while True:
+        char = process.stdout.read(1)
+        if not char:
+            break
+        sys.stdout.write(char)
+        sys.stdout.flush()
+        stdout_buffer.append(char)
+
     try:
-        completed = subprocess.run(
-            cmd,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout_s,
-            cwd=str(cwd) if cwd is not None else None,
-        )
+        return_code = process.wait(timeout=timeout_s)
     except subprocess.TimeoutExpired as e:
-        partial = (
-            e.stdout
-            if isinstance(e.stdout, str)
-            else (e.stdout or b"").decode("utf-8", errors="replace")
-        )
+        process.kill()
+        process.wait()
+        partial = "".join(stdout_buffer)
         log_path.write_text(partial)
         raise RuntimeError(
             f"{label} subprocess timed out after {timeout_s}s; "
             f"see {log_path} for partial output."
         ) from e
-    log_path.write_text(completed.stdout or "")
-    if completed.returncode != 0:
-        tail = "\n".join((completed.stdout or "").splitlines()[-50:])
+
+    captured = "".join(stdout_buffer)
+    log_path.write_text(captured)
+    if return_code != 0:
+        tail = "\n".join(captured.splitlines()[-50:])
         raise RuntimeError(
-            f"{label} subprocess exited with code {completed.returncode}; "
+            f"{label} subprocess exited with code {return_code}; "
             f"full log at {log_path}. Last 50 lines:\n{tail}"
         )
 
@@ -1960,6 +2007,7 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
             timeout_s=self.subprocess_timeout_s,
             label="SWE-bench",
             cwd=cwd,
+            passthrough_output=True,
         )
 
     def score(self) -> tuple[float | None, int]:
@@ -1991,7 +2039,9 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         slice_str = f"0:{min(self.num_instances, n_rows)}"
 
         output_dir = self.report_dir / "swe_bench_output"
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True)
 
         patched_config = self._patch_config(output_dir, benchmark_cfg)
 
