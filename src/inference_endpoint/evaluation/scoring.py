@@ -1719,24 +1719,41 @@ def _run_subprocess_with_log(
             )
         return
 
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env.setdefault("LITELLM_LOG", "ERROR")
+
+    # Use a PTY for stdout so the child sees isatty()=True and enables turn counters /
+    # progress output that it would suppress when stdout is a plain pipe.
+    import pty
+
+    master_fd, slave_fd = pty.openpty()
     process = subprocess.Popen(
         cmd,
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
+        stdout=slave_fd,
         stderr=None,  # inherit parent stderr so progress bars / TTY detection work
-        text=True,
-        bufsize=1,
+        env=env,
         cwd=str(cwd) if cwd is not None else None,
     )
+    os.close(slave_fd)
+
     stdout_buffer: list[str] = []
-    assert process.stdout is not None
-    while True:
-        char = process.stdout.read(1)
-        if not char:
-            break
-        sys.stdout.write(char)
-        sys.stdout.flush()
-        stdout_buffer.append(char)
+    master = os.fdopen(master_fd, "rb")
+    try:
+        while True:
+            try:
+                chunk = master.read(256)
+            except OSError:
+                break
+            if not chunk:
+                break
+            text = chunk.decode("utf-8", errors="replace")
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            stdout_buffer.append(text)
+    finally:
+        master.close()
 
     try:
         return_code = process.wait(timeout=timeout_s)
