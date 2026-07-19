@@ -26,7 +26,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlparse, urlunparse
 
 import msgspec.json
@@ -230,11 +230,100 @@ class SwebenchRunner:
         self._validate_prediction_ids(request, preds_path)
         shutil.copy2(preds_path, run_dir / "preds.json")
 
+        # Classify the agent-phase exit statuses (structured, from mini-swe-agent's
+        # exit_statuses_*.yaml) BEFORE grading, so infrastructure failures — the
+        # per-instance sandbox `docker run` that never started the task — are told
+        # apart from genuine agent outcomes.
+        exit_report = self._classify_exit_statuses(output_dir)
+
         result_path = self._run_eval(
             request, preds_path, output_dir, run_dir, cancel_token
         )
-        shutil.copy2(result_path, run_dir / "swe_bench_results.json")
-        return msgspec.json.decode(result_path.read_bytes(), type=dict)
+        result = msgspec.json.decode(result_path.read_bytes(), type=dict)
+
+        # Surface the exit-status metrics + an infra-error verdict on the result. When
+        # any instance failed on infra it never produced a real attempt, so the
+        # resolved count is over an INCOMPLETE set and the accuracy is not reliable —
+        # the client should fail the SWE-bench accuracy and ask for a retry rather
+        # than report a misleading (deflated) number.
+        result["exit_status_report"] = exit_report
+        graded = int(result.get("completed_instances") or 0)
+        valid_attempts = exit_report["submitted"] + exit_report["limits_exceeded"]
+        # Invariant: with zero infra errors, real attempts == graded results.
+        result["accuracy_complete"] = (
+            exit_report["infra_errors"] == 0 and valid_attempts == graded
+        )
+        if exit_report["infra_errors"] > 0:
+            infra_desc = ", ".join(
+                f"{status}={count}"
+                for status, count in sorted(exit_report["infra_by_status"].items())
+            )
+            result["infra_error"] = True
+            result["status"] = "infra_error"
+            result["message"] = (
+                f"{exit_report['infra_errors']}/{exit_report['total']} instances failed "
+                f"with an INFRASTRUCTURE error ({infra_desc}) — the sandbox container "
+                f"never started, so those tasks never ran. The reported accuracy is "
+                f"computed over an incomplete set and is NOT reliable. Please RETRY "
+                f"the SWE-bench run (infra error, not a model result)."
+            )
+        # Persist the AUGMENTED result (raw eval report + exit-status metrics +
+        # infra verdict) as swe_bench_results.json — this is the artifact the client
+        # scorer downloads, so the infra metrics/verdict travel with it.
+        (run_dir / "swe_bench_results.json").write_bytes(msgspec.json.encode(result))
+        return result
+
+    _AGENT_RAN_STATUSES: ClassVar[frozenset[str]] = frozenset(
+        {"Submitted", "LimitsExceeded"}
+    )
+
+    @classmethod
+    def _classify_exit_statuses(cls, output_dir: Path) -> dict[str, Any]:
+        """Split mini-swe-agent's exit statuses into real agent attempts vs infra
+        errors. `Submitted` (agent produced a diff) and `LimitsExceeded` (agent ran
+        out of steps) are genuine attempts; every OTHER status (`CalledProcessError`,
+        `TimeoutExpired`, ...) means the per-instance sandbox `docker run` failed and
+        the task never started — an infrastructure error, not a model outcome.
+
+        Robust because it reads the structured `exit_statuses_*.yaml`, not logs.
+        """
+        files = sorted(
+            output_dir.glob("exit_statuses_*.yaml"),
+            key=lambda path: path.stat().st_mtime,
+        )
+        by_status: dict[str, list[str]] = {}
+        if files:
+            try:
+                loaded = yaml.safe_load(files[-1].read_text()) or {}
+            except (OSError, yaml.YAMLError):
+                loaded = {}
+            instances_by_status = loaded.get("instances_by_exit_status")
+            if isinstance(instances_by_status, dict):
+                for status, instance_ids in instances_by_status.items():
+                    if isinstance(instance_ids, list):
+                        by_status[str(status)] = [str(i) for i in instance_ids]
+
+        counts = {status: len(ids) for status, ids in by_status.items()}
+        infra_by_status = {
+            status: len(ids)
+            for status, ids in by_status.items()
+            if status not in cls._AGENT_RAN_STATUSES
+        }
+        infra_ids = [
+            instance_id
+            for status, ids in by_status.items()
+            if status not in cls._AGENT_RAN_STATUSES
+            for instance_id in ids
+        ]
+        return {
+            "total": sum(counts.values()),
+            "submitted": counts.get("Submitted", 0),
+            "limits_exceeded": counts.get("LimitsExceeded", 0),
+            "infra_errors": len(infra_ids),
+            "infra_by_status": infra_by_status,
+            "infra_instance_ids": infra_ids,
+            "counts_by_status": counts,
+        }
 
     def _load_template(self, request: RunRequest) -> dict[str, Any]:
         template_path = self._template_dir / TEMPLATE_FILES[request.template]

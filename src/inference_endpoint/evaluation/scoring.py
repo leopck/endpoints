@@ -2383,6 +2383,33 @@ class SWEBenchScorer(Scorer, scorer_id="swe_bench_scorer"):
         if not result_path.exists():
             result_path.write_bytes(msgspec.json.encode(result))
 
+        # Infra-error gate. mini-swe-agent's exit statuses tell real agent attempts
+        # (Submitted, LimitsExceeded) from infrastructure failures where the
+        # per-instance sandbox container never started (CalledProcessError,
+        # TimeoutExpired, ...). Surface the counts, and if ANY instance failed on
+        # infra the resolved count is over an INCOMPLETE set — the accuracy is not a
+        # real model result, so fail it and ask the user to retry rather than report
+        # a misleading (deflated) number.
+        exit_report = result.get("exit_status_report")
+        if isinstance(exit_report, dict):
+            logger.info(
+                "SWE-bench exit statuses: submitted=%d limits_exceeded=%d "
+                "infra_errors=%d (by status: %s)",
+                exit_report.get("submitted", 0),
+                exit_report.get("limits_exceeded", 0),
+                exit_report.get("infra_errors", 0),
+                exit_report.get("infra_by_status", {}),
+            )
+        if result.get("infra_error"):
+            logger.error(
+                "SWE-bench accuracy FAILED (infrastructure error, not a model "
+                "result): %s",
+                result.get("message")
+                or "sandbox containers failed to start — RETRY the SWE-bench run",
+            )
+            self.complete = False
+            return None, 1
+
         submitted_count = result.get("submitted_instances") or 0
         resolved = result.get("resolved_instances") or 0
         if submitted_count == 0:
