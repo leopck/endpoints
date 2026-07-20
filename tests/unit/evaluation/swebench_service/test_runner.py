@@ -467,3 +467,42 @@ def test_regrade_stops_when_no_progress(monkeypatch, tmp_path):
 
     assert out["error_ids"] == ["b"]
     assert calls["n"] == 1  # one no-progress round -> stop, don't burn all 6
+
+
+def test_load_skip_ids_env(monkeypatch, tmp_path):
+    monkeypatch.delenv("SWE_BENCH_SKIP_IDS_FILE", raising=False)
+    monkeypatch.setenv("SWE_BENCH_SKIP_IDS", "a__x-1, b__y-2 ,")
+    assert SwebenchRunner._load_skip_ids() == frozenset({"a__x-1", "b__y-2"})
+
+    f = tmp_path / "skip.json"
+    f.write_bytes(msgspec.json.encode(["c__z-3", "d__w-4"]))
+    monkeypatch.setenv("SWE_BENCH_SKIP_IDS_FILE", str(f))
+    assert SwebenchRunner._load_skip_ids() == frozenset({"c__z-3", "d__w-4"})
+
+    monkeypatch.delenv("SWE_BENCH_SKIP_IDS_FILE")
+    monkeypatch.delenv("SWE_BENCH_SKIP_IDS")
+    assert SwebenchRunner._load_skip_ids() == frozenset()
+
+
+def test_reinject_skipped_restores_denominator_as_unresolved():
+    """Skipped instances come back as unresolved and the denominator is the ORIGINAL
+    count, so resolved/total equals a full run and submitted==total (scorer stays
+    complete)."""
+    result = {
+        "resolved_ids": ["a", "b"],
+        "unresolved_ids": ["c"],
+        "submitted_ids": ["a", "b", "c"],
+        "resolved_instances": 2,
+        "unresolved_instances": 1,
+        "submitted_instances": 3,
+        "total_instances": 3,
+    }
+    # Ran 3 of an original 5; 2 were skipped (known always-fail).
+    SwebenchRunner._reinject_skipped(result, ["x", "y"], 5)
+
+    assert result["total_instances"] == 5
+    assert result["submitted_instances"] == 5
+    assert set(result["unresolved_ids"]) == {"c", "x", "y"}
+    assert result["skipped_ids"] == ["x", "y"]
+    # resolved unchanged -> resolved/total is 2/5, exactly a full run's number.
+    assert result["resolved_instances"] == 2

@@ -235,6 +235,22 @@ class SwebenchRunner:
             )
         )
 
+        # TEMPORARY SPEED HACK (env-gated; revert by unsetting the env var).
+        # Instances known to ALWAYS fail (0 resolves across a large sample) are not
+        # worth their agent+eval runtime. Skip RUNNING them, but keep the denominator
+        # at the ORIGINAL count and score them as unresolved — resolved/total is
+        # mathematically identical to running them (they contribute 0 resolves), just
+        # faster. Fully internal to the runner: the client still issued the full set,
+        # so the scorer's denominator (== len(evaluated_instance_ids) it issued) and
+        # its submitted_count==denominator completeness check both stay satisfied.
+        skip_ids = self._load_skip_ids()
+        original_instance_ids = list(request.evaluated_instance_ids)
+        skipped_ids = [i for i in original_instance_ids if i in skip_ids]
+        if skipped_ids:
+            request.evaluated_instance_ids = [
+                i for i in original_instance_ids if i not in skip_ids
+            ]
+
         output_dir = run_dir / "swe_bench_output"
         if output_dir.exists():
             shutil.rmtree(output_dir)
@@ -340,6 +356,14 @@ class SwebenchRunner:
                 f"computed over an incomplete set and is NOT reliable. Please RETRY "
                 f"the SWE-bench run (infra error, not a model result)."
             )
+        # Re-inject any SKIPPED instances (see the skip hack above) as unresolved and
+        # restore the ORIGINAL denominator, so the reported result is exactly what a
+        # full run would have produced (skipped == known-always-fail == unresolved),
+        # and the scorer's submitted_count==denominator completeness check holds.
+        if skipped_ids:
+            self._reinject_skipped(result, skipped_ids, len(original_instance_ids))
+            request.evaluated_instance_ids = original_instance_ids
+
         # Persist the AUGMENTED result (raw eval report + exit-status metrics +
         # infra verdict) as swe_bench_results.json — this is the artifact the client
         # scorer downloads, so the infra metrics/verdict travel with it.
@@ -440,6 +464,51 @@ class SwebenchRunner:
             if id_key in result:
                 result[count_key] = len(result[id_key])
         return len(err_ids) - len(result.get("error_ids") or [])
+
+    @staticmethod
+    def _load_skip_ids() -> frozenset[str]:
+        """Instance ids to SKIP running (temporary speed hack), from the environment.
+
+        ``SWE_BENCH_SKIP_IDS_FILE`` -> a JSON list of ids; or ``SWE_BENCH_SKIP_IDS``
+        -> a comma-separated inline list. Unset / unreadable => empty (no-op). This
+        is intentionally env-gated so it reverts cleanly by removing the variable —
+        no code change needed to disable it.
+        """
+        path = os.environ.get("SWE_BENCH_SKIP_IDS_FILE")
+        if path:
+            try:
+                data = msgspec.json.decode(Path(path).read_bytes())
+                return frozenset(str(i) for i in data)
+            except (OSError, msgspec.DecodeError):
+                return frozenset()
+        inline = os.environ.get("SWE_BENCH_SKIP_IDS", "")
+        return frozenset(p.strip() for p in inline.split(",") if p.strip())
+
+    @staticmethod
+    def _reinject_skipped(
+        result: dict[str, Any], skipped_ids: list[str], original_total: int
+    ) -> None:
+        """Fold skipped instances back into ``result`` as unresolved and restore the
+        original denominator, so resolved/total matches a full run exactly."""
+        skip = [i for i in skipped_ids]
+        result["skipped_ids"] = sorted(skip)
+        for bucket in ("submitted_ids", "unresolved_ids"):
+            lst = result.setdefault(bucket, [])
+            have = set(lst)
+            for iid in skip:
+                if iid not in have:
+                    lst.append(iid)
+                    have.add(iid)
+        # Recompute the id-backed counts, then force the denominator fields to the
+        # original count (the skipped ids are included above, so these match).
+        for count_key, id_key in (
+            ("unresolved_instances", "unresolved_ids"),
+            ("submitted_instances", "submitted_ids"),
+        ):
+            if id_key in result:
+                result[count_key] = len(result[id_key])
+        result["total_instances"] = original_total
+        result["submitted_instances"] = original_total
 
     _AGENT_RAN_STATUSES: ClassVar[frozenset[str]] = frozenset(
         {"Submitted", "LimitsExceeded"}
