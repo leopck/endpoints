@@ -333,3 +333,137 @@ def test_run_classifies_eval_subprocess_failure_as_infra(monkeypatch, tmp_path):
         (run_dir / "swe_bench_results.json").read_bytes(), type=dict
     )
     assert persisted["infra_error"] is True
+
+
+def test_merge_regrade_moves_recovered_ids_and_recounts():
+    result = {
+        "resolved_ids": ["a"],
+        "unresolved_ids": [],
+        "empty_patch_ids": [],
+        "completed_ids": ["a"],
+        "incomplete_ids": [],
+        "error_ids": ["b", "c"],
+        "resolved_instances": 1,
+        "unresolved_instances": 0,
+        "empty_patch_instances": 0,
+        "completed_instances": 1,
+        "error_instances": 2,
+    }
+    # Re-grade of {b, c}: b now resolves, c still errors.
+    sub = {
+        "resolved_ids": ["b"],
+        "unresolved_ids": [],
+        "empty_patch_ids": [],
+        "completed_ids": ["b"],
+        "incomplete_ids": [],
+        "error_ids": ["c"],
+    }
+
+    recovered = SwebenchRunner._merge_regrade(result, sub, ["b", "c"])
+
+    assert recovered == 1
+    assert set(result["resolved_ids"]) == {"a", "b"}
+    assert result["error_ids"] == ["c"]
+    assert result["resolved_instances"] == 2
+    assert result["completed_instances"] == 2
+    assert result["error_instances"] == 1
+
+
+def test_regrade_never_fabricates_a_pass():
+    """An id the re-grade STILL reports as error stays in error_ids — no id is
+    moved out of error without a real verdict."""
+    result = {
+        "resolved_ids": [],
+        "unresolved_ids": [],
+        "empty_patch_ids": [],
+        "completed_ids": [],
+        "incomplete_ids": [],
+        "error_ids": ["b"],
+        "resolved_instances": 0,
+        "error_instances": 1,
+    }
+    sub = {"resolved_ids": [], "error_ids": ["b"]}  # still errored
+
+    recovered = SwebenchRunner._merge_regrade(result, sub, ["b"])
+
+    assert recovered == 0
+    assert result["error_ids"] == ["b"]
+    assert result["resolved_instances"] == 0
+
+
+def test_regrade_error_ids_recovers_across_attempts(monkeypatch, tmp_path):
+    """error_ids clear over multiple fresh-container re-grade passes; the loop stops
+    the moment errors empty (no wasted extra pass) and writes per-attempt artifacts."""
+    runner = SwebenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+    request = _request(["http://endpoint:30000"])
+    request.evaluated_instance_ids = ["a", "b", "c"]
+    output_dir = tmp_path / "out"
+    run_dir = tmp_path / "run"
+    output_dir.mkdir()
+    run_dir.mkdir()
+    preds = output_dir / "preds.json"
+    preds.write_text("{}")
+    result = {
+        "resolved_ids": ["a"],
+        "unresolved_ids": [],
+        "empty_patch_ids": [],
+        "completed_ids": ["a"],
+        "incomplete_ids": [],
+        "error_ids": ["b", "c"],
+        "resolved_instances": 1,
+        "error_instances": 2,
+        "completed_instances": 1,
+    }
+    calls = {"n": 0}
+
+    def fake_run_eval(
+        self, req, preds_path, out, rundir, cancel_token=None, *, instance_ids, log_name
+    ):
+        calls["n"] += 1
+        if calls["n"] == 1:  # given [b, c] -> b resolves, c still errors
+            sub = {"resolved_ids": ["b"], "completed_ids": ["b"], "error_ids": ["c"]}
+        else:  # given [c] -> c resolves
+            sub = {"resolved_ids": ["c"], "completed_ids": ["c"], "error_ids": []}
+        p = out / f"sub{calls['n']}.json"
+        p.write_bytes(msgspec.json.encode(sub))
+        return p
+
+    monkeypatch.setattr(SwebenchRunner, "_run_eval", fake_run_eval)
+
+    out = runner._regrade_error_ids(request, preds, output_dir, run_dir, result)
+
+    assert out["error_ids"] == []
+    assert set(out["resolved_ids"]) == {"a", "b", "c"}
+    assert out["error_instances"] == 0
+    assert out["resolved_instances"] == 3
+    assert calls["n"] == 2  # stopped as soon as error_ids emptied
+    assert (run_dir / "swe_bench_eval_regrade_1.json").exists()
+
+
+def test_regrade_stops_when_no_progress(monkeypatch, tmp_path):
+    """A sticky error (re-grade keeps returning it) stops the loop early rather than
+    burning all 6 attempts."""
+    runner = SwebenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+    request = _request(["http://endpoint:30000"])
+    request.evaluated_instance_ids = ["b"]
+    output_dir = tmp_path / "out"
+    run_dir = tmp_path / "run"
+    output_dir.mkdir()
+    run_dir.mkdir()
+    preds = output_dir / "preds.json"
+    preds.write_text("{}")
+    result = {"error_ids": ["b"], "error_instances": 1, "resolved_ids": []}
+    calls = {"n": 0}
+
+    def fake_run_eval(self, req, preds_path, out, rundir, cancel_token=None, *, instance_ids, log_name):
+        calls["n"] += 1
+        p = out / f"sub{calls['n']}.json"
+        p.write_bytes(msgspec.json.encode({"error_ids": ["b"]}))  # never recovers
+        return p
+
+    monkeypatch.setattr(SwebenchRunner, "_run_eval", fake_run_eval)
+
+    out = runner._regrade_error_ids(request, preds, output_dir, run_dir, result)
+
+    assert out["error_ids"] == ["b"]
+    assert calls["n"] == 1  # one no-progress round -> stop, don't burn all 6

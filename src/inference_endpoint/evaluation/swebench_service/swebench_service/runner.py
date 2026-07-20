@@ -25,6 +25,7 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 from urllib.parse import urlparse, urlunparse
@@ -298,6 +299,21 @@ class SwebenchRunner:
             return result
         result = msgspec.json.decode(result_path.read_bytes(), type=dict)
 
+        # Instance-level RE-GRADE. Some instances can land in error_ids on a TRANSIENT
+        # container-runtime flake (rootless-podman streaming-exec "APIError 500 exec
+        # session state improper", or a docker-socket blip) even though the eval
+        # subprocess as a whole exited 0. Those are NOT model outcomes — the task was
+        # graded against a broken container, not the model's patch. Re-grade ONLY the
+        # error_ids with FRESH containers (each _run_eval uses a fresh run_id), up to
+        # _MAX_REGRADE_ATTEMPTS, and merge recovered ids into their true buckets. Never
+        # fabricates a pass: an id only leaves error on a real resolved/unresolved/
+        # empty verdict from the re-grade. Complements the wholesale-failure catch
+        # above (that handles eval dying entirely; this handles partial errors).
+        if result.get("error_ids"):
+            result = self._regrade_error_ids(
+                request, preds_path, output_dir, run_dir, result, cancel_token
+            )
+
         # Surface the exit-status metrics + an infra-error verdict on the result. When
         # any instance failed on infra it never produced a real attempt, so the
         # resolved count is over an INCOMPLETE set and the accuracy is not reliable —
@@ -329,6 +345,101 @@ class SwebenchRunner:
         # scorer downloads, so the infra metrics/verdict travel with it.
         (run_dir / "swe_bench_results.json").write_bytes(msgspec.json.encode(result))
         return result
+
+    # Instance-level re-grade bound. Each attempt re-grades the STILL-erroring ids
+    # with fresh containers; the transient flake almost always clears within a
+    # couple of tries, so 6 is a generous ceiling that also caps wasted eval passes.
+    _MAX_REGRADE_ATTEMPTS: ClassVar[int] = 6
+    _REGRADE_ID_BUCKETS: ClassVar[tuple[str, ...]] = (
+        "resolved_ids",
+        "unresolved_ids",
+        "empty_patch_ids",
+        "completed_ids",
+        "incomplete_ids",
+    )
+
+    def _regrade_error_ids(
+        self,
+        request: RunRequest,
+        preds_path: Path,
+        output_dir: Path,
+        run_dir: Path,
+        result: dict[str, Any],
+        cancel_token: CancellationToken | None = None,
+    ) -> dict[str, Any]:
+        """Re-grade instances stuck in ``error_ids`` on a transient container-runtime
+        flake, merging any that now grade cleanly back into their true buckets.
+
+        Re-runs the eval harness on ONLY the current ``error_ids`` (fresh run_id ->
+        fresh containers/exec sessions, which clears the flake), up to
+        ``_MAX_REGRADE_ATTEMPTS`` times, stopping early when ``error_ids`` empties or
+        a round makes no progress. Recovery is evidence-based: an id leaves
+        ``error_ids`` only when the re-grade reports it resolved / unresolved / empty
+        — never fabricated. If the re-grade eval itself dies wholesale
+        (``SubprocessFailed``), stop and leave the remaining errors as-is (the
+        downstream infra gate then handles a genuinely broken eval). All counts are
+        recomputed from the id lists so the persisted result stays self-consistent.
+        """
+        for attempt in range(1, self._MAX_REGRADE_ATTEMPTS + 1):
+            err_ids = list(result.get("error_ids") or [])
+            if not err_ids:
+                break
+            try:
+                sub_path = self._run_eval(
+                    request,
+                    preds_path,
+                    output_dir,
+                    run_dir,
+                    cancel_token,
+                    instance_ids=err_ids,
+                    log_name=f"swe_bench_eval_regrade_{attempt}.log",
+                )
+            except SubprocessFailed:
+                # The re-grade eval died as a whole — not recoverable here; leave the
+                # remaining error_ids for the wholesale infra gate to judge.
+                break
+            sub = msgspec.json.decode(sub_path.read_bytes(), type=dict)
+            (run_dir / f"swe_bench_eval_regrade_{attempt}.json").write_bytes(
+                msgspec.json.encode(sub)
+            )
+            recovered = self._merge_regrade(result, sub, err_ids)
+            if not recovered:
+                # No id changed bucket this round — the remaining errors are sticky,
+                # so further attempts would just burn eval passes.
+                break
+        return result
+
+    @staticmethod
+    def _merge_regrade(
+        result: dict[str, Any], sub: dict[str, Any], err_ids: list[str]
+    ) -> int:
+        """Fold a subset re-grade ``sub`` into ``result``: move any of ``err_ids`` the
+        re-grade placed in a real bucket out of ``error_ids``, then recompute counts.
+        Returns how many ids were recovered (left ``error_ids``)."""
+        err_set = set(err_ids)
+        for bucket in SwebenchRunner._REGRADE_ID_BUCKETS:
+            existing = result.setdefault(bucket, [])
+            have = set(existing)
+            for iid in sub.get(bucket) or []:
+                if iid in err_set and iid not in have:
+                    existing.append(iid)
+                    have.add(iid)
+        # An id stays errored only if the re-grade STILL reports it as an error.
+        still_error = set(sub.get("error_ids") or [])
+        result["error_ids"] = [iid for iid in (result.get("error_ids") or []) if iid in still_error]
+        # Recompute every *_instances count from its id list so the result is
+        # internally consistent after the merge.
+        for count_key, id_key in (
+            ("resolved_instances", "resolved_ids"),
+            ("unresolved_instances", "unresolved_ids"),
+            ("empty_patch_instances", "empty_patch_ids"),
+            ("completed_instances", "completed_ids"),
+            ("incomplete_instances", "incomplete_ids"),
+            ("error_instances", "error_ids"),
+        ):
+            if id_key in result:
+                result[count_key] = len(result[id_key])
+        return len(err_ids) - len(result.get("error_ids") or [])
 
     _AGENT_RAN_STATUSES: ClassVar[frozenset[str]] = frozenset(
         {"Submitted", "LimitsExceeded"}
@@ -604,9 +715,20 @@ class SwebenchRunner:
         output_dir: Path,
         run_dir: Path,
         cancel_token: CancellationToken | None = None,
+        *,
+        instance_ids: Sequence[str] | None = None,
+        log_name: str = "swe_bench_eval.log",
     ) -> Path:
+        # A FRESH run_id per call means the harness spins up FRESH eval containers /
+        # exec sessions — which is exactly what clears a transient container-runtime
+        # flake on a re-grade (see _regrade_error_ids). `instance_ids` grades only a
+        # subset (defaults to the full evaluated set).
         run_id = f"endpoints_{uuid.uuid4().hex[:8]}"
-        (run_dir / "swe_bench_eval_run_id.txt").write_text(run_id)
+        ids = list(instance_ids) if instance_ids is not None else list(
+            request.evaluated_instance_ids
+        )
+        if instance_ids is None:
+            (run_dir / "swe_bench_eval_run_id.txt").write_text(run_id)
         dataset_name = {
             "verified": "princeton-nlp/SWE-bench_Verified",
             "lite": "princeton-nlp/SWE-bench_Lite",
@@ -628,11 +750,11 @@ class SwebenchRunner:
             "--run_id",
             run_id,
             "--instance_ids",
-            *request.evaluated_instance_ids,
+            *ids,
         ]
         _run_subprocess(
             cmd,
-            run_dir / "swe_bench_eval.log",
+            run_dir / log_name,
             cwd=output_dir,
             timeout_s=self.subprocess_timeout_s,
             cancel_token=cancel_token,
