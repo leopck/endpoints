@@ -44,6 +44,23 @@ class RunCancelled(RunnerError):
     pass
 
 
+class SubprocessFailed(RunnerError):
+    """A child subprocess exited abnormally (nonzero code, or timed out).
+
+    Carries the structured outcome — ``returncode`` (``None`` on timeout) and a
+    bounded log ``tail`` — so callers can classify the failure from the process
+    STATUS rather than by grepping the log text. Subclasses ``RunnerError`` so
+    existing ``except RunnerError`` handlers are unaffected.
+    """
+
+    def __init__(
+        self, message: str, *, returncode: int | None, tail: str = ""
+    ) -> None:
+        super().__init__(message)
+        self.returncode = returncode
+        self.tail = tail
+
+
 class CancellationToken:
     def __init__(self) -> None:
         self._event = threading.Event()
@@ -158,7 +175,10 @@ def _run_subprocess(
                 if remaining <= 0:
                     _terminate_process(process)
                     process.communicate()
-                    raise RunnerError(f"subprocess timed out after {timeout_s}s: {cmd}")
+                    raise SubprocessFailed(
+                        f"subprocess timed out after {timeout_s}s: {cmd}",
+                        returncode=None,
+                    )
                 try:
                     process.communicate(timeout=min(0.5, remaining))
                     if cancel_token is not None and cancel_token.is_cancelled():
@@ -181,8 +201,10 @@ def _run_subprocess(
                 -_LOG_TAIL_MAX_LINES:
             ]
         )
-        raise RunnerError(
-            f"subprocess exited with code {process.returncode}: {cmd}\n{tail}"
+        raise SubprocessFailed(
+            f"subprocess exited with code {process.returncode}: {cmd}\n{tail}",
+            returncode=process.returncode,
+            tail=tail,
         )
 
 
@@ -236,9 +258,44 @@ class SwebenchRunner:
         # apart from genuine agent outcomes.
         exit_report = self._classify_exit_statuses(output_dir)
 
-        result_path = self._run_eval(
-            request, preds_path, output_dir, run_dir, cancel_token
-        )
+        try:
+            result_path = self._run_eval(
+                request, preds_path, output_dir, run_dir, cancel_token
+            )
+        except SubprocessFailed as exc:
+            # The docker-based eval harness (swebench.harness.run_evaluation) exited
+            # abnormally BEFORE grading any instance — the sibling of an agent-phase
+            # infra error, one phase later. In practice the docker daemon socket
+            # timed out (ReadTimeout) or refused connections (EAGAIN /
+            # BlockingIOError) while saturated by sandbox teardown + eval-image
+            # pulls. The agents all ran (their diffs are in preds.json), but nothing
+            # was graded, so any resolved-rate would be bogus. Classify as infra and
+            # fail+retry — keyed on the subprocess STATUS (returncode/timeout), not
+            # on log text, exactly like the agent-phase exit-status classifier.
+            eval_total = len(request.evaluated_instance_ids)
+            how = "timed out" if exc.returncode is None else f"exited code {exc.returncode}"
+            result = {
+                "exit_status_report": exit_report,
+                "accuracy_complete": False,
+                "infra_error": True,
+                "status": "infra_error",
+                "resolved_instances": 0,
+                "completed_instances": 0,
+                "total_instances": eval_total,
+                "submitted_instances": eval_total,
+                "eval_infra_error": {"returncode": exc.returncode, "detail": exc.tail},
+                "message": (
+                    f"SWE-bench EVAL harness (swebench.harness.run_evaluation) {how} "
+                    f"before grading any of {eval_total} instances — the docker-based "
+                    f"evaluation never ran to completion (daemon contention: socket "
+                    f"ReadTimeout / EAGAIN). The agents produced predictions, but the "
+                    f"eval was never scored, so any accuracy would be bogus. This is "
+                    f"an INFRASTRUCTURE error, not a model result. Please RETRY the "
+                    f"SWE-bench run."
+                ),
+            }
+            (run_dir / "swe_bench_results.json").write_bytes(msgspec.json.encode(result))
+            return result
         result = msgspec.json.decode(result_path.read_bytes(), type=dict)
 
         # Surface the exit-status metrics + an infra-error verdict on the result. When

@@ -24,6 +24,7 @@ from swebench_service.runner import (  # noqa: E402
     CancellationToken,
     RunCancelled,
     RunnerError,
+    SubprocessFailed,
     SwebenchRunner,
 )
 from swebench_service.schemas import RunRequest  # noqa: E402
@@ -255,3 +256,80 @@ def test_run_eval_persists_harness_run_id(monkeypatch, tmp_path):
 
     assert result_path.exists()
     assert (run_dir / "swe_bench_eval_run_id.txt").read_text().startswith("endpoints_")
+
+
+def test_run_subprocess_failure_carries_structured_returncode(tmp_path):
+    log_path = tmp_path / "subprocess.log"
+
+    with pytest.raises(SubprocessFailed) as exc_info:
+        runner_mod._run_subprocess(
+            [sys.executable, "-c", "import sys; print('x'); sys.exit(7)"],
+            log_path,
+            cwd=tmp_path,
+            timeout_s=5,
+        )
+
+    assert exc_info.value.returncode == 7
+    assert isinstance(exc_info.value, RunnerError)  # back-compat: still a RunnerError
+
+
+def test_run_classifies_eval_subprocess_failure_as_infra(monkeypatch, tmp_path):
+    """A wholesale eval-harness (run_evaluation) subprocess failure — the docker
+    daemon socket timing out / refusing under load — is an INFRASTRUCTURE error,
+    not a model result: the agents ran (preds exist) but nothing was graded, so
+    run() must emit an infra_error verdict (fail+retry), not raise or score."""
+    runner = SwebenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
+    request = _request(["http://endpoint:30000"])
+    run_dir = tmp_path / "run"
+
+    def fake_patch_config(self, config_dir, req):
+        cfg = config_dir / "config.yaml"
+        cfg.write_text("model: test-model\n")
+        return cfg
+
+    def fake_run_agent(self, req, config, output_dir, rundir, cancel_token=None):
+        (output_dir / "preds.json").write_text('{"repo__repo-1":"patch"}')
+
+    def fake_run_eval(self, req, preds, output_dir, rundir, cancel_token=None):
+        raise SubprocessFailed(
+            "subprocess exited with code 1: [run_evaluation]\n"
+            "requests.exceptions.ReadTimeout: ... Read timed out. (read timeout=60)",
+            returncode=1,
+            tail="ReadTimeout: read timeout=60",
+        )
+
+    monkeypatch.setattr(SwebenchRunner, "_patch_config", fake_patch_config)
+    monkeypatch.setattr(SwebenchRunner, "_run_agent", fake_run_agent)
+    monkeypatch.setattr(
+        SwebenchRunner, "_validate_prediction_ids", lambda self, req, preds: None
+    )
+    monkeypatch.setattr(
+        SwebenchRunner,
+        "_classify_exit_statuses",
+        classmethod(
+            lambda cls, output_dir: {
+                "submitted": 1,
+                "limits_exceeded": 0,
+                "infra_errors": 0,
+                "infra_by_status": {},
+                "counts_by_status": {"Submitted": 1},
+                "total": 1,
+            }
+        ),
+    )
+    monkeypatch.setattr(SwebenchRunner, "_run_eval", fake_run_eval)
+
+    result = runner.run(request, run_dir)
+
+    assert result["infra_error"] is True
+    assert result["accuracy_complete"] is False
+    assert result["status"] == "infra_error"
+    assert result["resolved_instances"] == 0
+    assert result["total_instances"] == 1
+    assert result["eval_infra_error"]["returncode"] == 1
+    assert "RETRY" in result["message"]
+    # The infra verdict is persisted as the client-facing artifact.
+    persisted = msgspec.json.decode(
+        (run_dir / "swe_bench_results.json").read_bytes(), type=dict
+    )
+    assert persisted["infra_error"] is True
