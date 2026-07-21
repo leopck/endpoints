@@ -469,6 +469,27 @@ def test_regrade_stops_when_no_progress(monkeypatch, tmp_path):
     assert calls["n"] == 1  # one no-progress round -> stop, don't burn all 6
 
 
+def test_classify_context_window_exceeded_is_not_infra(tmp_path):
+    """ContextWindowExceededError = the agent ran and overflowed its own context
+    window (a model/budget outcome), NOT a sandbox-never-started infra error. It
+    must not count toward infra_errors (which would wrongly fail an otherwise-valid
+    run for retry)."""
+    (tmp_path / "exit_statuses_1.yaml").write_text(
+        "instances_by_exit_status:\n"
+        "  Submitted: [a, b, c]\n"
+        "  LimitsExceeded: [d]\n"
+        "  ContextWindowExceededError: [e]\n"
+        "  CalledProcessError: [f]\n"
+    )
+    rep = SwebenchRunner._classify_exit_statuses(tmp_path)
+
+    assert rep["infra_errors"] == 1  # only the CalledProcessError
+    assert "ContextWindowExceededError" not in rep["infra_by_status"]
+    assert rep["infra_by_status"] == {"CalledProcessError": 1}
+    assert rep["submitted"] == 3
+    assert rep["limits_exceeded"] == 1
+
+
 def test_load_skip_ids_env(monkeypatch, tmp_path):
     monkeypatch.delenv("SWE_BENCH_SKIP_IDS_FILE", raising=False)
     monkeypatch.setenv("SWE_BENCH_SKIP_IDS", "a__x-1, b__y-2 ,")

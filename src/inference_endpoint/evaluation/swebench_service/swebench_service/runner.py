@@ -511,16 +511,23 @@ class SwebenchRunner:
         result["submitted_instances"] = original_total
 
     _AGENT_RAN_STATUSES: ClassVar[frozenset[str]] = frozenset(
-        {"Submitted", "LimitsExceeded"}
+        # The agent DID run the task; these are model/budget outcomes, not infra.
+        # `Submitted` = produced a diff; `LimitsExceeded` = hit the step cap;
+        # `ContextWindowExceededError` = the accumulated conversation overflowed the
+        # model's own context window (many turns ran — the sandbox started fine, the
+        # MODEL exhausted its budget). All three are genuine attempts scored as
+        # unresolved, NOT infrastructure failures that warrant a retry.
+        {"Submitted", "LimitsExceeded", "ContextWindowExceededError"}
     )
 
     @classmethod
     def _classify_exit_statuses(cls, output_dir: Path) -> dict[str, Any]:
         """Split mini-swe-agent's exit statuses into real agent attempts vs infra
-        errors. `Submitted` (agent produced a diff) and `LimitsExceeded` (agent ran
-        out of steps) are genuine attempts; every OTHER status (`CalledProcessError`,
-        `TimeoutExpired`, ...) means the per-instance sandbox `docker run` failed and
-        the task never started — an infrastructure error, not a model outcome.
+        errors. `Submitted` (agent produced a diff), `LimitsExceeded` (agent ran out
+        of steps) and `ContextWindowExceededError` (agent overflowed its own context
+        window) are genuine model/budget outcomes; statuses like `CalledProcessError`
+        / `TimeoutExpired` mean the per-instance sandbox `docker run` failed and the
+        task never started — an infrastructure error, not a model outcome.
 
         Robust because it reads the structured `exit_statuses_*.yaml`, not logs.
         """
