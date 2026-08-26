@@ -173,6 +173,17 @@ def run_srun_step(
     return result
 
 
+def enroot_container_name(job_id: str, container_name: str) -> str:
+    """The Enroot container name Pyxis derives from ``--container-name``.
+
+    Pyxis namespaces every named container by the allocation it belongs to, so
+    ``--container-name=X`` inside job ``N`` becomes the Enroot container
+    ``pyxis_N_X``. Anything that later addresses the container by name --
+    ``enroot list``, ``enroot remove`` -- has to use the same form.
+    """
+    return f"pyxis_{job_id}_{container_name}"
+
+
 def resolve_image(image_registry: str, instance_id: str) -> str:
     if Path(instance_id).name != instance_id or instance_id in {".", ".."}:
         raise RunnerError(f"invalid SWE-bench instance ID: {instance_id}")
@@ -307,12 +318,12 @@ class PyxisEnvironment:
                 return
             self._cleaned = True
         try:
-            if os.environ.get("SLURM_JOB_ID", "").strip():
+            job_id = os.environ.get("SLURM_JOB_ID", "").strip()
+            if job_id:
+                container = enroot_container_name(job_id, self.name)
                 try:
-                    subprocess.run(
-                        build_srun_command(
-                            argv=["enroot", "remove", "-f", f"pyxis_{self.name}"]
-                        ),
+                    completed = subprocess.run(
+                        build_srun_command(argv=["enroot", "remove", "-f", container]),
                         check=False,
                         capture_output=True,
                         text=True,
@@ -322,9 +333,19 @@ class PyxisEnvironment:
                 except (OSError, RunnerError, subprocess.SubprocessError):
                     logger.warning(
                         "Could not remove Pyxis container %s",
-                        self.name,
+                        container,
                         exc_info=True,
                     )
+                else:
+                    if completed.returncode != 0:
+                        # Never silent: an unreclaimed rootfs is ~2.5 GB and
+                        # they accumulate for the whole allocation.
+                        logger.warning(
+                            "enroot remove %s exited %s: %s",
+                            container,
+                            completed.returncode,
+                            (completed.stderr or completed.stdout or "").strip()[-500:],
+                        )
         finally:
             self._tmp.cleanup()
 
