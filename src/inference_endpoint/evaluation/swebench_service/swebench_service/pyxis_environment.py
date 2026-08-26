@@ -47,6 +47,12 @@ _SAFE_SRUN_ENV = (
     # the container is ever created. The remaining SLURM_* variables stay out:
     # inheriting SLURM_JOB_ID / SLURM_STEP_ID is what breaks a nested srun.
     "SLURM_CONF",
+    # Enroot reads these when Pyxis creates the container, which happens inside
+    # the step. Dropping them silently discards the operator's override, so the
+    # ~2.5 GB create-time temp lands back on whichever device holds the unpacked
+    # rootfs -- exactly the device the override existed to protect.
+    "ENROOT_TEMP_PATH",
+    "ENROOT_CONFIG_PATH",
 )
 _STEP_STATUS = "/tmp/.mlperf_srun_status"
 _STEP_SCRIPT = r"""set +e
