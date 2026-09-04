@@ -33,12 +33,29 @@ def main() -> None:
     parser.add_argument("--max-concurrent-runs", type=int, default=1)
     parser.add_argument("--subprocess-timeout-s", type=int, default=24 * 60 * 60)
     parser.add_argument("--runtime", choices=("docker", "pyxis"), default="docker")
-    parser.add_argument("--image-registry")
+    image_group = parser.add_mutually_exclusive_group()
+    image_group.add_argument("--image-registry")
+    image_group.add_argument("--image-dir", type=Path)
+    parser.add_argument(
+        "--node-map",
+        type=Path,
+        help="optional file with one 'instance_id node' Pyxis assignment per line",
+    )
     auth_group = parser.add_mutually_exclusive_group()
     auth_group.add_argument("--auth-token")
+    auth_group.add_argument("--auth-token-file", type=Path)
     auth_group.add_argument("--allow-unauthenticated", action="store_true")
     parser.add_argument("--max-stored-runs", type=int, default=100)
     args = parser.parse_args()
+
+    auth_token = args.auth_token
+    if args.auth_token_file is not None:
+        try:
+            auth_token = args.auth_token_file.read_text().strip()
+        except OSError as exc:
+            parser.error(f"could not read --auth-token-file: {exc}")
+        if not auth_token:
+            parser.error("--auth-token-file is empty")
 
     config = ServiceConfig(
         host=args.host,
@@ -46,7 +63,7 @@ def main() -> None:
         artifact_root=Path(args.artifact_root),
         max_concurrent_runs=args.max_concurrent_runs,
         subprocess_timeout_s=args.subprocess_timeout_s,
-        auth_token=args.auth_token,
+        auth_token=auth_token,
         allow_unauthenticated=args.allow_unauthenticated,
         max_stored_runs=args.max_stored_runs,
     )
@@ -55,6 +72,8 @@ def main() -> None:
         project_root=Path(__file__).resolve().parents[1],
         subprocess_timeout_s=config.subprocess_timeout_s,
         image_registry=args.image_registry,
+        image_dir=args.image_dir,
+        node_map=args.node_map,
     )
     web.run_app(create_app(config, runner=runner), host=config.host, port=config.port)
 

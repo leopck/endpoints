@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .artifacts import atomic_write_bytes
-from .pyxis_environment import resolve_image, run_srun_step
+from .pyxis_environment import load_node_map, resolve_image, run_srun_step
 from .runner import EVAL_INFRA_FAILURES_FILE, RunnerError
 
 _PRINT_LOCK = threading.Lock()
@@ -60,12 +60,23 @@ def _run_agent(args: argparse.Namespace) -> None:
 
     failure_path = args.output / _INFRASTRUCTURE_FAILURE
     failure_path.unlink(missing_ok=True)
+    node_map = load_node_map(getattr(args, "node_map", None))
 
     def get_pyxis_environment(config: dict, instance: dict):
         environment_config = copy.deepcopy(config.get("environment", {}))
         environment_config["image"] = resolve_image(
-            args.image_registry, instance["instance_id"]
+            args.image_registry,
+            instance["instance_id"],
+            image_dir=getattr(args, "image_dir", None),
         )
+        instance_id = instance["instance_id"]
+        node = node_map.get(instance_id)
+        if getattr(args, "node_map", None) is not None and node is None:
+            raise RunnerError(
+                f"Pyxis node map has no assignment for requested instance: "
+                f"{instance_id}"
+            )
+        environment_config["node"] = node
         environment_config["infrastructure_failure_path"] = str(failure_path)
         return get_environment(environment_config)
 
@@ -116,6 +127,7 @@ def _evaluate_instance(
     output_dir: Path,
     run_id: str,
     timeout_s: int,
+    node: str | None = None,
 ) -> None:
     instance_id = test_spec.instance_id
     safe_model = prediction["model_name_or_path"].replace("/", "__")
@@ -143,6 +155,7 @@ def _evaluate_instance(
         workdir="/testbed",
         status_path=status_path,
         timeout_s=timeout_s + 30,
+        node=node,
         stderr=subprocess.PIPE,
         argv=[
             "bash",
@@ -194,8 +207,21 @@ def _run_eval(args: argparse.Namespace) -> None:
         if prediction["instance_id"] in args.instance_ids
     }
     rows = load_swebench_dataset(args.dataset_name, args.split, args.instance_ids)
+    node_map = load_node_map(getattr(args, "node_map", None))
+    if getattr(args, "node_map", None) is not None:
+        missing = sorted(set(args.instance_ids) - node_map.keys())
+        if missing:
+            raise RunnerError(
+                "Pyxis node map has no assignment for requested instances: "
+                + ", ".join(missing[:10])
+                + (" ..." if len(missing) > 10 else "")
+            )
     images = {
-        instance_id: resolve_image(args.image_registry, instance_id)
+        instance_id: resolve_image(
+            args.image_registry,
+            instance_id,
+            image_dir=getattr(args, "image_dir", None),
+        )
         for instance_id in args.instance_ids
     }
     payloads = []
@@ -212,6 +238,7 @@ def _run_eval(args: argparse.Namespace) -> None:
                 "output_dir": args.output_dir,
                 "run_id": args.run_id,
                 "timeout_s": args.timeout,
+                "node": node_map.get(instance_id),
             }
         )
 
@@ -232,8 +259,7 @@ def _run_eval(args: argparse.Namespace) -> None:
             except Exception as exc:  # noqa: BLE001 -- one instance, not the run
                 with _PRINT_LOCK:
                     print(
-                        f"Pyxis evaluation failed for {instance_id} "
-                        f"(non-fatal): {exc}",
+                        f"Pyxis evaluation failed for {instance_id} (non-fatal): {exc}",
                         flush=True,
                     )
                 failures[instance_id] = f"{type(exc).__name__}: {exc}"
@@ -275,7 +301,10 @@ def main(argv: list[str] | None = None) -> None:
     agent_parser.add_argument("--filter", required=True)
     agent_parser.add_argument("--workers", type=int, required=True)
     agent_parser.add_argument("--output", type=Path, required=True)
-    agent_parser.add_argument("--image-registry", required=True)
+    agent_images = agent_parser.add_mutually_exclusive_group(required=True)
+    agent_images.add_argument("--image-registry")
+    agent_images.add_argument("--image-dir", type=Path)
+    agent_parser.add_argument("--node-map", type=Path)
 
     eval_parser = commands.add_parser("eval")
     eval_parser.add_argument("--dataset-name", required=True)
@@ -283,7 +312,10 @@ def main(argv: list[str] | None = None) -> None:
     eval_parser.add_argument("--predictions-path", type=Path, required=True)
     eval_parser.add_argument("--max-workers", type=int, required=True)
     eval_parser.add_argument("--run-id", required=True)
-    eval_parser.add_argument("--image-registry", required=True)
+    eval_images = eval_parser.add_mutually_exclusive_group(required=True)
+    eval_images.add_argument("--image-registry")
+    eval_images.add_argument("--image-dir", type=Path)
+    eval_parser.add_argument("--node-map", type=Path)
     eval_parser.add_argument("--output-dir", type=Path, required=True)
     eval_parser.add_argument("--timeout", type=int, default=1800)
     eval_parser.add_argument("--instance-ids", nargs="+", required=True)

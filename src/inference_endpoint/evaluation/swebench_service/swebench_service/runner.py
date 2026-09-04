@@ -258,15 +258,14 @@ class SweBenchRunner:
             return self._run(request, run_dir, cancel_token)
         finally:
             try:
-                cleanup_kwargs: dict[str, Any] = {}
+                cleanup_kwargs: dict[str, Any] = {
+                    "instance_ids": request.evaluated_instance_ids
+                }
                 eval_run_id_path = run_dir / "swe_bench_eval_run_id.txt"
                 if eval_run_id_path.exists():
                     eval_run_id = eval_run_id_path.read_text().strip()
                     if eval_run_id:
-                        cleanup_kwargs = {
-                            "eval_run_id": eval_run_id,
-                            "instance_ids": request.evaluated_instance_ids,
-                        }
+                        cleanup_kwargs["eval_run_id"] = eval_run_id
                 self._cleanup_containers(run_dir.name, **cleanup_kwargs)
             except Exception:
                 logger.warning(
@@ -706,13 +705,63 @@ class PyxisSweBenchRunner(SweBenchRunner):
         *,
         project_root: Path,
         subprocess_timeout_s: int,
-        image_registry: str,
+        image_registry: str | None = None,
+        image_dir: Path | None = None,
+        node_map: Path | None = None,
     ):
         super().__init__(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
         )
         self.image_registry = image_registry
+        self.image_dir = image_dir
+        self.node_map = node_map
+        self._node_map_snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+        self._node_map_snapshot: Path | None = None
+        if node_map is not None:
+            # Snapshot routing once. Dispatch, evaluation, and terminal cleanup
+            # must agree even if an operator later replaces the shared file.
+            from .pyxis_environment import load_node_map
+
+            self._node_assignments = load_node_map(node_map)
+            self._node_map_snapshot_dir = tempfile.TemporaryDirectory(
+                prefix="swebench-node-map-"
+            )
+            self._node_map_snapshot = (
+                Path(self._node_map_snapshot_dir.name) / "node-map.txt"
+            )
+            self._node_map_snapshot.write_text(
+                "".join(
+                    f"{instance_id}\t{node}\n"
+                    for instance_id, node in self._node_assignments.items()
+                )
+            )
+            self._node_map_snapshot.chmod(0o600)
+        else:
+            self._node_assignments = {}
+
+    def _image_source_args(self) -> list[str]:
+        if self.image_dir is not None:
+            args = ["--image-dir", str(self.image_dir)]
+        elif self.image_registry is not None:
+            args = ["--image-registry", self.image_registry]
+        else:  # guarded by create_runner; defensive for direct construction
+            raise RunnerError("Pyxis runtime requires an image registry or directory")
+        if self._node_map_snapshot is not None:
+            args.extend(["--node-map", str(self._node_map_snapshot)])
+        return args
+
+    def _validate_node_assignments(self, instance_ids: list[str]) -> None:
+        if self.node_map is None:
+            return
+        missing = sorted(set(instance_ids) - self._node_assignments.keys())
+        if missing:
+            preview = ", ".join(missing[:10])
+            suffix = " ..." if len(missing) > 10 else ""
+            raise RunnerError(
+                "Pyxis node map has no assignment for requested instances: "
+                f"{preview}{suffix}"
+            )
 
     def _configure_environment(
         self, environment_cfg: dict[str, Any], run_id: str
@@ -739,6 +788,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
         secret_values: set[str],
         cancel_token: CancellationToken | None = None,
     ) -> None:
+        self._validate_node_assignments(request.evaluated_instance_ids)
         command = [
             sys.executable,
             "-m",
@@ -758,8 +808,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
             str(request.workers),
             "--output",
             str(output_dir),
-            "--image-registry",
-            self.image_registry,
+            *self._image_source_args(),
         ]
         self._run_logged_subprocess(
             command,
@@ -780,6 +829,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
         secret_values: set[str],
         cancel_token: CancellationToken | None = None,
     ) -> Path:
+        self._validate_node_assignments(request.evaluated_instance_ids)
         run_id, dataset_name = _prepare_eval(request, run_dir)
         command = [
             sys.executable,
@@ -796,8 +846,7 @@ class PyxisSweBenchRunner(SweBenchRunner):
             str(request.max_eval_workers),
             "--run-id",
             run_id,
-            "--image-registry",
-            self.image_registry,
+            *self._image_source_args(),
             "--output-dir",
             str(output_dir),
             "--instance-ids",
@@ -824,36 +873,74 @@ class PyxisSweBenchRunner(SweBenchRunner):
         instance_ids: list[str] | None = None,
     ) -> None:
         # Local import avoids the runner <-> Pyxis environment import cycle.
-        from .pyxis_environment import build_srun_command, safe_srun_env
+        from .pyxis_environment import (
+            build_srun_command,
+            safe_srun_env,
+            srun_step_admission,
+        )
 
-        del eval_run_id, instance_ids
+        del eval_run_id
         safe_run_id = re.sub(r"[^A-Za-z0-9_.-]", "-", run_id)[:24]
-        prefix = f"pyxis_mswe_{safe_run_id}_"
-        try:
-            listed = subprocess.run(
-                build_srun_command(argv=["enroot", "list", "-f"]),
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                env=safe_srun_env(),
+        suffix_prefix = f"mswe_{safe_run_id}_"
+        nodes: list[str | None] = []
+        if instance_ids and self._node_assignments:
+            nodes.extend(
+                sorted(
+                    {
+                        self._node_assignments[instance_id]
+                        for instance_id in instance_ids
+                        if instance_id in self._node_assignments
+                    }
+                )
             )
-            for line in listed.stdout.splitlines():
-                fields = line.split(maxsplit=1)
-                name = fields[0] if fields else ""
-                if name.startswith(prefix):
-                    subprocess.run(
-                        build_srun_command(argv=["enroot", "remove", "-f", name]),
+        else:
+            nodes.extend(sorted(set(self._node_assignments.values())))
+        if not nodes:
+            nodes.append(None)
+        failures: list[str] = []
+        for node in nodes:
+            try:
+                with srun_step_admission():
+                    listed = subprocess.run(
+                        build_srun_command(argv=["enroot", "list", "-f"], node=node),
                         check=True,
                         capture_output=True,
                         text=True,
                         timeout=30,
                         env=safe_srun_env(),
                     )
-        except (OSError, subprocess.SubprocessError) as exc:
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"{node or '<local>'}: list failed: {exc}")
+                continue
+            for line in listed.stdout.splitlines():
+                fields = line.split(maxsplit=1)
+                name = fields[0] if fields else ""
+                # Depending on Pyxis/Enroot versions, list output can be
+                # either pyxis_mswe_* or pyxis_<jobid>_mswe_*.
+                if not name.startswith("pyxis_") or suffix_prefix not in name:
+                    continue
+                suffix = name.split(suffix_prefix, 1)[1]
+                if not suffix or "_" in suffix:
+                    continue
+                try:
+                    with srun_step_admission():
+                        subprocess.run(
+                            build_srun_command(
+                                argv=["enroot", "remove", "-f", name], node=node
+                            ),
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                            env=safe_srun_env(),
+                        )
+                except (OSError, subprocess.SubprocessError) as exc:
+                    failures.append(f"{node or '<local>'}: remove {name} failed: {exc}")
+        if failures:
             raise RunnerError(
-                f"failed to clean up Pyxis containers for SWE-bench run {run_id}"
-            ) from exc
+                f"failed to clean up Pyxis containers for SWE-bench run {run_id}: "
+                + "; ".join(failures[:20])
+            )
 
 
 def create_runner(
@@ -862,6 +949,8 @@ def create_runner(
     project_root: Path,
     subprocess_timeout_s: int,
     image_registry: str | None,
+    image_dir: Path | None = None,
+    node_map: Path | None = None,
 ) -> RunnerProtocol:
     if runtime == "docker":
         return SweBenchRunner(
@@ -869,11 +958,15 @@ def create_runner(
             subprocess_timeout_s=subprocess_timeout_s,
         )
     if runtime == "pyxis":
-        if image_registry is None:
-            raise ValueError("Pyxis runtime requires an image registry")
+        if (image_registry is None) == (image_dir is None):
+            raise ValueError(
+                "Pyxis runtime requires exactly one of image_registry or image_dir"
+            )
         return PyxisSweBenchRunner(
             project_root=project_root,
             subprocess_timeout_s=subprocess_timeout_s,
             image_registry=image_registry,
+            image_dir=image_dir,
+            node_map=node_map,
         )
     raise ValueError(f"unknown SWE-bench runtime: {runtime}")

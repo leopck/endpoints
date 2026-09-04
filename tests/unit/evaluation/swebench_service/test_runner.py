@@ -3,6 +3,7 @@
 
 import json
 import logging
+import os
 import stat
 import subprocess
 import sys
@@ -20,16 +21,26 @@ from inference_endpoint.evaluation.swebench_service.swebench_service import (
     artifacts as artifacts_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
+    pyxis_environment as pyxis_environment_mod,
+)
+from inference_endpoint.evaluation.swebench_service.swebench_service import (
     pyxis_worker as worker_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service import (
     runner as runner_mod,
 )
 from inference_endpoint.evaluation.swebench_service.swebench_service.pyxis_environment import (
+    _PERSISTENT_SERVER_SCRIPT,
     PyxisEnvironment,
     StepNotLaunched,
+    _PersistentExecChannel,
+    _read_sized_file,
+    _run_srun_step_once,
+    _StepPacer,
     build_srun_command,
     enroot_container_name,
+    load_node_map,
+    read_step_retry_log,
     read_step_sentinel,
     resolve_image,
     safe_srun_env,
@@ -457,13 +468,19 @@ def _stub_successful_run(monkeypatch, runner: SweBenchRunner) -> None:
 def test_run_cleans_labeled_containers_after_success(monkeypatch, tmp_path):
     runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
     _stub_successful_run(monkeypatch, runner)
-    cleaned: list[str] = []
-    monkeypatch.setattr(runner, "_cleanup_containers", cleaned.append)
+    cleaned: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_containers",
+        lambda run_id, **kwargs: cleaned.append((run_id, kwargs)),
+    )
 
     result = runner.run(_request(["http://endpoint:30000"]), tmp_path / "run-1")
 
     assert result == {"resolved_instances": 1, "submitted_instances": 1}
-    assert cleaned == ["run-1"]
+    assert cleaned == [
+        ("run-1", {"instance_ids": ["repo__repo-1"]}),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -481,20 +498,26 @@ def test_run_cleans_labeled_containers_after_failure(
     monkeypatch, tmp_path, error, raised, match
 ):
     runner = SweBenchRunner(project_root=tmp_path, subprocess_timeout_s=30)
-    cleaned: list[str] = []
+    cleaned: list[tuple[str, dict]] = []
 
     def fail_agent(*args, **kwargs):
         raise error
 
     monkeypatch.setattr(runner, "_run_agent", fail_agent)
-    monkeypatch.setattr(runner, "_cleanup_containers", cleaned.append)
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_containers",
+        lambda run_id, **kwargs: cleaned.append((run_id, kwargs)),
+    )
 
     with pytest.raises(raised, match=match) as exc_info:
         runner.run(_request(["http://endpoint:30000"]), tmp_path / "run-2")
 
     if raised is not RunCancelled:
         assert exc_info.value.__cause__ is error
-    assert cleaned == ["run-2"]
+    assert cleaned == [
+        ("run-2", {"instance_ids": ["repo__repo-1"]}),
+    ]
 
 
 def test_run_scores_predictions_left_behind_by_a_failed_agent_phase(
@@ -780,7 +803,420 @@ def _pyxis_request(instance_ids: list[str] | None = None) -> RunRequest:
 _PYXIS_IMAGE_REGISTRY = "gitlab-master.nvidia.com:5005/hvagadia/swebench-arm64-images"
 
 
-def _finish_srun_step(command: list[str], returncode: int) -> None:
+def _local_persistent_channel(
+    monkeypatch,
+    tmp_path,
+    *,
+    server_scripts=None,
+    driver_grace_s=1.0,
+    shutdown_grace_s=0.1,
+    capture_stderr_separately=True,
+    failure_path=None,
+):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    unshare = bin_dir / "unshare"
+    unshare.write_text('#!/bin/sh\nshift 3\nexec "$@"\n')
+    unshare.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    protocol_dir = tmp_path / "protocol"
+    scripts = list(server_scripts or [_PERSISTENT_SERVER_SCRIPT])
+
+    def command_factory(generation, secret):
+        script = scripts.pop(0) if len(scripts) > 1 else scripts[0]
+        return [
+            "bash",
+            "-c",
+            script,
+            "persistent-test-server",
+            str(protocol_dir),
+            generation,
+            secret,
+            "bash",
+            "-c",
+        ]
+
+    channel = _PersistentExecChannel(
+        protocol_dir=protocol_dir,
+        command_factory=command_factory,
+        launch_timeout_s=1.0,
+        driver_grace_s=driver_grace_s,
+        shutdown_grace_s=shutdown_grace_s,
+        capture_stderr_separately=capture_stderr_separately,
+        failure_path=failure_path,
+    )
+    channel.start()
+    return channel
+
+
+def test_persistent_channel_handles_multiline_large_output_and_nonce_isolation(
+    monkeypatch, tmp_path
+):
+    channel = _local_persistent_channel(monkeypatch, tmp_path)
+    try:
+        first = channel.execute(
+            command="printf 'first\\nsecond\\n'; printf 'diagnostic\\n' >&2",
+            cwd=str(tmp_path),
+            timeout_s=5,
+        )
+        second = channel.execute(
+            command="head -c 262144 /dev/zero | tr '\\0' x",
+            cwd=str(tmp_path),
+            timeout_s=5,
+        )
+    finally:
+        channel.close()
+
+    assert first.stdout == "first\nsecond\n"
+    assert first.stderr == "diagnostic\n"
+    assert second.stdout == "x" * 262144
+    assert second.stderr == ""
+    assert list((tmp_path / "protocol" / "requests").iterdir()) == []
+    assert channel.stats["server_starts"] == 1
+    assert channel.stats["commands"] == 2
+
+
+def test_persistent_channel_preserves_merged_stream_order(monkeypatch, tmp_path):
+    channel = _local_persistent_channel(
+        monkeypatch, tmp_path, capture_stderr_separately=False
+    )
+    try:
+        result = channel.execute(
+            command="printf 'one\\n'; printf 'two\\n' >&2; printf 'three\\n'",
+            cwd=str(tmp_path),
+            timeout_s=5,
+        )
+    finally:
+        channel.close()
+
+    assert result.stdout == "one\ntwo\nthree\n"
+    assert result.stderr == ""
+
+
+def test_persistent_completion_rejects_a_forged_manifest(monkeypatch, tmp_path):
+    channel = _local_persistent_channel(monkeypatch, tmp_path)
+    request = channel.protocol_dir / "requests" / ("a" * 32)
+    request.mkdir()
+    (request / "stdout").write_text("forged")
+    (request / "stderr").write_text("")
+    (request / "complete").write_text("0 6 0 0 " + "0" * 64 + "\n")
+    try:
+        with pytest.raises(RunnerError, match="digest did not verify"):
+            channel._read_completion(request, time.monotonic() + 1)
+    finally:
+        channel.close()
+
+
+def test_persistent_kill_after_is_reported_as_timeout(monkeypatch, tmp_path):
+    channel = _local_persistent_channel(monkeypatch, tmp_path)
+    timeout = tmp_path / "bin" / "timeout"
+    timeout.write_text("#!/bin/sh\nexit 137\n")
+    timeout.chmod(0o755)
+    try:
+        result = channel.execute(command="true", cwd=str(tmp_path), timeout_s=1)
+    finally:
+        channel.close()
+
+    assert result.returncode == 137
+    assert result.timed_out is True
+
+
+def test_persistent_response_reader_retries_a_partial_filesystem_view(tmp_path):
+    responses = iter([b"partial", b"complete-response"])
+
+    result = _read_sized_file(
+        tmp_path / "stdout",
+        len(b"complete-response"),
+        deadline=1.0,
+        read_bytes=lambda _path: next(responses),
+        monotonic=lambda: 0.0,
+        sleep=lambda _seconds: None,
+    )
+
+    assert result == b"complete-response"
+
+
+def test_persistent_server_death_does_not_restart_a_pending_request(
+    monkeypatch, tmp_path
+):
+    dies_pending = r"""root=$1
+generation=$2
+mkdir -p "$root/requests"
+printf '%s\n' "$generation" > "$root/ready.tmp"
+mv "$root/ready.tmp" "$root/ready"
+sleep 0.1
+exit 17
+"""
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "3")
+    channel = _local_persistent_channel(
+        monkeypatch, tmp_path, server_scripts=[dies_pending]
+    )
+    try:
+        with pytest.raises(StepNotLaunched) as exc_info:
+            channel.execute(
+                command="printf must-not-replay",
+                cwd=str(tmp_path),
+                timeout_s=5,
+            )
+    finally:
+        channel.close()
+
+    assert exc_info.value.status == "pending"
+    assert exc_info.value.provable_non_execution is False
+    assert channel.stats["server_starts"] == 1
+    assert channel.stats["safe_restarts"] == 0
+
+
+def test_idle_persistent_server_death_records_infrastructure_failure(
+    monkeypatch, tmp_path
+):
+    failure_path = tmp_path / "infra-failure"
+    channel = _local_persistent_channel(
+        monkeypatch, tmp_path, failure_path=failure_path
+    )
+    assert channel._process is not None
+    channel._process.terminate()
+    channel._process.wait(timeout=2)
+    try:
+        with pytest.raises(RunnerError, match="server is not running"):
+            channel.execute(command="true", cwd=str(tmp_path), timeout_s=1)
+    finally:
+        channel.close()
+
+    assert channel.stats["command_failures"] == 1
+    assert failure_path.exists()
+
+
+def test_persistent_server_death_never_replays_a_started_request(monkeypatch, tmp_path):
+    dies_started = r"""root=$1
+generation=$2
+mkdir -p "$root/requests"
+printf '%s\n' "$generation" > "$root/ready.tmp"
+mv "$root/ready.tmp" "$root/ready"
+while :; do
+    for request in "$root"/requests/*; do
+        [ -d "$request" ] || continue
+        printf 'started\n' > "$request/status.tmp"
+        mv "$request/status.tmp" "$request/status"
+        exit 19
+    done
+    sleep 0.01
+done
+"""
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "3")
+    channel = _local_persistent_channel(
+        monkeypatch, tmp_path, server_scripts=[dies_started]
+    )
+    try:
+        with pytest.raises(StepNotLaunched) as exc_info:
+            channel.execute(
+                command="printf must-not-replay",
+                cwd=str(tmp_path),
+                timeout_s=5,
+            )
+    finally:
+        channel.close()
+
+    assert exc_info.value.status == "started"
+    assert exc_info.value.provable_non_execution is False
+    assert channel.stats["server_starts"] == 1
+    assert channel.stats["safe_restarts"] == 0
+
+
+def test_persistent_channel_enforces_server_side_timeout(monkeypatch, tmp_path):
+    channel = _local_persistent_channel(monkeypatch, tmp_path)
+    try:
+        result = channel.execute(
+            command="sleep 2",
+            cwd=str(tmp_path),
+            timeout_s=1,
+        )
+    finally:
+        channel.close()
+
+    assert result.returncode == 124
+    assert channel.stats["nonzero_commands"] == 1
+
+
+def test_persistent_channel_has_a_nonreplayable_driver_deadline(monkeypatch, tmp_path):
+    ignores_requests = r"""root=$1
+generation=$2
+mkdir -p "$root/requests"
+printf '%s\n' "$generation" > "$root/ready.tmp"
+mv "$root/ready.tmp" "$root/ready"
+while [ ! -f "$root/stop" ]; do sleep 0.01; done
+"""
+    channel = _local_persistent_channel(
+        monkeypatch,
+        tmp_path,
+        server_scripts=[ignores_requests],
+        driver_grace_s=0.05,
+    )
+    try:
+        with pytest.raises(StepNotLaunched, match="driver deadline") as exc_info:
+            channel.execute(command="true", cwd=str(tmp_path), timeout_s=0)
+    finally:
+        channel.close()
+
+    assert exc_info.value.status == "pending"
+    assert exc_info.value.provable_non_execution is False
+
+
+def test_persistent_cleanup_kills_and_reaps_an_unresponsive_server(
+    monkeypatch, tmp_path
+):
+    ignores_cleanup = r"""root=$1
+generation=$2
+mkdir -p "$root/requests"
+printf '%s\n' "$generation" > "$root/ready.tmp"
+mv "$root/ready.tmp" "$root/ready"
+trap '' TERM
+while :; do :; done
+"""
+    channel = _local_persistent_channel(
+        monkeypatch,
+        tmp_path,
+        server_scripts=[ignores_cleanup],
+        shutdown_grace_s=0.05,
+    )
+    process = channel._process
+
+    channel.close()
+
+    assert process is not None
+    assert process.poll() is not None
+    assert channel._process is None
+
+
+def test_pyxis_persistent_exec_remains_opt_in(monkeypatch, tmp_path):
+    monkeypatch.delenv("SWEBENCH_PYXIS_PERSISTENT_EXEC", raising=False)
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setattr(
+        subprocess,
+        "Popen",
+        lambda *args, **kwargs: pytest.fail("persistent server must stay disabled"),
+    )
+
+    def fake_run(command, **kwargs):
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    environment = PyxisEnvironment(image=tmp_path / "task.sqsh", run_id="opt-out")
+    try:
+        output = environment.execute({"command": "true"})
+    finally:
+        environment.cleanup()
+
+    assert output["returncode"] == 0
+    assert environment._persistent_stats()["enabled"] is False
+    assert environment._persistent_stats()["direct_command_steps"] == 1
+
+
+def test_persistent_environment_commands_create_no_scheduler_steps(
+    monkeypatch, tmp_path
+):
+    class FakeChannel:
+        stats = {
+            "server_starts": 1,
+            "commands": 0,
+            "command_failures": 0,
+        }
+
+        def execute(self, *, command, cwd, timeout_s):
+            self.stats["commands"] += 1
+            return subprocess.CompletedProcess(
+                [command], 0, stdout="stdout\nstderr\n", stderr=""
+            )
+
+    environment = _bare_environment(tmp_path)
+    environment._persistent_enabled = True
+    environment._persistent_channel = FakeChannel()
+    environment._scheduler_steps = 1
+    environment._direct_command_steps = 0
+    environment._cleanup_steps = 0
+    monkeypatch.setattr(
+        pyxis_environment_mod,
+        "run_srun_step",
+        lambda **kwargs: pytest.fail("persistent execute must not create an srun step"),
+    )
+
+    output = environment.execute({"command": "printf output"})
+    stats = environment._persistent_stats()
+
+    assert output["output"] == "stdout\nstderr\n"
+    assert output["extra"]["stderr"] == ""
+    assert stats["scheduler_steps"] == 2
+    assert stats["persistent_commands"] == 1
+    assert stats["scheduler_steps_per_persistent_command"] == 2.0
+
+
+def test_pyxis_persistent_exec_env_starts_one_server_and_reuses_it(
+    monkeypatch, tmp_path
+):
+    channels = []
+
+    class FakeChannel:
+        def __init__(self, **kwargs):
+            self.stats = {
+                "server_starts": 0,
+                "commands": 0,
+                "command_failures": 0,
+            }
+            channels.append(self)
+
+        def start(self):
+            self.stats["server_starts"] += 1
+
+        def execute(self, *, command, cwd, timeout_s):
+            self.stats["commands"] += 1
+            return subprocess.CompletedProcess(
+                [command], 0, stdout=f"{command}\n", stderr=""
+            )
+
+        def close(self):
+            return None
+
+    scheduler_calls = []
+
+    def fake_srun_step(**kwargs):
+        scheduler_calls.append(kwargs)
+        return subprocess.CompletedProcess(["srun"], 0, stdout="", stderr="")
+
+    cleanup_calls = []
+
+    def fake_subprocess_run(command, **kwargs):
+        cleanup_calls.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setenv("SWEBENCH_PYXIS_PERSISTENT_EXEC", "true")
+    monkeypatch.setattr(pyxis_environment_mod, "_PersistentExecChannel", FakeChannel)
+    monkeypatch.setattr(pyxis_environment_mod, "run_srun_step", fake_srun_step)
+    monkeypatch.setattr(subprocess, "run", fake_subprocess_run)
+
+    environment = PyxisEnvironment(image=tmp_path / "task.sqsh", run_id="reuse")
+    try:
+        first = environment.execute({"command": "first"})
+        second = environment.execute({"command": "second"})
+    finally:
+        environment.cleanup()
+
+    assert first["output"] == "first\n"
+    assert second["output"] == "second\n"
+    assert len(channels) == 1
+    assert len(scheduler_calls) == 1
+    assert scheduler_calls[0]["argv"] == ["true"]
+    assert len(cleanup_calls) == 1
+    assert environment._persistent_stats()["scheduler_steps"] == 3
+    assert environment._persistent_stats()["persistent_commands"] == 2
+
+
+def _finish_srun_step(
+    command: list[str], returncode: int, *, timed_out: bool = False
+) -> None:
     mount_argument = next(
         (
             argument
@@ -794,10 +1230,12 @@ def _finish_srun_step(command: list[str], returncode: int) -> None:
     for mount in mount_argument.removeprefix("--container-mounts=").split(","):
         source, destination = mount.split(":", 1)
         if destination == "/tmp/.mlperf_srun_status":
-            Path(source).write_text(f"finished:{returncode}\n")
+            Path(source).write_text(f"finished:{returncode}:{int(timed_out)}\n")
             return
         if destination == "/tmp":
-            Path(source, ".mlperf_srun_status").write_text(f"finished:{returncode}\n")
+            Path(source, ".mlperf_srun_status").write_text(
+                f"finished:{returncode}:{int(timed_out)}\n"
+            )
             return
     raise AssertionError("srun command does not mount its status file")
 
@@ -853,7 +1291,7 @@ def test_create_runner_runtime_is_typed():
 
 
 def test_create_runner_requires_image_registry_for_pyxis(tmp_path):
-    with pytest.raises(ValueError, match="image registry"):
+    with pytest.raises(ValueError, match="image_registry or image_dir"):
         create_runner(
             "pyxis",
             project_root=tmp_path,
@@ -871,6 +1309,22 @@ def test_create_runner_selects_pyxis(tmp_path):
     )
 
     assert isinstance(runner, PyxisSweBenchRunner)
+
+
+def test_create_runner_accepts_local_pyxis_images(tmp_path):
+    (tmp_path / "nodes.txt").write_text("repo__repo-1 cpu-0001\n")
+    runner = create_runner(
+        "pyxis",
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_registry=None,
+        image_dir=tmp_path / "images",
+        node_map=tmp_path / "nodes.txt",
+    )
+
+    assert isinstance(runner, PyxisSweBenchRunner)
+    assert runner.image_dir == tmp_path / "images"
+    assert runner.node_map == tmp_path / "nodes.txt"
 
 
 def test_pyxis_patch_config_selects_pyxis_environment(tmp_path):
@@ -907,6 +1361,40 @@ def test_pyxis_normalizes_instance_id_for_registry_image():
     assert resolve_image(_PYXIS_IMAGE_REGISTRY, "Repo__Repo-1").endswith(
         "/sweb.eval.arm64.repo__repo-1:v4.1.0-arm64"
     )
+
+
+def test_pyxis_resolves_staged_local_image(tmp_path):
+    assert resolve_image(None, "Repo__Repo-1", image_dir=tmp_path) == (
+        tmp_path / "Repo__Repo-1.sqsh"
+    )
+
+
+def test_pyxis_loads_multi_node_assignment(tmp_path):
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text(
+        "# staged image locations\nrepo__repo-1 cpu-0001\nrepo__repo-2 cpu-0002\n"
+    )
+
+    assert load_node_map(node_map) == {
+        "repo__repo-1": "cpu-0001",
+        "repo__repo-2": "cpu-0002",
+    }
+
+
+def test_pyxis_rejects_conflicting_multi_node_assignment(tmp_path):
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__repo-1 cpu-0001\nrepo__repo-1 cpu-0002\n")
+
+    with pytest.raises(RunnerError, match="conflicting Pyxis node assignments"):
+        load_node_map(node_map)
+
+
+def test_pyxis_rejects_invalid_node_name(tmp_path):
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__repo-1 --cpu-0001\n")
+
+    with pytest.raises(RunnerError, match="invalid Pyxis node name"):
+        load_node_map(node_map)
 
 
 def test_pyxis_image_registry_requires_repository():
@@ -1000,6 +1488,70 @@ def test_pyxis_builds_host_srun_command(monkeypatch):
     ]
 
 
+def test_pyxis_builds_srun_command_for_explicit_remote_node(monkeypatch):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+
+    command = build_srun_command(argv=["true"], node="cpu-worker-02")
+
+    assert "--nodelist=cpu-worker-02" in command
+    assert "--nodelist=cpu-driver" not in command
+
+
+def test_pyxis_outer_timeout_includes_configured_step_launch_grace(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_LAUNCH_GRACE_S", "900")
+    seen = []
+
+    def fake_run(command, **kwargs):
+        seen.append(kwargs["timeout"])
+        (tmp_path / ".mlperf_srun_status").write_text("finished:0:0\n")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _run_srun_step_once(
+        argv=["true"],
+        status_path=tmp_path / ".mlperf_srun_status",
+        timeout_s=300,
+    )
+
+    assert seen == [1230.0]
+
+
+@pytest.mark.parametrize(
+    ("isolate_pid_namespace", "expects_unshare"),
+    [(True, True), (False, False)],
+)
+def test_pyxis_step_can_preserve_host_pid_namespace(
+    monkeypatch, tmp_path, isolate_pid_namespace, expects_unshare
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    commands = []
+
+    def fake_run(command, **kwargs):
+        commands.append(command)
+        (tmp_path / ".mlperf_srun_status").write_text("finished:0:0\n")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    _run_srun_step_once(
+        argv=["enroot", "list", "-f"],
+        status_path=tmp_path / ".mlperf_srun_status",
+        timeout_s=60,
+        isolate_pid_namespace=isolate_pid_namespace,
+    )
+
+    script = commands[0][commands[0].index("pyxis-step") - 1]
+    assert ("unshare --pid --fork --mount-proc" in script) is expects_unshare
+    assert 'timeout --verbose -k 5 "$timeout_s"' in script
+
+
 def test_pyxis_srun_environment_does_not_forward_credentials(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "model-secret")
     monkeypatch.setenv("SWEBENCH_SERVICE_AUTH_TOKEN", "service-secret")
@@ -1010,6 +1562,18 @@ def test_pyxis_srun_environment_does_not_forward_credentials(monkeypatch):
     assert "OPENAI_API_KEY" not in environment
     assert "SWEBENCH_SERVICE_AUTH_TOKEN" not in environment
     assert "HF_TOKEN" not in environment
+
+
+def test_pyxis_srun_uses_node_local_tmpdir_without_moving_the_host_mount(
+    monkeypatch, tmp_path
+):
+    shared_tmp = tmp_path / "shared-driver-tmp"
+    monkeypatch.setenv("TMPDIR", str(shared_tmp))
+
+    environment = safe_srun_env()
+
+    assert environment["TMPDIR"] == "/tmp"
+    assert os.environ["TMPDIR"] == str(shared_tmp)
 
 
 @pytest.mark.parametrize(
@@ -1137,10 +1701,53 @@ def test_pyxis_environment_mounts_persistent_tmp_on_every_step(monkeypatch, tmp_
     assert destination == "/tmp"
     persistent_tmp = Path(source)
     assert persistent_tmp.is_dir()
-    assert stat.S_IMODE(persistent_tmp.stat().st_mode) == 0o1777
+    assert stat.S_IMODE(persistent_tmp.stat().st_mode) == 0o700
 
     environment.cleanup()
 
+    assert not persistent_tmp.exists()
+
+
+def test_pyxis_environment_cleanup_after_nonretryable_outer_timeout(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            _finish_srun_step(command, 0)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+        if len(calls) == 2:
+            mount = next(
+                argument.removeprefix("--container-mounts=")
+                for argument in command
+                if argument.startswith("--container-mounts=")
+            )
+            source = next(
+                source
+                for source, destination in (
+                    item.split(":", 1) for item in mount.split(",")
+                )
+                if destination == "/tmp"
+            )
+            Path(source, ".mlperf_srun_status").write_text("started\n")
+            raise subprocess.TimeoutExpired(
+                command, kwargs["timeout"], output="partial\n"
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    environment = PyxisEnvironment(image=tmp_path / "task.sqsh", run_id="run-1")
+    persistent_tmp = environment._tmp_dir
+
+    with pytest.raises(StepNotLaunched):
+        environment.execute({"command": "pytest -q"})
+    environment.cleanup()
+
+    assert calls[-1][-4:-1] == ["enroot", "remove", "-f"]
     assert not persistent_tmp.exists()
 
 
@@ -1205,6 +1812,31 @@ def test_pyxis_environment_decodes_timeout_output(monkeypatch, tmp_path):
     environment.cleanup()
 
 
+@pytest.mark.parametrize(("timed_out", "expected"), [(True, -1), (False, 137)])
+def test_pyxis_environment_distinguishes_kill_after_from_voluntary_137(
+    monkeypatch, tmp_path, timed_out, expected
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        returncode = 137 if calls == 2 else 0
+        _finish_srun_step(command, returncode, timed_out=timed_out and calls == 2)
+        return subprocess.CompletedProcess(command, returncode, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    environment = PyxisEnvironment(image=tmp_path / "task.sqsh", run_id="run-1")
+    try:
+        output = environment.execute({"command": "kill -KILL $$"})
+    finally:
+        environment.cleanup()
+
+    assert output["returncode"] == expected
+
+
 def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tmp_path):
     failure_path = tmp_path / ".pyxis_infrastructure_failure"
     environment = object.__new__(PyxisEnvironment)
@@ -1214,6 +1846,7 @@ def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tm
         timeout_s=30,
         interpreter=["bash", "-c"],
         infrastructure_failure_path=failure_path,
+        node=None,
     )
     environment.name = "mswe_run-1_abcd1234"
     environment._tmp_dir = tmp_path
@@ -1228,7 +1861,7 @@ def test_pyxis_environment_raises_when_srun_never_starts_command(monkeypatch, tm
         ),
     )
 
-    with pytest.raises(RunnerError, match=r"exceeded its 60s deadline"):
+    with pytest.raises(RunnerError, match=r"exceeded its 60\.0s outer deadline"):
         environment.execute({"command": "pytest -q"})
 
     assert failure_path.exists()
@@ -1400,6 +2033,179 @@ def test_pyxis_failure_carries_srun_output(monkeypatch, tmp_path):
     assert "failed to start Pyxis container" in str(exc_info.value)
 
 
+def test_pyxis_failure_carries_separately_captured_scheduler_stderr(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "gb-nvl-053-compute04")
+    scheduler_error = (
+        "srun: RPC rate limited 16 time(s). Sleeping then trying again.\n"
+        "srun: error: Task launch failed: Job credential expired\n"
+    )
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 167, stdout="", stderr=scheduler_error
+        ),
+    )
+
+    with pytest.raises(StepNotLaunched) as exc_info:
+        _run_srun_step_once(
+            argv=["true"],
+            status_path=tmp_path / ".mlperf_srun_status",
+            timeout_s=30,
+            stderr=subprocess.PIPE,
+        )
+
+    failure = exc_info.value
+    assert failure.provable_non_execution is True
+    assert failure.srun_rc == 167
+    assert "RPC rate limited" in str(failure)
+    assert "Job credential expired" in str(failure)
+
+
+def test_outer_timeout_with_pending_status_is_retryable_and_keeps_output(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "2")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(
+                command,
+                kwargs["timeout"],
+                output=b"srun: RPC rate limited\n",
+                stderr=b"srun: Job credential expired\n",
+            )
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="recovered\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    output = _bare_environment(tmp_path).execute({"command": "pytest -q"})
+
+    assert output["output"] == "recovered\n"
+    assert len(calls) == 2
+
+
+def test_recovered_outer_timeout_does_not_leave_failure_marker(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "2")
+    failure_path = tmp_path / ".pyxis_infrastructure_failure"
+    calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        _finish_srun_step(command, 0)
+        return subprocess.CompletedProcess(command, 0, stdout="recovered\n", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _seconds: None)
+
+    output = _bare_environment(tmp_path, failure_path).execute({"command": "pytest -q"})
+
+    assert output["returncode"] == 0
+    assert not failure_path.exists()
+
+
+def test_step_retry_log_reader_preserves_recovered_infrastructure_events(tmp_path):
+    retry_log = tmp_path / "infra_retries.jsonl"
+    retry_log.write_text(
+        '{"target":"mswe_probe","attempt":1,"outcome":"retrying"}\n'
+        '{"target":"mswe_probe","attempt":2,"outcome":"recovered"}\n'
+    )
+
+    records, errors = read_step_retry_log(retry_log)
+
+    assert [record["outcome"] for record in records] == ["retrying", "recovered"]
+    assert errors == []
+
+
+def test_step_retry_log_reader_makes_corrupt_accounting_visible(tmp_path):
+    retry_log = tmp_path / "infra_retries.jsonl"
+    retry_log.write_text('{"outcome":"exhausted"}\nnot-json\n{"attempt":2}\n')
+
+    records, errors = read_step_retry_log(retry_log)
+
+    assert [record["outcome"] for record in records] == ["exhausted"]
+    assert errors == [
+        "line 2: invalid JSON: Expecting value",
+        "line 3: expected an object with string outcome",
+    ]
+
+
+def test_outer_timeout_with_started_status_is_not_replayed_and_keeps_output(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "3")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        (tmp_path / ".mlperf_srun_status").write_text("started\n")
+        raise subprocess.TimeoutExpired(
+            command,
+            kwargs["timeout"],
+            output="partial command output\n",
+            stderr="srun diagnostic\n",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(StepNotLaunched) as exc_info:
+        _bare_environment(tmp_path).execute({"command": "rm -rf build"})
+
+    failure = exc_info.value
+    assert failure.provable_non_execution is False
+    assert failure.status == "started"
+    assert failure.srun_rc is None
+    assert "partial command output" in str(failure)
+    assert "srun diagnostic" in str(failure)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("channel", ["sentinel", "status"])
+def test_outer_timeout_accepts_proven_command_completion(
+    monkeypatch, tmp_path, channel
+):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+
+    def fake_run(command, **kwargs):
+        if channel == "sentinel":
+            nonce = command[command.index("pyxis-step") + 3]
+            output = f"partial\n__MLPERF_STEP_RC__ {nonce} 7\n"
+        else:
+            (tmp_path / ".mlperf_srun_status").write_text("finished:7:0\n")
+            output = "partial\n"
+        raise subprocess.TimeoutExpired(command, kwargs["timeout"], output=output)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = _run_srun_step_once(
+        argv=["false"],
+        status_path=tmp_path / ".mlperf_srun_status",
+        timeout_s=300,
+    )
+
+    assert result.returncode == 7
+    expected = "partial" if channel == "sentinel" else "partial\n"
+    assert result.stdout == expected
+
+
 def _bare_environment(tmp_path, failure_path=None):
     environment = object.__new__(PyxisEnvironment)
     environment.config = types.SimpleNamespace(
@@ -1408,6 +2214,7 @@ def _bare_environment(tmp_path, failure_path=None):
         timeout_s=30,
         interpreter=["bash", "-c"],
         infrastructure_failure_path=failure_path,
+        node=None,
     )
     environment.name = "mswe_run-1_abcd1234"
     environment._tmp_dir = tmp_path
@@ -1423,7 +2230,7 @@ def _bare_environment(tmp_path, failure_path=None):
         # The step script started; the command may well have executed.
         ("started\n", False),
         # A report for some other return code: the command ran.
-        ("finished:0\n", False),
+        ("finished:0:0\n", False),
     ],
 )
 def test_step_failure_reports_whether_non_execution_is_provable(
@@ -1490,6 +2297,30 @@ class TestStepRetry:
 
         assert output["returncode"] == 0
         assert len(calls) == 3
+
+    def test_every_retry_attempt_is_globally_paced(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SWEBENCH_PYXIS_STEP_RETRIES", "3")
+        paced = []
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if len(calls) < 3:
+                return subprocess.CompletedProcess(command, 1, stdout="", stderr="")
+            _finish_srun_step(command, 0)
+            return subprocess.CompletedProcess(command, 0, stdout="ok\n", stderr="")
+
+        monkeypatch.setattr(
+            "inference_endpoint.evaluation.swebench_service.swebench_service"
+            ".pyxis_environment._pace_srun_step",
+            lambda: paced.append(True),
+        )
+        monkeypatch.setattr(subprocess, "run", fake_run)
+
+        output = self._environment(tmp_path).execute({"command": "pytest -q"})
+
+        assert output["returncode"] == 0
+        assert len(paced) == len(calls) == 3
 
     def test_a_step_that_started_is_never_retried(self, monkeypatch, tmp_path):
         """It may have executed. Another attempt could double-apply it."""
@@ -1583,6 +2414,40 @@ class TestStepRetry:
 def test_step_not_launched_is_a_runner_error():
     """Existing ``except RunnerError`` handlers must keep working unchanged."""
     assert issubclass(StepNotLaunched, RunnerError)
+
+
+def test_step_pacer_spaces_admissions_without_holding_sleep_lock():
+    now = [10.0]
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        now[0] += seconds
+
+    pacer = _StepPacer(2.0, monotonic=lambda: now[0], sleep=sleep)
+
+    pacer.wait()
+    pacer.wait()
+    pacer.wait()
+
+    assert sleeps == [0.5, 0.5]
+
+
+def test_step_pacer_coordinates_processes_through_shared_state(tmp_path):
+    sleeps = []
+    state_path = tmp_path / "global-step-rate"
+    kwargs = {
+        "state_path": state_path,
+        "monotonic": lambda: 1.0,
+        "wall_time": lambda: 100.0,
+        "sleep": sleeps.append,
+    }
+
+    _StepPacer(2.0, **kwargs).wait()
+    _StepPacer(2.0, **kwargs).wait()
+
+    assert sleeps == [0.5]
+    assert float(state_path.read_text()) == 101.0
 
 
 def test_step_reports_its_return_code_in_band(monkeypatch, tmp_path):
@@ -1843,6 +2708,38 @@ def test_pyxis_cleanup_removes_only_exact_run_prefix(monkeypatch, tmp_path):
     ]
 
 
+def test_pyxis_cleanup_fans_out_to_every_routed_node(monkeypatch, tmp_path):
+    monkeypatch.setenv("SLURM_JOB_ID", "1738605")
+    monkeypatch.setenv("SLURMD_NODENAME", "cpu-driver")
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__repo-1 cpu-0001\nrepo__repo-2 cpu-0002\n")
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        node = next(arg for arg in command if arg.startswith("--nodelist="))
+        output = ""
+        if command[-3:] == ["enroot", "list", "-f"]:
+            output = f"pyxis_1738605_mswe_run-1_{node[-4:]}\n"
+        return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_dir=tmp_path / "images",
+        node_map=node_map,
+    )
+
+    runner._cleanup_containers("run-1")
+
+    assert {arg for call in calls for arg in call if arg.startswith("--nodelist=")} == {
+        "--nodelist=cpu-0001",
+        "--nodelist=cpu-0002",
+    }
+    assert sum(call[-4:-2] == ["enroot", "remove"] for call in calls) == 2
+
+
 def test_pyxis_agent_command_uses_host_model_and_image_registry(monkeypatch, tmp_path):
     calls: list[tuple[list[str], dict]] = []
 
@@ -1875,6 +2772,60 @@ def test_pyxis_agent_command_uses_host_model_and_image_registry(monkeypatch, tmp
     assert kwargs["env"]["OPENAI_API_KEY"] == "model-secret"
 
 
+def test_pyxis_agent_command_uses_staged_images_and_node_map(monkeypatch, tmp_path):
+    calls = []
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__repo-1 cpu-0001\n")
+    monkeypatch.setattr(
+        runner_mod,
+        "_run_subprocess",
+        lambda command, log_path, **kwargs: calls.append(command),
+    )
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_dir=tmp_path / "images",
+        node_map=node_map,
+    )
+
+    runner._run_agent(
+        _pyxis_request(), tmp_path / "config.yaml", tmp_path, tmp_path, set()
+    )
+
+    command = calls[0]
+    assert command[command.index("--image-dir") + 1] == str(tmp_path / "images")
+    snapshot = Path(command[command.index("--node-map") + 1])
+    assert snapshot != node_map
+    assert snapshot.read_text() == "repo__repo-1\tcpu-0001\n"
+    assert "--image-registry" not in command
+
+    node_map.write_text("repo__repo-1 cpu-9999\n")
+    assert snapshot.read_text() == "repo__repo-1\tcpu-0001\n"
+
+
+def test_pyxis_agent_rejects_missing_node_assignment_before_dispatch(
+    monkeypatch, tmp_path
+):
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__another-1 cpu-0001\n")
+    monkeypatch.setattr(
+        runner_mod,
+        "_run_subprocess",
+        lambda *args, **kwargs: pytest.fail("worker must not be dispatched"),
+    )
+    runner = PyxisSweBenchRunner(
+        project_root=tmp_path,
+        subprocess_timeout_s=30,
+        image_dir=tmp_path / "images",
+        node_map=node_map,
+    )
+
+    with pytest.raises(RunnerError, match="no assignment.*repo__repo-1"):
+        runner._run_agent(
+            _pyxis_request(), tmp_path / "config.yaml", tmp_path, tmp_path, set()
+        )
+
+
 def test_pyxis_agent_requires_upstream_environment_hook(monkeypatch, tmp_path):
     swebench = types.SimpleNamespace(main=lambda **kwargs: None)
     _install_fake_minisweagent(monkeypatch, swebench)
@@ -1894,6 +2845,36 @@ def test_pyxis_agent_restores_upstream_environment_hook(monkeypatch, tmp_path):
     worker_mod.main(_pyxis_agent_args(tmp_path))
 
     assert swebench.get_sb_environment is original
+
+
+def test_pyxis_agent_routes_staged_image_to_assigned_node(monkeypatch, tmp_path):
+    captured = []
+    original = object()
+
+    def fake_main(**kwargs):
+        captured.append(
+            swebench.get_sb_environment({}, {"instance_id": "repo__repo-1"})
+        )
+
+    swebench = types.SimpleNamespace(
+        get_sb_environment=original,
+        main=fake_main,
+    )
+    _install_fake_minisweagent(monkeypatch, swebench)
+    node_map = tmp_path / "nodes.txt"
+    node_map.write_text("repo__repo-1 cpu-0042\n")
+    args = _pyxis_agent_args(tmp_path)
+    registry_index = args.index("--image-registry")
+    args[registry_index : registry_index + 2] = [
+        "--image-dir",
+        str(tmp_path / "images"),
+    ]
+    args.extend(["--node-map", str(node_map)])
+
+    worker_mod.main(args)
+
+    assert captured[0]["image"] == tmp_path / "images/repo__repo-1.sqsh"
+    assert captured[0]["node"] == "cpu-0042"
 
 
 def test_pyxis_agent_propagates_environment_infrastructure_failure(
