@@ -88,6 +88,10 @@ class _FakeSWEBenchScorer(_FakeScorer):
         super().__init__(*args, **kwargs)
 
 
+class _FakeSWEBenchFleetScorer(_FakeSWEBenchScorer):
+    SCORER_ID = ScorerMethod.SWE_BENCH_FLEET.value
+
+
 class _FakeBreakdownScorer(_FakeScorer):
     """Scorer that returns a breakdown (like the composite gpt-oss scorer)."""
 
@@ -211,10 +215,13 @@ _RESULT = SimpleNamespace(perf_results=[], phase_results=[])
 @pytest.mark.unit
 class TestScoreAccuracy:
     @pytest.mark.parametrize(
+        "scorer_cls", [_FakeSWEBenchScorer, _FakeSWEBenchFleetScorer]
+    )
+    @pytest.mark.parametrize(
         "test_mode", [config_schema.TestMode.ACC, config_schema.TestMode.BOTH]
     )
     def test_swebench_receives_typed_runtime_model_and_endpoint(
-        self, tmp_path, test_mode
+        self, tmp_path, test_mode, scorer_cls
     ):
         model_params = ModelParams(
             name="test-model",
@@ -228,7 +235,7 @@ class TestScoreAccuracy:
             api_key="runtime-secret",
         )
         cfg = AccuracyConfiguration(
-            scorer=_FakeSWEBenchScorer,  # type: ignore[arg-type]
+            scorer=scorer_cls,  # type: ignore[arg-type]
             extractor=None,
             dataset_name="swe_bench",
             dataset=_FakeDataset(1, 1.0),  # type: ignore[arg-type]
@@ -242,7 +249,7 @@ class TestScoreAccuracy:
 
         score_accuracy(_ctx([cfg], test_mode=test_mode), _RESULT)
 
-        assert _FakeSWEBenchScorer.received_kwargs == {
+        assert scorer_cls.received_kwargs == {
             "extractor": None,
             "ground_truth_column": None,
             "swebench_service_auth_token": "service-secret",

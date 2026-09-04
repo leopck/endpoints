@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 from urllib.parse import urljoin
 
 import msgspec
@@ -54,6 +54,9 @@ from .swe_bench_scorer import SWEBenchScorer
 
 logger = logging.getLogger(__name__)
 
+if TYPE_CHECKING:
+    from ..config.schema import EndpointConfig, ModelParams
+
 
 class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
     """Distributed SWE-bench scoring across N services."""
@@ -74,6 +77,8 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
         report_dir: Any,
         extractor: type[Extractor] | None = None,
         ground_truth_column: str | None = "instance_id",
+        model_params: ModelParams | None = None,
+        endpoint_config: EndpointConfig | None = None,
         **extras: Any,
     ) -> None:
         super().__init__(
@@ -85,6 +90,8 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
         )
         self.report_dir = self.report_dir.resolve()
         self.options = self._resolve_options(extras)
+        self.model_params = model_params
+        self.endpoint_config = endpoint_config
 
     # --------------------------------------------------------------- config --
 
@@ -219,14 +226,27 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
     def score(self) -> tuple[float | None, int]:
         self.complete = True
         config = load_benchmark_config(self.report_dir)
-        model_params = config.get("model_params") or {}
-        model_name = model_params.get("name")
+        persisted_model_params = config.get("model_params") or {}
+        model_name = (
+            self.model_params.name
+            if self.model_params is not None
+            else persisted_model_params.get("name")
+        )
         if not model_name:
             raise ValueError("model_params.name is required in the benchmark config")
-        endpoint_config = config.get("endpoint_config") or {}
-        endpoint_urls = list(endpoint_config.get("endpoints") or [])
+        persisted_endpoint_config = config.get("endpoint_config") or {}
+        endpoint_urls = list(
+            self.endpoint_config.endpoints
+            if self.endpoint_config is not None
+            else persisted_endpoint_config.get("endpoints") or []
+        )
         if not endpoint_urls:
             raise SetupError("the benchmark config lists no endpoint URLs")
+        endpoint_api_key = (
+            self.endpoint_config.api_key
+            if self.endpoint_config is not None
+            else persisted_endpoint_config.get("api_key")
+        )
 
         instance_ids = self._instance_ids()
         if not instance_ids:
@@ -238,7 +258,7 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
             expected_model=self.options["expected_model"],
             tool_call_model=model_name,
             min_prompt_tokens=self.options["min_prompt_tokens"],
-            api_key=endpoint_config.get("api_key"),
+            api_key=endpoint_api_key,
         )
         try:
             run_gates(gates, endpoint_urls)
@@ -254,16 +274,16 @@ class SWEBenchFleetScorer(Scorer, scorer_id="swe_bench_fleet"):
 
         self._model_name = model_name
         self._endpoint_urls = endpoint_urls
-        self._endpoint_api_key = endpoint_config.get("api_key")
+        self._endpoint_api_key = endpoint_api_key
         # load_benchmark_config() yaml.safe_load()s config.yaml, so model_params
         # is a plain mapping here, while _generation_params() expects the
         # pydantic ModelParams. Re-validate rather than re-implement the field
         # selection, so the fleet path and the single-service path agree.
-        from ..config.schema import ModelParams
+        if self.model_params is None:
+            from ..config.schema import ModelParams
 
-        self._generation_params = SWEBenchScorer._generation_params(
-            ModelParams.model_validate(model_params)
-        )
+            self.model_params = ModelParams.model_validate(persisted_model_params)
+        self._generation_params = SWEBenchScorer._generation_params(self.model_params)
         self._unit_root = unit_root
 
         def fingerprint() -> str | None:

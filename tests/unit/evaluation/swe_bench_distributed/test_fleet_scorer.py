@@ -5,9 +5,14 @@
 
 from __future__ import annotations
 
-import pytest
+from unittest.mock import MagicMock
 
-from inference_endpoint.config.schema import ScorerMethod
+import pandas as pd
+import pytest
+import yaml
+
+from inference_endpoint.config.schema import EndpointConfig, ModelParams, ScorerMethod
+from inference_endpoint.evaluation import swe_bench_fleet_scorer as fleet_scorer_module
 from inference_endpoint.evaluation.scoring import Scorer
 from inference_endpoint.evaluation.swe_bench_fleet_scorer import SWEBenchFleetScorer
 from inference_endpoint.exceptions import SetupError
@@ -76,3 +81,54 @@ class TestOptions:
             SWEBenchFleetScorer._resolve_options(
                 {"swebench_service_urls": URLS, "shard_size": 0}
             )
+
+
+def test_runtime_endpoint_secret_wins_over_redacted_report(monkeypatch, tmp_path):
+    report_dir = tmp_path / "report"
+    report_dir.mkdir()
+    (report_dir / "sample_idx_map.json").write_text(
+        '{"swe_bench":{"sample-uuid":0}}'
+    )
+    (report_dir / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "model_params": {"name": "persisted-model"},
+                "endpoint_config": {
+                    "endpoints": ["http://persisted:8000"],
+                    "api_key": "<redacted>",
+                },
+            }
+        )
+    )
+    dataset = MagicMock()
+    dataset.dataframe = pd.DataFrame(
+        {"instance_id": ["repo__repo-1"], "prompt": ["prompt"]}
+    )
+    captured = {}
+
+    def build_gates(**kwargs):
+        captured.update(kwargs)
+        return [], MagicMock()
+
+    def refuse(_gates, _urls):
+        raise fleet_scorer_module.GateFailure("stop after credential capture")
+
+    monkeypatch.setattr(fleet_scorer_module, "build_gates", build_gates)
+    monkeypatch.setattr(fleet_scorer_module, "run_gates", refuse)
+    scorer = SWEBenchFleetScorer(
+        dataset_name="swe_bench",
+        dataset=dataset,
+        report_dir=report_dir,
+        swebench_service_urls=URLS,
+        num_instances=1,
+        model_params=ModelParams(name="runtime-model"),
+        endpoint_config=EndpointConfig(
+            endpoints=["http://runtime:8000"], api_key="runtime-secret"
+        ),
+    )
+
+    with pytest.raises(SetupError, match="credential capture"):
+        scorer.score()
+
+    assert captured["tool_call_model"] == "runtime-model"
+    assert captured["api_key"] == "runtime-secret"

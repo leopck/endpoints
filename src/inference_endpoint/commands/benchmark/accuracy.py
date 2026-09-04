@@ -262,7 +262,10 @@ def score_accuracy(
             scorer_kwargs = dict(eval_cfg.extras)
             if (
                 getattr(eval_cfg.scorer, "SCORER_ID", None)
-                == ScorerMethod.SWE_BENCH.value
+                in {
+                    ScorerMethod.SWE_BENCH.value,
+                    ScorerMethod.SWE_BENCH_FLEET.value,
+                }
             ):
                 scorer_kwargs.update(
                     model_params=eval_cfg.model_params,
